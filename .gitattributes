@@ -1,0 +1,21 @@
+# Normalize line endings so the same checkout works on Windows hosts and in the
+# Linux containers that run the services (docs/DESIGN.md 13).
+* text=auto eol=lf
+
+# Shell scripts MUST keep LF. A CRLF check.sh fails on Linux with an obscure
+# "\r: command not found", which would look like a broken check rather than a
+# line-ending problem.
+*.sh text eol=lf
+
+# PowerShell is fine either way, but keep it CRLF-native on Windows.
+*.ps1 text eol=crlf
+
+# Binary and generated assets: never touch, never diff as text.
+*.docx binary
+*.png binary
+*.jpg binary
+*.pdf binary
+*.sqlite3 binary
+
+# The lockfile is generated. Mark it so reviews collapse it by default.
+uv.lock linguist-generated=true -diff

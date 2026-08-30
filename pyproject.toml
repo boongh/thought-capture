@@ -1,0 +1,125 @@
+# Virtual workspace root: intentionally no [project] table, so the root is never
+# importable or publishable. Members live in apps/* and packages/*.
+# See docs/DESIGN.md 17 for the boundary each member owns.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.0",
+    "hypothesis>=6.167",
+]
+
+[tool.uv.workspace]
+members = ["apps/*", "packages/*"]
+
+[tool.uv.sources]
+tc-domain = { workspace = true }
+tc-application = { workspace = true }
+tc-infrastructure = { workspace = true }
+tc-api = { workspace = true }
+tc-discord-bot = { workspace = true }
+tc-worker = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Lint and format
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+# Never let a formatter rewrite prose. docs/DESIGN.md is the accepted design
+# anchor and contains illustrative Python blocks that ruff would otherwise
+# reformat; changing it requires an ADR, not a tool run (CLAUDE.md).
+extend-exclude = ["docs", "rendered", "*.md"]
+src = [
+    "packages/domain/src",
+    "packages/application/src",
+    "packages/infrastructure/src",
+    "apps/api/src",
+    "apps/discord_bot/src",
+    "apps/worker/src",
+    "tests",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "A",    # builtins shadowing
+    "C4",   # comprehensions
+    "DTZ",  # timezone-aware datetimes
+    "T20",  # no print
+    "SIM",  # simplify
+    "PTH",  # use pathlib
+    "RUF",
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "tc_domain",
+    "tc_application",
+    "tc_infrastructure",
+    "tc_api",
+    "tc_discord_bot",
+    "tc_worker",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+"tools/**" = ["T20"]
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+mypy_path = [
+    "packages/domain/src",
+    "packages/application/src",
+    "packages/infrastructure/src",
+    "apps/api/src",
+    "apps/discord_bot/src",
+    "apps/worker/src",
+]
+files = [
+    "packages/domain/src",
+    "packages/application/src",
+    "packages/infrastructure/src",
+    "apps/api/src",
+    "apps/discord_bot/src",
+    "apps/worker/src",
+]
+
+# Strict mode is enforced on domain and application, which carry the business
+# rules. Infrastructure and app wiring interact with third-party libraries whose
+# stubs are uneven; they are type-checked but may permit untyped imports.
+[[tool.mypy.overrides]]
+module = ["tc_infrastructure.*", "tc_api.*", "tc_discord_bot.*", "tc_worker.*"]
+disallow_untyped_calls = false
+disallow_subclassing_any = false
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires a live PostgreSQL instance (docker compose profile 'core')",
+    "contract: requires a pinned external service",
+]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]

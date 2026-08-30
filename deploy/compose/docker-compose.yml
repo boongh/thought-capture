@@ -1,0 +1,47 @@
+# Local development stack. See docs/DESIGN.md 13.
+#
+# Only loopback ports are published. Nothing here is reachable off-host.
+#
+#   docker compose --profile core up -d
+#
+# Profiles:
+#   core          postgres, and later api/bot/worker
+#   ai            Khoj and its own database (Phase 2, not yet defined)
+#   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
+
+name: thought-capture
+
+services:
+  postgres:
+    # Pinned to a full minor. PostgreSQL recommends always running the current
+    # minor. Debian (trixie) rather than Alpine on purpose: musl locale and ICU
+    # differences change text collation, which would change full-text and
+    # trigram ordering in a system whose correctness depends on retrieval.
+    image: postgres:18.6-trixie
+    profiles: ["core"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
+      POSTGRES_USER: ${POSTGRES_USER:-tc_migrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      # Deterministic collation so index ordering is reproducible across hosts.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Loopback only. Never expose PostgreSQL beyond the host (docs/DESIGN.md 12.2).
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tc_migrator} -d ${POSTGRES_DB:-thought_capture}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    # Reduce blast radius: no new privileges, and the image's own postgres user.
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres-data:
+    driver: local

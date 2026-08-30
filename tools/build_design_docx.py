@@ -5,15 +5,13 @@ import re
 import textwrap
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
-
+from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "docs" / "DESIGN.md"
@@ -154,7 +152,9 @@ def set_repeat_table_header(row) -> None:
 def define_numbering(document: Document) -> tuple[int, int]:
     numbering = document.part.numbering_part.element
 
-    def make_num(abstract_id: int, num_id: int, fmt: str, text: str, font: str | None = None) -> None:
+    def make_num(
+        abstract_id: int, num_id: int, fmt: str, text: str, font: str | None = None
+    ) -> None:
         abstract = OxmlElement("w:abstractNum")
         abstract.set(qn("w:abstractNumId"), str(abstract_id))
         multi = OxmlElement("w:multiLevelType")
@@ -281,16 +281,25 @@ def draw_centered(draw, box, text, font, fill=BLACK, max_chars=24):
     bounds = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=5, align="center")
     w, h = bounds[2] - bounds[0], bounds[3] - bounds[1]
     color = fill if str(fill).startswith("#") else f"#{fill}"
-    draw.multiline_text(((x1 + x2 - w) / 2, (y1 + y2 - h) / 2), wrapped, font=font, fill=color, spacing=5, align="center")
+    draw.multiline_text(
+        ((x1 + x2 - w) / 2, (y1 + y2 - h) / 2),
+        wrapped,
+        font=font,
+        fill=color,
+        spacing=5,
+        align="center",
+    )
 
 
 def rounded_box(draw, box, title, subtitle="", fill="EAF2F8"):
     draw.rounded_rectangle(box, radius=18, fill=f"#{fill}", outline=f"#{BLUE}", width=3)
-    x1, y1, x2, y2 = box
+    x1, y1, _x2, _y2 = box
     draw.text((x1 + 18, y1 + 13), title, font=diagram_font(23, True), fill=f"#{NAVY}")
     if subtitle:
         wrapped = "\n".join(textwrap.wrap(subtitle, 27))
-        draw.multiline_text((x1 + 18, y1 + 50), wrapped, font=diagram_font(17), fill=f"#{BLACK}", spacing=4)
+        draw.multiline_text(
+            (x1 + 18, y1 + 50), wrapped, font=diagram_font(17), fill=f"#{BLACK}", spacing=4
+        )
 
 
 def arrow(draw, start, end, color=NAVY, width=4):
@@ -310,15 +319,34 @@ def create_architecture_diagram(path: Path) -> None:
     img = Image.new("RGB", (1500, 850), "white")
     d = ImageDraw.Draw(img)
     d.text((40, 24), "Runtime architecture", font=diagram_font(34, True), fill=f"#{NAVY}")
-    d.text((40, 68), "One canonical store, two complementary retrieval paths", font=diagram_font(21), fill=f"#{MUTED}")
+    d.text(
+        (40, 68),
+        "One canonical store, two complementary retrieval paths",
+        font=diagram_font(21),
+        fill=f"#{MUTED}",
+    )
     rounded_box(d, (40, 155, 260, 275), "Discord", "capture and digest", "F2F4F7")
     rounded_box(d, (330, 155, 570, 275), "Bot", "allowlist, ingest adapter")
     rounded_box(d, (650, 155, 930, 275), "Application", "use cases and API gateway")
-    rounded_box(d, (1010, 110, 1450, 250), "PostgreSQL", "raw log, revisions, entities, exact search", "E8F5E9")
+    rounded_box(
+        d,
+        (1010, 110, 1450, 250),
+        "PostgreSQL",
+        "raw log, revisions, entities, exact search",
+        "E8F5E9",
+    )
     rounded_box(d, (1010, 330, 1450, 470), "Khoj", "semantic index, reranking, Ask/RAG", "FFF4E5")
     rounded_box(d, (650, 520, 930, 660), "Worker", "20:00 organize, export, retry")
-    rounded_box(d, (1010, 570, 1450, 710), "OpenRouter", "structured completions; provider gateway", "FCEEF5")
-    rounded_box(d, (40, 520, 570, 660), "Interface", "Khoj UI now; unified custom UI later", "F2F4F7")
+    rounded_box(
+        d,
+        (1010, 570, 1450, 710),
+        "OpenRouter",
+        "structured completions; provider gateway",
+        "FCEEF5",
+    )
+    rounded_box(
+        d, (40, 520, 570, 660), "Interface", "Khoj UI now; unified custom UI later", "F2F4F7"
+    )
     arrow(d, (260, 215), (330, 215))
     arrow(d, (570, 215), (650, 215))
     arrow(d, (930, 190), (1010, 180))
@@ -339,8 +367,10 @@ def create_capture_sequence(path: Path) -> None:
     d.text((40, 24), "Durable capture sequence", font=diagram_font(34, True), fill=f"#{NAVY}")
     labels = ["Discord user", "Bot", "Capture use case", "PostgreSQL", "Attachment store"]
     xs = [120, 400, 730, 1060, 1370]
-    for x, label in zip(xs, labels):
-        d.rounded_rectangle((x - 105, 110, x + 105, 180), radius=14, fill="#EAF2F8", outline=f"#{BLUE}", width=3)
+    for x, label in zip(xs, labels, strict=True):
+        d.rounded_rectangle(
+            (x - 105, 110, x + 105, 180), radius=14, fill="#EAF2F8", outline=f"#{BLUE}", width=3
+        )
         draw_centered(d, (x - 100, 112, x + 100, 178), label, diagram_font(20, True), max_chars=18)
         d.line((x, 180, x, 790), fill="#98A2B3", width=2)
     events = [
@@ -374,7 +404,9 @@ def add_mermaid_diagram(doc: Document, lines: list[str]) -> None:
         path = QA_DIR / "capture-sequence.png"
         create_capture_sequence(path)
         alt = "Sequence diagram showing Discord capture committed to attachment storage and PostgreSQL before acknowledgement."
-        caption = "Figure 2. Durable capture: acknowledgement follows the canonical database transaction."
+        caption = (
+            "Figure 2. Durable capture: acknowledgement follows the canonical database transaction."
+        )
     else:
         path = QA_DIR / "runtime-architecture.png"
         create_architecture_diagram(path)
@@ -536,7 +568,9 @@ def add_cover(doc: Document) -> None:
 
     subtitle = doc.add_paragraph()
     subtitle.paragraph_format.space_after = Pt(26)
-    sr = subtitle.add_run("A durable, reversible personal memory system built around Discord, PostgreSQL, Khoj, and OpenRouter")
+    sr = subtitle.add_run(
+        "A durable, reversible personal memory system built around Discord, PostgreSQL, Khoj, and OpenRouter"
+    )
     sr.font.size = Pt(14)
     sr.font.color.rgb = RGBColor.from_string(MUTED)
 
@@ -568,7 +602,9 @@ def add_cover(doc: Document) -> None:
     shd = OxmlElement("w:shd")
     shd.set(qn("w:fill"), CALLOUT)
     p_pr.append(shd)
-    cr = callout.add_run("Decision: PostgreSQL remains canonical and precise; Khoj provides semantic retrieval and Ask. A stable gateway makes a future unified UI straightforward without maintaining a Khoj fork.")
+    cr = callout.add_run(
+        "Decision: PostgreSQL remains canonical and precise; Khoj provides semantic retrieval and Ask. A stable gateway makes a future unified UI straightforward without maintaining a Khoj fork."
+    )
     cr.bold = True
     cr.font.color.rgb = RGBColor.from_string(NAVY)
     cr.font.size = Pt(10.5)
@@ -578,7 +614,9 @@ def add_cover(doc: Document) -> None:
     h.paragraph_format.space_before = Pt(0)
     toc = doc.add_paragraph()
     add_toc(toc)
-    note = doc.add_paragraph("The document also uses Word heading styles for navigation and accessibility.")
+    note = doc.add_paragraph(
+        "The document also uses Word heading styles for navigation and accessibility."
+    )
     note.runs[0].italic = True
     note.runs[0].font.color.rgb = RGBColor.from_string(MUTED)
     doc.add_page_break()
@@ -678,7 +716,9 @@ def build() -> None:
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Inches(0.25)
             p.paragraph_format.first_line_indent = Inches(-0.18)
-            add_inline_runs(p, ("☒ " if checkbox.group(1).lower() == "x" else "☐ ") + checkbox.group(2))
+            add_inline_runs(
+                p, ("☒ " if checkbox.group(1).lower() == "x" else "☐ ") + checkbox.group(2)
+            )
             i += 1
             continue
         if stripped.startswith("**") and stripped.endswith("**") and len(stripped) < 180:
@@ -703,7 +743,9 @@ def build() -> None:
     core.subject = "Accepted implementation anchor"
     core.author = "Thought Capture AI project"
     core.keywords = "Discord, Khoj, OpenRouter, PostgreSQL, personal memory, system design"
-    core.comments = f"Generated from docs/DESIGN.md sha256={hashlib.sha256(SOURCE.read_bytes()).hexdigest()}"
+    core.comments = (
+        f"Generated from docs/DESIGN.md sha256={hashlib.sha256(SOURCE.read_bytes()).hexdigest()}"
+    )
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     doc.save(OUTPUT)
     print(OUTPUT)
