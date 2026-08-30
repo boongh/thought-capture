@@ -8,6 +8,7 @@ durable commit" (docs/DESIGN.md 3.1) true rather than aspirational.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 import sqlalchemy as sa
@@ -18,6 +19,13 @@ from tc_domain.capture import AppendOutcome, CaptureSource, ThoughtDraft, Though
 from tc_infrastructure.db.tables import blobs, outbox_events, thought_attachments, thoughts
 
 THOUGHT_CAPTURED_EVENT = "thought.captured"
+
+# The bot acknowledges on the fast path, immediately after this transaction
+# commits, and then marks the event delivered. The outbox is the safety net for
+# when that does not happen - the process died, or Discord was unreachable.
+# Holding the event back briefly keeps the safety net from racing the fast path
+# and sending a second acknowledgement for a message that already got one.
+ACK_DELIVERY_GRACE = dt.timedelta(seconds=60)
 
 
 class PostgresThoughtRepository:
@@ -138,6 +146,7 @@ class PostgresThoughtRepository:
                 workspace_id=draft.workspace_id,
                 event_type=THOUGHT_CAPTURED_EVENT,
                 aggregate_id=str(thought_id),
+                available_at=sa.func.now() + ACK_DELIVERY_GRACE,
                 payload={
                     "thought_id": thought_id,
                     "source": str(draft.source),
