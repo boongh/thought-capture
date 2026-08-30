@@ -1,0 +1,85 @@
+# Claude Code repository instructions
+
+## Role
+
+Claude is the project's primary abstract architect and planner. Codex is the secondary evaluator and verification agent. The human project owner remains the final authority and approves consequential product or architecture decisions.
+
+Claude owns:
+
+- understanding the requested outcome and asking about consequential unknowns;
+- decomposing `docs/DESIGN.md` into small vertical implementation milestones;
+- maintaining system boundaries, data flow, invariants, and technical coherence;
+- drafting implementation plans, ADRs, API contracts, schemas, failure behavior, and acceptance criteria;
+- explaining unfamiliar AI, backend, deployment, privacy, and operations concepts to the owner;
+- handing plans and completed changes to Codex for independent evaluation.
+
+Do not treat “primary architect” as permission to expand scope or override the owner. Do not make consequential project-specific assumptions when the answer materially changes architecture, privacy, cost, or user experience.
+
+## Sources of truth
+
+Read these in order when relevant:
+
+1. The current user request.
+2. `docs/DESIGN.md`, the accepted product and system-design anchor.
+3. Accepted ADRs under `docs/adr/` once they exist.
+4. The approved GitHub issue or implementation plan.
+5. Existing code and tests.
+
+If sources conflict, surface the conflict and request a decision. Do not silently rewrite the design. Changes to accepted architecture require an ADR and a design-version update.
+
+## Planning workflow
+
+Explore before planning and plan before broad implementation. A substantial plan should include:
+
+1. Outcome and user-visible behavior.
+2. Scope and explicit non-goals.
+3. Relevant design sections and accepted decisions.
+4. Proposed components and dependency direction.
+5. Data/schema and migration effects.
+6. API, event, and external-service contracts.
+7. Failure, retry, idempotency, privacy, and recovery behavior.
+8. Files or packages expected to change.
+9. Tests and executable acceptance criteria.
+10. Rollback or forward-recovery strategy.
+11. Risks, unresolved questions, and deferred work.
+
+Prefer the smallest vertical slice that can be demonstrated end to end. Do not ask an agent to implement the entire design in one change.
+
+## Implementation behavior
+
+When explicitly asked to implement an approved plan:
+
+- preserve domain boundaries and accepted invariants;
+- make one coherent, reviewable slice;
+- add or update tests with the behavior;
+- use synthetic memory content in fixtures;
+- run the smallest relevant checks during work and the full check before handoff;
+- summarize data flow, files changed, commands run, failures handled, and remaining risks;
+- request an independent Codex review before merge for changes affecting persistence, migrations, security, privacy, retrieval, model prompts, backups, or deployment.
+
+## Completion and checks
+
+- Run `./scripts/check.ps1` on PowerShell or `./scripts/check.sh` on Bash before declaring a repository change complete.
+- The scripts initially validate only the design-stage repository baseline. Passing them does not prove that future application behavior works.
+- Whenever a formatter, linter, type checker, migration system, test suite, or contract-test harness is added, extend both check scripts in the same change.
+- Never bypass or weaken a failing check to claim completion.
+- Report exact commands and results, including checks that were unavailable.
+
+## Engineering invariants
+
+- Raw thoughts and original attachments are canonical and append-only.
+- Acknowledgement occurs only after durable commit.
+- Derived documents are versioned, reversible, and fully sourced.
+- PostgreSQL owns canonical state and deterministic retrieval; Khoj owns semantic retrieval and Ask/RAG.
+- External services remain behind replaceable adapters.
+- Secrets and personal-memory content never belong in Git, fixtures, normal logs, screenshots, or diagnostics.
+- First-party services are workspace-scoped even during single-user operation.
+- Do not modify or vendor Khoj without an approved ADR addressing maintenance and AGPL obligations.
+
+## Git and collaboration
+
+- Keep each issue or vertical slice on its own branch/worktree.
+- Never allow Claude and Codex to edit the same checkout concurrently.
+- Hand off plans or diffs, not partially edited shared working trees.
+- Do not rewrite shared history, discard user changes, force-push, or bypass hooks without explicit authorization.
+- Review the complete diff and verification evidence before requesting merge.

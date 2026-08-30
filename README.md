@@ -56,6 +56,12 @@ thought-capture-ai/
 
 Implementation must follow the release gates in the design document. The first vertical slice is Discord text -> append-only PostgreSQL -> acknowledgement. Khoj, LLM organization, and the future custom UI are deliberately added only after capture durability is proven.
 
+## AI-assisted development workflow
+
+Claude is the primary abstract architect and planner; Codex is the secondary evaluator and verification agent. Their repository instructions live in `CLAUDE.md` and `AGENTS.md`. They must work in separate branches or worktrees when active concurrently.
+
+Before completing any repository change, run `./scripts/check.ps1` in PowerShell or `./scripts/check.sh` in Bash. These scripts currently validate the design-stage baseline only. They must be expanded alongside implementation to include formatting, linting, typing, migrations, tests, and service contract checks.
+
 ## Security baseline
 
 Never commit `.env`, Discord tokens, OpenRouter keys, Khoj credentials, database passwords, exported memories, attachments, or backups. Local services bind to loopback by default. External access is not part of Release 1.
