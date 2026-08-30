@@ -66,6 +66,8 @@ required_paths=(
   ".python-version"
   "env.example"
   "deploy/compose/docker-compose.yml"
+  "alembic.ini"
+  "migrations/env.py"
 )
 
 for path in "${required_paths[@]}"; do

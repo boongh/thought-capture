@@ -61,7 +61,9 @@ try {
         "uv.lock",
         ".python-version",
         "env.example",
-        "deploy/compose/docker-compose.yml"
+        "deploy/compose/docker-compose.yml",
+        "alembic.ini",
+        "migrations/env.py"
     )
 
     foreach ($Path in $RequiredPaths) {

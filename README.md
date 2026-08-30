@@ -53,6 +53,13 @@ Start the local database:
 docker compose --profile core -f deploy/compose/docker-compose.yml up -d
 ```
 
+Apply the schema. Migrations are a deployment step and never run from API
+startup:
+
+```bash
+uv run alembic upgrade head
+```
+
 Run the checks before declaring any change complete:
 
 ```bash
