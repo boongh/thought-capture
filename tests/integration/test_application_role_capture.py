@@ -47,23 +47,6 @@ def app_connection(app_engine: Engine) -> Iterator[sa.Connection]:
             transaction.rollback()
 
 
-def _seed(connection: sa.Connection) -> tuple[uuid.UUID, uuid.UUID]:
-    workspace_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    connection.execute(
-        sa.text("INSERT INTO users (id, display_name) VALUES (:id, :name)"),
-        {"id": user_id, "name": "synthetic owner"},
-    )
-    connection.execute(
-        sa.text(
-            "INSERT INTO workspaces (id, name, mode, timezone)"
-            " VALUES (:id, :name, 'personal', 'Asia/Bangkok')"
-        ),
-        {"id": workspace_id, "name": "synthetic workspace"},
-    )
-    return workspace_id, user_id
-
-
 def _insert_thought(
     connection: sa.Connection,
     workspace_id: uuid.UUID,
@@ -97,12 +80,14 @@ def test_application_role_connects(app_connection: sa.Connection) -> None:
     assert who == "tc_app"
 
 
-def test_application_role_can_append_a_thought(app_connection: sa.Connection) -> None:
+def test_application_role_can_append_a_thought(
+    app_connection: sa.Connection, seeded_identity: tuple[uuid.UUID, uuid.UUID]
+) -> None:
     """The real capture path: INSERT ... RETURNING id as tc_app.
 
     This is the test that would have caught a missing sequence grant.
     """
-    workspace_id, user_id = _seed(app_connection)
+    workspace_id, user_id = seeded_identity
 
     thought_id = _insert_thought(
         app_connection, workspace_id, user_id, source_message_id="app-role-1"
@@ -115,8 +100,10 @@ def test_application_role_can_append_a_thought(app_connection: sa.Connection) ->
     assert body == "synthetic thought"
 
 
-def test_application_role_can_archive_an_attachment(app_connection: sa.Connection) -> None:
-    workspace_id, user_id = _seed(app_connection)
+def test_application_role_can_archive_an_attachment(
+    app_connection: sa.Connection, seeded_identity: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    workspace_id, user_id = seeded_identity
     thought_id = _insert_thought(
         app_connection, workspace_id, user_id, source_message_id="app-role-2"
     )
@@ -145,9 +132,9 @@ def test_application_role_can_archive_an_attachment(app_connection: sa.Connectio
 
 
 def test_application_role_insert_is_idempotent_by_constraint(
-    app_connection: sa.Connection,
+    app_connection: sa.Connection, seeded_identity: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
-    workspace_id, user_id = _seed(app_connection)
+    workspace_id, user_id = seeded_identity
     _insert_thought(app_connection, workspace_id, user_id, source_message_id="app-role-dup")
 
     with pytest.raises(sa.exc.IntegrityError):
@@ -155,10 +142,10 @@ def test_application_role_insert_is_idempotent_by_constraint(
 
 
 def test_application_role_cannot_update_a_committed_thought(
-    app_connection: sa.Connection,
+    app_connection: sa.Connection, seeded_identity: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     """Denied twice over: no UPDATE grant, and the trigger would reject it too."""
-    workspace_id, user_id = _seed(app_connection)
+    workspace_id, user_id = seeded_identity
     thought_id = _insert_thought(
         app_connection, workspace_id, user_id, source_message_id="app-role-3"
     )
@@ -171,9 +158,9 @@ def test_application_role_cannot_update_a_committed_thought(
 
 
 def test_application_role_cannot_delete_a_committed_thought(
-    app_connection: sa.Connection,
+    app_connection: sa.Connection, seeded_identity: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
-    workspace_id, user_id = _seed(app_connection)
+    workspace_id, user_id = seeded_identity
     thought_id = _insert_thought(
         app_connection, workspace_id, user_id, source_message_id="app-role-4"
     )
