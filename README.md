@@ -29,7 +29,52 @@ By the end of Release 1, the owner can:
 
 Khoj uses a separate runtime because its current source package supports Python 3.10-3.12, while this project's services use Python 3.14.
 
-## Planned repository shape
+## Local development
+
+The workspace uses [uv](https://docs.astral.sh/uv/). CPython is pinned to the
+patch version in `.python-version` and installed by uv itself.
+
+```bash
+python -m pip install uv
+uv python install 3.14.7
+uv sync --all-packages
+```
+
+Copy the configuration template and fill it in. `.env` is gitignored and must
+never be committed:
+
+```bash
+cp env.example .env
+```
+
+Start the local database. `--env-file .env` is required: Compose resolves a bare
+`.env` relative to the compose file, not the repository root, so without it the
+required password variables are unset and the command fails.
+
+```bash
+docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d
+```
+
+Apply the schema. Migrations are a deployment step and never run from API
+startup:
+
+```bash
+uv run alembic upgrade head
+```
+
+Run the checks before declaring any change complete:
+
+```bash
+./scripts/check.ps1
+```
+
+The check script runs the lockfile check, `ruff format --check`, `ruff check`,
+`mypy`, and the unit suite, then the integration suite if a Docker engine is
+reachable. When Docker is unavailable it reports the integration tests as
+`NOT RUN` rather than passing silently — a run with skips is not full
+verification.
+
+## Repository shape
 
 ```text
 thought-capture-ai/
@@ -60,7 +105,7 @@ Implementation must follow the release gates in the design document. The first v
 
 Claude is the primary abstract architect and planner; Codex is the secondary evaluator and verification agent. Their repository instructions live in `CLAUDE.md` and `AGENTS.md`. They must work in separate branches or worktrees when active concurrently.
 
-Before completing any repository change, run `./scripts/check.ps1` in PowerShell or `./scripts/check.sh` in Bash. These scripts currently validate the design-stage baseline only. They must be expanded alongside implementation to include formatting, linting, typing, migrations, tests, and service contract checks.
+Before completing any repository change, run `./scripts/check.ps1` in PowerShell or `./scripts/check.sh` in Bash. They must be expanded alongside implementation as migrations, integration suites, and service contract checks are introduced.
 
 ## Security baseline
 

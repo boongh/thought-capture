@@ -1,0 +1,23 @@
+[project]
+name = "tc-api"
+version = "0.1.0"
+description = "FastAPI gateway: health, capture, raw log reads, run commands."
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "tc-domain",
+    "tc-application",
+    "tc-infrastructure",
+    "fastapi>=0.118",
+    "uvicorn[standard]>=0.37",
+]
+
+# No [project.scripts] yet. A declared console command whose entrypoint module
+# does not exist installs cleanly and then fails on invocation, which is worse
+# than an absent command. The script is added with the entrypoint itself.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tc_api"]

@@ -13,6 +13,12 @@ Claude owns:
 - explaining unfamiliar AI, backend, deployment, privacy, and operations concepts to the owner;
 - handing plans and completed changes to Codex for independent evaluation.
 
+## Specialized agent
+
+- Use `.claude/agents/architecture-researcher.md` for bounded, read-only research when an architecture decision depends on current external facts, compatibility, licensing, cost, or provider behavior.
+- Keep final synthesis and architectural decisions in the primary Claude session.
+- Do not use the researcher as a substitute for asking the owner about consequential project-specific preferences.
+
 Do not treat “primary architect” as permission to expand scope or override the owner. Do not make consequential project-specific assumptions when the answer materially changes architecture, privacy, cost, or user experience.
 
 ## Sources of truth
@@ -83,3 +89,24 @@ When explicitly asked to implement an approved plan:
 - Hand off plans or diffs, not partially edited shared working trees.
 - Do not rewrite shared history, discard user changes, force-push, or bypass hooks without explicit authorization.
 - Review the complete diff and verification evidence before requesting merge.
+
+### Required commit report
+
+Every commit created by Claude must include a CTO-readable report in the commit body. A subject line alone is not sufficient. Do not create a commit until its report accurately explains the complete staged change.
+
+Use this structure:
+
+```text
+<type>: <concise outcome>
+
+Change report:
+- What changed: <user-visible and repository-level summary>
+- Why: <problem, requirement, or accepted decision motivating the change>
+- Technical details: <general implementation approach and data flow>
+- Interfaces and data: <new or changed endpoints, commands, events, functions, schemas, migrations, configuration, and their behavior>
+- Verification: <exact checks run and their results>
+- Risks and recovery: <compatibility, security, privacy, deployment, rollback, or forward-recovery notes>
+- Follow-ups: <remaining work or None>
+```
+
+The technical report must name important new or changed functions and endpoints, state what each does, and explain at a useful architectural level how it works. It must also mention migrations, configuration changes, external-service behavior, and breaking changes when applicable. Write `None` for categories that genuinely do not apply; do not omit them. Never include secrets, tokens, personal-memory content, or sensitive diagnostic data in a commit message.

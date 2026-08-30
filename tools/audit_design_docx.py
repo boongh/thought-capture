@@ -3,7 +3,6 @@ from pathlib import Path
 from docx import Document
 from docx.oxml.ns import qn
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DOCX = ROOT / "docs" / "Thought-Capture-AI-System-Design.docx"
 
@@ -29,7 +28,15 @@ def main() -> None:
     section = doc.sections[0]
     assert round(section.page_width.inches, 2) == 8.50
     assert round(section.page_height.inches, 2) == 11.00
-    assert all(round(x.inches, 2) == 1.00 for x in (section.left_margin, section.right_margin, section.top_margin, section.bottom_margin))
+    assert all(
+        round(x.inches, 2) == 1.00
+        for x in (
+            section.left_margin,
+            section.right_margin,
+            section.top_margin,
+            section.bottom_margin,
+        )
+    )
 
     numbering = doc.part.numbering_part.element
     assert len(numbering.findall(qn("w:num"))) >= 2
@@ -42,7 +49,9 @@ def main() -> None:
     assert len(drawings) == 2, f"expected 2 diagrams, found {len(drawings)}"
     doc_prs = doc.part.element.findall(".//" + qn("wp:docPr"))
     assert all(node.get("descr") for node in doc_prs), "every diagram needs alt text"
-    print(f"PASS paragraphs={len(doc.paragraphs)} headings={len(headings)} tables={len(doc.tables)} diagrams={len(drawings)}")
+    print(
+        f"PASS paragraphs={len(doc.paragraphs)} headings={len(headings)} tables={len(doc.tables)} diagrams={len(drawings)}"
+    )
 
 
 if __name__ == "__main__":
