@@ -15,6 +15,15 @@ class CaptureRejected(DomainError):
     """The message is not eligible for capture and must not be acknowledged."""
 
 
+class InvalidAllowlist(DomainError):
+    """The allowlist configuration itself is unsafe or incomplete.
+
+    Raised at construction rather than at check time, so a deployment that would
+    capture a wider surface than intended fails at startup instead of quietly
+    ingesting other people's messages.
+    """
+
+
 class NotAllowlisted(CaptureRejected):
     """The sender, guild, or channel is not on the allowlist.
 

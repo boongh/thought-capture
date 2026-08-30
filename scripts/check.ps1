@@ -105,12 +105,20 @@ try {
     }
 
     if ($DockerUp) {
-        & $Uv run pytest -m integration
-        if ($LASTEXITCODE -ne 0) { throw "FAIL: integration tests (exit $LASTEXITCODE)" }
+        # Tells the integration conftest that a skipped test is a failure. An
+        # unreachable database must never be reported as a passing suite.
+        $env:TC_REQUIRE_INTEGRATION = "1"
+        try {
+            & $Uv run pytest -m integration
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: integration tests (exit $LASTEXITCODE)" }
+        }
+        finally {
+            Remove-Item Env:\TC_REQUIRE_INTEGRATION -ErrorAction SilentlyContinue
+        }
         Write-Host "OK: integration tests"
     }
     else {
-        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --profile core up -d)"
+        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d)"
         Write-Host "SKIPPED: Docker engine unavailable" -ForegroundColor Yellow
     }
 

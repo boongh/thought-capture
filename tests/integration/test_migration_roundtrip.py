@@ -51,12 +51,11 @@ def roundtrip_url() -> Iterator[URL]:
 
     admin = sa.create_engine(maintenance, isolation_level="AUTOCOMMIT")
     drop = sa.text(f'DROP DATABASE IF EXISTS "{ROUNDTRIP_DATABASE_NAME}" WITH (FORCE)')
-    try:
-        with admin.connect() as connection:
-            connection.execute(drop)
-            connection.execute(sa.text(f'CREATE DATABASE "{ROUNDTRIP_DATABASE_NAME}"'))
-    except sa.exc.OperationalError as exc:
-        pytest.skip(f"PostgreSQL is not reachable: {exc}")
+    # A connection failure propagates as an error rather than a skip: an
+    # unreachable database is a failed verification, not an absent one.
+    with admin.connect() as connection:
+        connection.execute(drop)
+        connection.execute(sa.text(f'CREATE DATABASE "{ROUNDTRIP_DATABASE_NAME}"'))
 
     try:
         yield target

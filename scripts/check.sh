@@ -103,13 +103,15 @@ step "unit tests"          "$uv_bin" run pytest -m "not integration and not cont
 # ---------------------------------------------------------------------------
 printf '\n--- integration tests\n'
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  if ! "$uv_bin" run pytest -m integration; then
+  # Tells the integration conftest that a skipped test is a failure. An
+  # unreachable database must never be reported as a passing suite.
+  if ! TC_REQUIRE_INTEGRATION=1 "$uv_bin" run pytest -m integration; then
     printf 'FAIL: integration tests\n' >&2
     exit 1
   fi
   printf '%s\n' "OK: integration tests"
 else
-  skipped+=("integration tests (Docker engine unavailable; start Docker, then: docker compose --profile core up -d)")
+  skipped+=("integration tests (Docker engine unavailable; start Docker, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d)")
   printf '%s\n' "SKIPPED: Docker engine unavailable"
 fi
 

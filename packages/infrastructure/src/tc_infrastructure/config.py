@@ -73,6 +73,25 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8080, ge=1, le=65535)
     api_bearer_token: SecretStr = SecretStr("")
 
+    @field_validator(
+        "discord_owner_user_id",
+        "discord_guild_id",
+        "discord_channel_id",
+        mode="before",
+    )
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """Treat an empty environment variable as absent.
+
+        ``env.example`` ships the optional Discord IDs blank, and a blank line
+        in a ``.env`` file arrives as the empty string rather than as a missing
+        key. Without this, copying the template and filling in only what you
+        need fails validation before the process reaches PostgreSQL.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("workspace_timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:

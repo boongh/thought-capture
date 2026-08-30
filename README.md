@@ -47,10 +47,12 @@ never be committed:
 cp env.example .env
 ```
 
-Start the local database:
+Start the local database. `--env-file .env` is required: Compose resolves a bare
+`.env` relative to the compose file, not the repository root, so without it the
+required password variables are unset and the command fails.
 
 ```bash
-docker compose --profile core -f deploy/compose/docker-compose.yml up -d
+docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d
 ```
 
 Apply the schema. Migrations are a deployment step and never run from API

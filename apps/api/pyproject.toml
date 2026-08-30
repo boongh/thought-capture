@@ -11,8 +11,9 @@ dependencies = [
     "uvicorn[standard]>=0.37",
 ]
 
-[project.scripts]
-tc-api = "tc_api.__main__:main"
+# No [project.scripts] yet. A declared console command whose entrypoint module
+# does not exist installs cleanly and then fails on invocation, which is worse
+# than an absent command. The script is added with the entrypoint itself.
 
 [build-system]
 requires = ["hatchling"]

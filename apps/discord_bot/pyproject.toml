@@ -10,8 +10,7 @@ dependencies = [
     "discord-py>=2.6",
 ]
 
-[project.scripts]
-tc-discord-bot = "tc_discord_bot.__main__:main"
+# No [project.scripts] yet; see the note in apps/api/pyproject.toml.
 
 [build-system]
 requires = ["hatchling"]

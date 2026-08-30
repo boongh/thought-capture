@@ -10,8 +10,7 @@ dependencies = [
     "apscheduler>=3.11,<4",
 ]
 
-[project.scripts]
-tc-worker = "tc_worker.__main__:main"
+# No [project.scripts] yet; see the note in apps/api/pyproject.toml.
 
 [build-system]
 requires = ["hatchling"]

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from tc_domain.capture import AttachmentCandidate
-from tc_domain.errors import AttachmentRejected, NotAllowlisted
+from tc_domain.errors import AttachmentRejected, InvalidAllowlist, NotAllowlisted
 
 # Executable and script types are refused outright. Release 1 does no scanning
 # and no extraction, so anything that could be executed by a careless later
@@ -80,16 +80,26 @@ class AttachmentPolicy:
 class CaptureAllowlist:
     """Exact-ID allowlist for the Discord capture surface.
 
-    Release 1 supports a direct message to the bot or one configured private
-    channel. Everything else is ignored and audited without storing its content
-    (docs/DESIGN.md 4.1).
+    Release 1 supports "either a direct message to the bot or messages in one
+    configured private channel" (docs/DESIGN.md 4.1). Everything else is ignored
+    and audited without storing its content.
+
+    Guild capture is therefore all-or-nothing: ``guild_id`` and ``channel_id``
+    must be supplied together. A guild allowlist without an exact channel would
+    capture every channel the bot can see, which is a wider surface than the
+    design permits and a plausible way to ingest other people's conversations.
     """
 
     owner_user_id: int
     guild_id: int | None = None
     channel_id: int | None = None
-    # Bot and webhook authors are never captured, regardless of ID.
-    allow_bots: bool = field(default=False)
+
+    def __post_init__(self) -> None:
+        if (self.guild_id is None) != (self.channel_id is None):
+            raise InvalidAllowlist(
+                "guild_id and channel_id must be configured together: Release 1 captures "
+                "direct messages or exactly one private channel (docs/DESIGN.md 4.1)"
+            )
 
     def check(
         self,
@@ -100,7 +110,9 @@ class CaptureAllowlist:
         author_is_bot: bool,
     ) -> None:
         """Raise ``NotAllowlisted`` unless every configured constraint matches."""
-        if author_is_bot and not self.allow_bots:
+        # Unconditional, and first: a bot author is never captured, whatever the
+        # IDs say. This also stops the bot ingesting its own acknowledgements.
+        if author_is_bot:
             raise NotAllowlisted("author is a bot or webhook")
         if author_id != self.owner_user_id:
             raise NotAllowlisted("author is not the workspace owner")
@@ -113,5 +125,5 @@ class CaptureAllowlist:
             raise NotAllowlisted("guild capture is not configured; direct messages only")
         if guild_id != self.guild_id:
             raise NotAllowlisted("guild is not allowlisted")
-        if self.channel_id is not None and channel_id != self.channel_id:
+        if channel_id != self.channel_id:
             raise NotAllowlisted("channel is not allowlisted")
