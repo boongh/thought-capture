@@ -74,3 +74,24 @@ For code reviews, lead with findings ordered by severity. Cite exact files and l
 - Keep one issue or coherent vertical slice per branch.
 - Do not rewrite shared history, force-push, discard user changes, or bypass hooks without explicit authorization.
 - Review `git diff` before committing and use a descriptive commit message.
+
+### Required commit report
+
+Every commit created by Codex must include a CTO-readable report in the commit body. A subject line alone is not sufficient. Do not create a commit until its report accurately explains the complete staged change.
+
+Use this structure:
+
+```text
+<type>: <concise outcome>
+
+Change report:
+- What changed: <user-visible and repository-level summary>
+- Why: <problem, requirement, or accepted decision motivating the change>
+- Technical details: <general implementation approach and data flow>
+- Interfaces and data: <new or changed endpoints, commands, events, functions, schemas, migrations, configuration, and their behavior>
+- Verification: <exact checks run and their results>
+- Risks and recovery: <compatibility, security, privacy, deployment, rollback, or forward-recovery notes>
+- Follow-ups: <remaining work or None>
+```
+
+The technical report must name important new or changed functions and endpoints, state what each does, and explain at a useful architectural level how it works. It must also mention migrations, configuration changes, external-service behavior, and breaking changes when applicable. Write `None` for categories that genuinely do not apply; do not omit them. Never include secrets, tokens, personal-memory content, or sensitive diagnostic data in a commit message.
