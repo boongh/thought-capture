@@ -15,6 +15,12 @@ By default, Codex should:
 
 Codex may implement changes when the user explicitly requests implementation or asks it to resolve accepted review findings. In that case, preserve the approved architecture, make the smallest coherent change, and verify it before reporting completion.
 
+## Specialized agents
+
+- Use `.codex/agents/implementation-reviewer.toml` for independent, read-only plan and code evaluation.
+- Use `.codex/agents/security-privacy-reviewer.toml` for changes involving personal data, identity, external providers, storage, logs, exports, backups, deployment, or workspace isolation.
+- Keep implementation and review in separate agent turns. A reviewer must not silently fix the change it is evaluating.
+
 ## Sources of truth
 
 Read these in order when relevant:

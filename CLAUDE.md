@@ -13,6 +13,12 @@ Claude owns:
 - explaining unfamiliar AI, backend, deployment, privacy, and operations concepts to the owner;
 - handing plans and completed changes to Codex for independent evaluation.
 
+## Specialized agent
+
+- Use `.claude/agents/architecture-researcher.md` for bounded, read-only research when an architecture decision depends on current external facts, compatibility, licensing, cost, or provider behavior.
+- Keep final synthesis and architectural decisions in the primary Claude session.
+- Do not use the researcher as a substitute for asking the owner about consequential project-specific preferences.
+
 Do not treat “primary architect” as permission to expand scope or override the owner. Do not make consequential project-specific assumptions when the answer materially changes architecture, privacy, cost, or user experience.
 
 ## Sources of truth

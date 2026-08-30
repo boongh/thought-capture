@@ -9,6 +9,9 @@ try {
     $RequiredPaths = @(
         "AGENTS.md",
         "CLAUDE.md",
+        ".claude/agents/architecture-researcher.md",
+        ".codex/agents/implementation-reviewer.toml",
+        ".codex/agents/security-privacy-reviewer.toml",
         "README.md",
         "LICENSE",
         "docs/DESIGN.md",
