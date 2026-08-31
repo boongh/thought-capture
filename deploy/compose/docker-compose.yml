@@ -102,6 +102,36 @@ services:
       TC_MIGRATION_DATABASE_URL: >-
         postgresql+psycopg://${POSTGRES_USER:-tc_migrator}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thought_capture}
 
+  api:
+    <<: *service-image
+    profiles: ["core"]
+    command: ["python", "-m", "tc_api"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *service-env
+      # Binds to all interfaces *inside* the container; the port below is
+      # published only on host loopback, so it is still not reachable off-host
+      # (docs/DESIGN.md 12.2).
+      TC_API_HOST: "0.0.0.0"
+      TC_API_PORT: "8080"
+      TC_API_BEARER_TOKEN: ${TC_API_BEARER_TOKEN:?TC_API_BEARER_TOKEN must be set in .env}
+    ports:
+      - "127.0.0.1:${TC_API_PORT:-8080}:8080"
+    volumes:
+      - attachments:/data/attachments
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/live').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
   discord-bot:
     <<: *service-image
     profiles: ["core"]
