@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
 from tc_domain.windows import CaptureWindow, previous_cutoff_before, windows_since
-from tc_infrastructure.db.tables import capture_windows
+from tc_infrastructure.db.tables import capture_windows, runs
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +50,21 @@ class PostgresCaptureWindows:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def organized_frontier(self, workspace_id: WorkspaceId) -> dt.datetime | None:
-        """The end of the newest *contiguously* organized window.
+    async def organized_frontier(
+        self, workspace_id: WorkspaceId, *, floor: dt.datetime
+    ) -> dt.datetime:
+        """The end of the newest *contiguously* organized window, anchored at ``floor``.
 
-        Deliberately not ``MAX(window_end)``. If 30 August fails and 31 August
-        then succeeds, the maximum jumps past the failure and 30 August is never
-        offered again - a day's thoughts silently never become a digest. The
-        frontier stops at the first gap instead, so a failed window keeps being
-        retried until it succeeds.
+        ``floor`` is the cutoff the very first window must start at - the cutoff
+        before this workspace's first capture. Deliberately not ``MAX(window_end)``
+        and deliberately not "whatever the earliest *organized* row happens to
+        be": if 30 August fails and 31 August then succeeds, the maximum jumps
+        past the failure and 30 August is never offered again - a day's thoughts
+        silently never become a digest. The walk starts at ``floor`` and stops at
+        the first gap, so a failed window keeps being retried until it succeeds
+        - including when the very *first* window is the one that failed, which a
+        walk anchored on the first organized row (rather than on ``floor``)
+        cannot detect, because there is nothing earlier to compare it against.
         """
         async with self._session_factory() as session:
             rows = (
@@ -66,14 +73,15 @@ class PostgresCaptureWindows:
                     .where(
                         capture_windows.c.workspace_id == workspace_id,
                         capture_windows.c.status == "organized",
+                        capture_windows.c.window_start >= floor,
                     )
                     .order_by(capture_windows.c.window_end)
                 )
             ).all()
 
-        frontier: dt.datetime | None = None
+        frontier = floor
         for row in rows:
-            if frontier is not None and row.window_start != frontier:
+            if row.window_start != frontier:
                 # A gap: an earlier window is still unorganized.
                 break
             frontier = row.window_end
@@ -90,20 +98,19 @@ class PostgresCaptureWindows:
     ) -> list[CaptureWindow]:
         """Closed windows that still need organizing, oldest first.
 
-        Anchored on the last organized cutoff, falling back to the first capture
-        so that a brand-new workspace does not enumerate windows reaching back
-        to the epoch.
+        Anchored on the contiguously organized frontier, which itself starts at
+        the cutoff before the first capture - so that a brand-new workspace does
+        not enumerate windows reaching back to the epoch, and so that a first
+        window which failed to organize is never silently skipped.
         """
-        anchor = await self.organized_frontier(workspace_id)
-        if anchor is None:
-            if first_capture_at is None:
-                return []
-            # The *cutoff before* the first capture, not the capture instant.
-            # A window is (start, end], so anchoring on the capture itself would
-            # exclude that very thought - and starting mid-day would skip its
-            # own cutoff entirely, because enumeration steps to the next local
-            # date.
-            anchor = previous_cutoff_before(first_capture_at, digest_local_time, timezone)
+        if first_capture_at is None:
+            return []
+        # The *cutoff before* the first capture, not the capture instant. A
+        # window is (start, end], so anchoring on the capture itself would
+        # exclude that very thought - and starting mid-day would skip its own
+        # cutoff entirely, because enumeration steps to the next local date.
+        floor = previous_cutoff_before(first_capture_at, digest_local_time, timezone)
+        anchor = await self.organized_frontier(workspace_id, floor=floor)
 
         already = await self._organized_ends(workspace_id)
         return [
@@ -173,6 +180,36 @@ class PostgresCaptureWindows:
                     where=capture_windows.c.status != "organized",
                 )
             )
+
+    async def succeeded_run_for(
+        self, workspace_id: WorkspaceId, window: CaptureWindow
+    ) -> uuid.UUID | None:
+        """A prior succeeded organize run already committed for this exact window.
+
+        The resume half of a durable window-keyed protocol. The pipeline
+        callback commits its ``runs`` row as its very last step, and
+        ``mark_organized`` commits the window's completion separately - a
+        crash between the two leaves the window ``closed`` even though the
+        run, and everything the callback wrote under it, already exists and
+        is complete. Without this lookup, catch-up would call the callback
+        again for the same window and produce a second, duplicate set of
+        derived output. Finding the existing run here lets the caller resume
+        by marking completion instead of redoing the work.
+        """
+        async with self._session_factory() as session:
+            run_id = await session.scalar(
+                sa.select(runs.c.id)
+                .where(
+                    runs.c.workspace_id == workspace_id,
+                    runs.c.kind == "organize",
+                    runs.c.window_start == window.start,
+                    runs.c.window_end == window.end,
+                    runs.c.status == "succeeded",
+                )
+                .order_by(runs.c.created_at.desc())
+                .limit(1)
+            )
+        return run_id
 
     async def mark_organized(
         self, workspace_id: WorkspaceId, window: CaptureWindow, run_id: uuid.UUID

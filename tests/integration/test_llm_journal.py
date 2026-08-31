@@ -308,8 +308,11 @@ async def test_a_journaled_run_replays_without_calling_a_provider(
     recorded = await journal.replay_map(workspace, run_id)
     assert request_fingerprint(request) in recorded
 
+    async def no_journal(req: LLMRequest, resp: LLMResponse, attempt: int) -> None:
+        """The replay itself is not what this test is checking."""
+
     replayed_provider = OfflineLLMProvider(recorded=recorded)
-    replayed = await complete_structured(replayed_provider, request, Thing)
+    replayed = await complete_structured(replayed_provider, request, Thing, journal=no_journal)
 
     assert replayed.value == first.value
     assert replayed.attempts == 1

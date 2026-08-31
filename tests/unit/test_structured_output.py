@@ -22,6 +22,10 @@ from tc_domain.llm import LLMOutputInvalid, LLMRequest, LLMResponse, LLMStep, Me
 from tc_infrastructure.llm.offline import OfflineLLMProvider
 
 
+async def no_journal(request: LLMRequest, response: LLMResponse, attempt: int) -> None:
+    """Journaling is required at the call site; these tests just don't check it."""
+
+
 class ProposedDocument(BaseModel):
     stable_key: str
     title: str = Field(min_length=1, max_length=120)
@@ -102,7 +106,7 @@ def test_surrounding_prose_is_discarded() -> None:
 async def test_valid_output_is_returned_without_repair() -> None:
     provider = ScriptedProvider(json.dumps(VALID))
 
-    result = await complete_structured(provider, a_request(), ProposedDocument)
+    result = await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert result.value.stable_key == "project:x"
     assert result.attempts == 1
@@ -114,7 +118,7 @@ async def test_usage_is_summed_across_attempts() -> None:
     """Budget accounting must include the failed attempt, which was still paid for."""
     provider = ScriptedProvider("not json", json.dumps(VALID))
 
-    result = await complete_structured(provider, a_request(), ProposedDocument)
+    result = await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert result.attempts == 2
     assert result.input_tokens == 20
@@ -129,7 +133,7 @@ async def test_usage_is_summed_across_attempts() -> None:
 async def test_invalid_json_is_repaired_once() -> None:
     provider = ScriptedProvider("this is not json at all", json.dumps(VALID))
 
-    result = await complete_structured(provider, a_request(), ProposedDocument)
+    result = await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert result.repaired is True
     assert result.attempts == 2
@@ -140,7 +144,7 @@ async def test_schema_violations_are_repaired_once() -> None:
     missing_sources = json.dumps({"stable_key": "project:x", "title": "Project X"})
     provider = ScriptedProvider(missing_sources, json.dumps(VALID))
 
-    result = await complete_structured(provider, a_request(), ProposedDocument)
+    result = await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert result.repaired is True
     assert result.value.source_thought_ids == [1, 2]
@@ -150,7 +154,7 @@ async def test_the_repair_quotes_the_specific_errors_back() -> None:
     """A generic "try again" wastes the attempt; the model needs the failure."""
     provider = ScriptedProvider(json.dumps({"stable_key": "x"}), json.dumps(VALID))
 
-    await complete_structured(provider, a_request(), ProposedDocument)
+    await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     repair = provider.requests[1]
     instruction = repair.messages[-1].content
@@ -162,7 +166,7 @@ async def test_the_repair_echoes_the_models_own_reply() -> None:
     bad = json.dumps({"stable_key": "x"})
     provider = ScriptedProvider(bad, json.dumps(VALID))
 
-    await complete_structured(provider, a_request(), ProposedDocument)
+    await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     roles = [m.role for m in provider.requests[1].messages]
     assert "assistant" in roles
@@ -173,7 +177,7 @@ async def test_the_repair_attempt_is_labelled_as_such() -> None:
     """So the journal shows which calls were corrections rather than first tries."""
     provider = ScriptedProvider("nonsense", json.dumps(VALID))
 
-    await complete_structured(provider, a_request(), ProposedDocument)
+    await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert provider.requests[0].step == LLMStep.ORGANIZE
     assert provider.requests[1].step == LLMStep.REPAIR
@@ -190,7 +194,7 @@ async def test_validation_errors_never_echo_the_offending_input() -> None:
         json.dumps(VALID),
     )
 
-    await complete_structured(provider, a_request(), ProposedDocument)
+    await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     instruction = provider.requests[1].messages[-1].content
     assert secret not in instruction
@@ -206,7 +210,7 @@ async def test_a_second_failure_aborts() -> None:
     provider = ScriptedProvider("nonsense", "still nonsense", json.dumps(VALID))
 
     with pytest.raises(LLMOutputInvalid) as caught:
-        await complete_structured(provider, a_request(), ProposedDocument)
+        await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
     assert caught.value.attempts == MAX_ATTEMPTS
     assert len(provider.requests) == MAX_ATTEMPTS
@@ -216,7 +220,7 @@ async def test_the_failure_names_the_schema_that_could_not_be_produced() -> None
     provider = ScriptedProvider("nonsense", "still nonsense")
 
     with pytest.raises(LLMOutputInvalid, match="ProposedDocument"):
-        await complete_structured(provider, a_request(), ProposedDocument)
+        await complete_structured(provider, a_request(), ProposedDocument, journal=no_journal)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +251,7 @@ async def test_the_offline_provider_replays_a_recorded_reply() -> None:
     request = a_request()
     provider.record(request, json.dumps(VALID))
 
-    result = await complete_structured(provider, request, ProposedDocument)
+    result = await complete_structured(provider, request, ProposedDocument, journal=no_journal)
 
     assert result.value.title == "Project X"
     assert result.attempts == 1

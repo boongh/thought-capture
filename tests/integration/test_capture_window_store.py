@@ -56,15 +56,29 @@ async def a_run(factory: async_sessionmaker[AsyncSession], workspace_id: Workspa
 async def clear_windows(
     factory: async_sessionmaker[AsyncSession], workspace_id: WorkspaceId
 ) -> None:
-    """Reset window state between tests.
+    """Reset window state between tests, and the runs this file's tests attach to them.
 
     Uses the *migration* role: since migration 0004 the application role holds
     SELECT, INSERT, and UPDATE on capture_windows but deliberately not DELETE,
     because the running system never removes a window.
+
+    ``workspace_id`` is a session-scoped fixture shared by every integration
+    test, and this file's tests reuse the same handful of synthetic dates. A
+    window-bounded run left behind by one test would otherwise be picked up by
+    ``succeeded_run_for``'s resume check in a later test reusing the same
+    bounds. Scoped to ``window_start IS NOT NULL`` because that is what only
+    this file's own runs (and ``test_organize_scheduler.py``'s) ever set;
+    other files' leftover runs for this workspace carry no window bounds and
+    must not be touched here, since some already have journal rows attached.
     """
     async with factory() as session, session.begin():
         await session.execute(
             sa.delete(capture_windows).where(capture_windows.c.workspace_id == workspace_id)
+        )
+        await session.execute(
+            sa.delete(runs).where(
+                runs.c.workspace_id == workspace_id, runs.c.window_start.is_not(None)
+            )
         )
 
 
@@ -139,7 +153,88 @@ async def test_marking_organized_records_the_run(
     await store.record(workspace, window, status="closed")
     await store.mark_organized(workspace, window, run_id)
 
-    assert await store.organized_frontier(workspace) == window.end
+    assert await store.organized_frontier(workspace, floor=window.start) == window.end
+
+
+# ---------------------------------------------------------------------------
+# Resume lookup
+# ---------------------------------------------------------------------------
+
+
+async def a_run_for_window(
+    factory: async_sessionmaker[AsyncSession],
+    workspace_id: WorkspaceId,
+    window: CaptureWindow,
+    *,
+    status: str = "succeeded",
+) -> uuid.UUID:
+    """A run row carrying the window bounds, as the callback's contract requires."""
+    run_id = uuid.uuid4()
+    async with factory() as session, session.begin():
+        await session.execute(
+            sa.insert(runs).values(
+                id=run_id,
+                workspace_id=workspace_id,
+                kind="organize",
+                status=status,
+                window_start=window.start,
+                window_end=window.end,
+            )
+        )
+    return run_id
+
+
+async def test_no_succeeded_run_is_found_when_none_was_committed(
+    store: PostgresCaptureWindows,
+    workspace: WorkspaceId,
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await clear_windows(admin_session_factory, workspace)
+    window = CaptureWindow(start=utc(2026, 8, 30, 13), end=utc(2026, 8, 31, 13))
+
+    assert await store.succeeded_run_for(workspace, window) is None
+
+
+async def test_a_committed_succeeded_run_is_found_for_its_exact_window(
+    store: PostgresCaptureWindows,
+    workspace: WorkspaceId,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The resume signal a crash between the callback and `mark_organized` needs."""
+    await clear_windows(admin_session_factory, workspace)
+    window = CaptureWindow(start=utc(2026, 8, 30, 13), end=utc(2026, 8, 31, 13))
+    run_id = await a_run_for_window(app_session_factory, workspace, window)
+
+    assert await store.succeeded_run_for(workspace, window) == run_id
+
+
+async def test_a_run_that_never_succeeded_is_not_a_resume_candidate(
+    store: PostgresCaptureWindows,
+    workspace: WorkspaceId,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A failed or still-running attempt must not be mistaken for completion."""
+    await clear_windows(admin_session_factory, workspace)
+    window = CaptureWindow(start=utc(2026, 8, 30, 13), end=utc(2026, 8, 31, 13))
+    await a_run_for_window(app_session_factory, workspace, window, status="failed")
+
+    assert await store.succeeded_run_for(workspace, window) is None
+
+
+async def test_a_run_for_a_different_window_is_not_a_resume_candidate(
+    store: PostgresCaptureWindows,
+    workspace: WorkspaceId,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await clear_windows(admin_session_factory, workspace)
+    other_window = CaptureWindow(start=utc(2026, 8, 29, 13), end=utc(2026, 8, 30, 13))
+    await a_run_for_window(app_session_factory, workspace, other_window)
+
+    window = CaptureWindow(start=utc(2026, 8, 30, 13), end=utc(2026, 8, 31, 13))
+    assert await store.succeeded_run_for(workspace, window) is None
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +324,9 @@ async def test_nothing_is_due_before_the_next_cutoff(
         now=utc(2026, 8, 31, 12),  # before today's 13:00 UTC cutoff
         digest_local_time=CUTOFF,
         timezone=BANGKOK,
-        first_capture_at=utc(2026, 8, 29, 6),
+        # Just after the organized window's own start, so the frontier walk
+        # anchors exactly where that window begins rather than finding a gap.
+        first_capture_at=utc(2026, 8, 29, 14),
     )
     assert due == []
 

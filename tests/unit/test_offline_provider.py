@@ -72,10 +72,11 @@ async def test_a_recorded_reply_is_returned_verbatim() -> None:
     assert response.model_served == OFFLINE_MODEL_ID
 
 
-async def test_replay_is_stable_across_calls() -> None:
+async def test_replay_is_stable_across_calls_within_what_was_recorded() -> None:
     """Determinism is the whole point of `rebuild --from-journal`."""
     provider = OfflineLLMProvider()
     request = a_request()
+    provider.record(request, '{"n": 1}')
     provider.record(request, '{"n": 1}')
 
     first = await provider.complete(request)
@@ -83,6 +84,22 @@ async def test_replay_is_stable_across_calls() -> None:
 
     assert first.content == second.content
     assert first.generation_id == second.generation_id
+
+
+async def test_replay_beyond_what_was_recorded_fails_rather_than_repeating() -> None:
+    """A pipeline that drifted must not silently receive a fabricated answer.
+
+    Repeating the last recorded reply for a call the original run never made
+    would let a changed pipeline use output that was never actually produced -
+    exactly the failure a replay exists to rule out.
+    """
+    provider = OfflineLLMProvider()
+    request = a_request()
+    provider.record(request, '{"n": 1}')
+    await provider.complete(request)
+
+    with pytest.raises(LLMError, match="never fabricates"):
+        await provider.complete(request)
 
 
 async def test_an_unrecorded_request_fails_rather_than_inventing() -> None:

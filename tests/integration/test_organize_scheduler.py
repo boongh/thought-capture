@@ -40,9 +40,26 @@ def workspace(seeded_identity: tuple[uuid.UUID, uuid.UUID]) -> WorkspaceId:
 async def clean_windows(
     admin_session_factory: async_sessionmaker[AsyncSession], workspace: WorkspaceId
 ) -> None:
+    """Clears this workspace's windows, and the runs this file's own tests attach to them.
+
+    ``workspace`` is a session-scoped fixture shared by every integration test,
+    and this file's tests all reuse the same handful of synthetic dates. A run
+    left behind by one test - with the exact window bounds another test also
+    uses - would otherwise be picked up by ``succeeded_run_for``'s resume
+    check, silently skipping that later test's own pipeline invocation.
+    Scoped to ``window_start IS NOT NULL`` because that is what only this
+    file's own runs (and ``test_capture_window_store.py``'s) ever set; other
+    files' leftover runs for this workspace carry no window bounds and must
+    not be touched here, since some already have journal rows attached.
+    """
     async with admin_session_factory() as session, session.begin():
         await session.execute(
             sa.delete(capture_windows).where(capture_windows.c.workspace_id == workspace)
+        )
+        await session.execute(
+            sa.delete(runs).where(
+                runs.c.workspace_id == workspace, runs.c.window_start.is_not(None)
+            )
         )
 
 
@@ -215,6 +232,39 @@ async def test_a_failed_window_is_still_offered_after_a_later_one_succeeds(
     )
 
 
+async def test_a_failed_first_window_is_still_offered_after_a_later_one_succeeds(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    clean_windows: None,
+) -> None:
+    """The gap the earlier fix could not catch: no organized window exists yet.
+
+    ``test_a_failed_window_is_still_offered_after_a_later_one_succeeds`` fails a
+    *middle* window with an earlier organized one already on the frontier. Here
+    the very *first* due window is the one that fails, so ``organized_frontier``
+    has no earlier row to compare the next success against - the bug this
+    guards against returned the later success's own end as the frontier,
+    skipping the first window forever.
+    """
+    failing = RecordingPipeline(app_session_factory, fail_on=utc(2026, 8, 29, 13))
+    first_pass = make_scheduler(app_session_factory, workspace, failing, now=utc(2026, 8, 31, 14))
+    organized = await first_pass.catch_up(first_capture_at=utc(2026, 8, 29, 6))
+
+    # 30 and 31 succeeded; 29, the first due window, failed.
+    assert organized == 2
+    assert utc(2026, 8, 29, 13) not in [w.end for w in failing.organized]
+
+    recovered = RecordingPipeline(app_session_factory)
+    second_pass = make_scheduler(
+        app_session_factory, workspace, recovered, now=utc(2026, 8, 31, 14)
+    )
+    await second_pass.catch_up(first_capture_at=utc(2026, 8, 29, 6))
+
+    assert utc(2026, 8, 29, 13) in [w.end for w in recovered.organized], (
+        "the failed first window was skipped permanently"
+    )
+
+
 async def test_a_window_completed_by_another_worker_is_not_redone(
     app_session_factory: async_sessionmaker[AsyncSession],
     workspace: WorkspaceId,
@@ -239,6 +289,67 @@ async def test_a_window_completed_by_another_worker_is_not_redone(
 
     assert organized == 0
     assert second.organized == []
+
+
+async def test_a_committed_run_is_resumed_rather_than_redone(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    clean_windows: None,
+) -> None:
+    """A crash between the callback committing and completion being marked
+    must resume, not re-invoke the callback and duplicate its output.
+
+    Simulates the crash directly: a ``runs`` row for this exact window is
+    already committed as ``succeeded`` - exactly what the callback's contract
+    requires before returning - but the window was never marked organized. A
+    callback that raises if invoked proves the scheduler resumed instead of
+    redoing the work.
+    """
+    window = CaptureWindow(start=utc(2026, 8, 30, 13), end=utc(2026, 8, 31, 13))
+    existing_run_id = uuid.uuid4()
+    async with app_session_factory() as session, session.begin():
+        await session.execute(
+            sa.insert(runs).values(
+                id=existing_run_id,
+                workspace_id=workspace,
+                kind="organize",
+                status="succeeded",
+                window_start=window.start,
+                window_end=window.end,
+            )
+        )
+
+    async def exploding_pipeline(workspace_id: WorkspaceId, w: CaptureWindow) -> uuid.UUID:
+        raise AssertionError("the callback must not be re-invoked for an already-completed window")
+
+    scheduler = make_scheduler(
+        app_session_factory,
+        workspace,
+        exploding_pipeline,
+        now=utc(2026, 8, 31, 14),  # type: ignore[arg-type]
+    )
+
+    organized = await scheduler.catch_up(first_capture_at=utc(2026, 8, 31, 6))
+
+    assert organized == 1
+    store = PostgresCaptureWindows(app_session_factory)
+    assert await store.organized_frontier(workspace, floor=window.start) == window.end
+
+    async with app_session_factory() as session:
+        run_ids = (
+            (
+                await session.execute(
+                    sa.select(runs.c.id).where(
+                        runs.c.workspace_id == workspace,
+                        runs.c.window_start == window.start,
+                        runs.c.window_end == window.end,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert run_ids == [existing_run_id], "resuming must not create a duplicate run"
 
 
 async def test_a_scheduled_run_finds_work_without_being_told_the_first_capture(
@@ -318,6 +429,55 @@ async def test_an_already_organized_window_is_not_organized_twice(
     assert again.organized == []
 
 
+async def test_a_completion_marking_failure_does_not_abandon_the_rest_of_the_batch(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    clean_windows: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB hiccup marking one window organized must not cost the other days.
+
+    The exception used to be caught only around the pipeline callback; a
+    failure in ``claim`` or ``mark_organized`` propagated out of
+    ``_organize_window`` and aborted whatever remained of the due list for
+    that ``catch_up`` call.
+    """
+    pipeline = RecordingPipeline(app_session_factory)
+    windows = PostgresCaptureWindows(app_session_factory)
+    real_mark_organized = windows.mark_organized
+
+    async def flaky_mark_organized(
+        workspace_id: WorkspaceId, window: CaptureWindow, run_id: uuid.UUID
+    ) -> None:
+        if window.end == utc(2026, 8, 30, 13):
+            raise RuntimeError("synthetic completion-marking failure")
+        await real_mark_organized(workspace_id, window, run_id)
+
+    monkeypatch.setattr(windows, "mark_organized", flaky_mark_organized)
+
+    async def first_capture(_: WorkspaceId) -> dt.datetime | None:
+        return utc(2026, 8, 29, 6)
+
+    scheduler = OrganizeScheduler(
+        windows=windows,
+        organize=pipeline,
+        first_capture=first_capture,
+        workspace_id=workspace,
+        digest_local_time=CUTOFF,
+        timezone=BANGKOK,
+        clock=lambda: utc(2026, 8, 31, 14),
+    )
+
+    organized = await scheduler.catch_up(first_capture_at=utc(2026, 8, 29, 6))
+
+    assert organized == 2, "the window whose completion could not be marked must not count"
+    assert [w.end for w in pipeline.organized] == [
+        utc(2026, 8, 29, 13),
+        utc(2026, 8, 30, 13),
+        utc(2026, 8, 31, 13),
+    ], "31 August must still be attempted even though 30 August's marking failed"
+
+
 async def test_a_contended_window_is_skipped_rather_than_waited_on(
     app_session_factory: async_sessionmaker[AsyncSession],
     workspace: WorkspaceId,
@@ -363,3 +523,37 @@ async def test_arming_before_the_cutoff_targets_today(
     scheduler = make_scheduler(app_session_factory, workspace, pipeline, now=utc(2026, 8, 31, 6))
 
     assert scheduler.schedule_next() == utc(2026, 8, 31, 13)
+
+
+async def test_re_arming_happens_even_when_catch_up_blows_up(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A due-list failure must not permanently stop the scheduler.
+
+    ``catch_up`` is already resilient to any single window's failure, but a
+    failure outside any one window - the first-capture lookup, say - used to
+    propagate out of ``_run_scheduled`` before ``schedule_next`` ran, leaving
+    the one-shot scheduler unarmed until the process restarted.
+    """
+    pipeline = RecordingPipeline(app_session_factory)
+
+    async def exploding_first_capture(_: WorkspaceId) -> dt.datetime | None:
+        raise RuntimeError("synthetic first-capture lookup failure")
+
+    scheduler = OrganizeScheduler(
+        windows=PostgresCaptureWindows(app_session_factory),
+        organize=pipeline,
+        first_capture=exploding_first_capture,
+        workspace_id=workspace,
+        digest_local_time=CUTOFF,
+        timezone=BANGKOK,
+        clock=lambda: utc(2026, 8, 31, 14),
+    )
+    rearmed = []
+    monkeypatch.setattr(scheduler, "schedule_next", lambda: rearmed.append(True))
+
+    await scheduler._run_scheduled()
+
+    assert rearmed == [True], "the scheduler must re-arm even after catch_up fails"

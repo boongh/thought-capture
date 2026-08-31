@@ -108,11 +108,21 @@ class OfflineLLMProvider:
         source = "replay"
         replies = self._recorded.get(fingerprint)
         if replies:
-            # Consume in order; the last recorded reply repeats if a replay
-            # asks more times than the original run did.
-            index = min(self._consumed.get(fingerprint, 0), len(replies) - 1)
-            content = replies[index]
-            self._consumed[fingerprint] = index + 1
+            # Consume in order. Asking more times than the original run did is
+            # not a case to paper over: a pipeline that drifted between the
+            # recorded run and this one must not silently receive an answer
+            # that was never actually produced for this call. Exhaustion fails
+            # the same way an unrecorded request does, further down.
+            index = self._consumed.get(fingerprint, 0)
+            if index < len(replies):
+                content = replies[index]
+                self._consumed[fingerprint] = index + 1
+            else:
+                raise LLMError(
+                    f"replay for {request.schema_name} asked fingerprint {fingerprint[:12]} "
+                    f"a {index + 1}th time, but only {len(replies)} occurrence(s) were recorded; "
+                    "the offline provider never fabricates a reply for a call that did not happen"
+                )
 
         if content is None and self._responder is not None:
             content = self._responder(request)

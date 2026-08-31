@@ -89,12 +89,19 @@ async def complete_structured[ModelT: BaseModel](
     request: LLMRequest,
     model: type[ModelT],
     *,
-    journal: JournalWriter | None = None,
+    journal: JournalWriter,
 ) -> StructuredResult[ModelT]:
     """Call the provider and parse its reply into ``model``.
 
     On the first validation failure the model is asked once more, with the
     specific errors quoted back. A second failure raises ``LLMOutputInvalid``.
+
+    ``journal`` is required, not optional: ADR-0008's "every attempt is
+    recorded" is an append-only guarantee, not a best-effort one, so this is
+    the one call site that could silently skip it must not have a default
+    that does. A caller that genuinely does not want a durable record (a unit
+    test of validation logic, say) still has to say so explicitly, with a
+    no-op.
     """
     attempt_request = request
     responses: list[LLMResponse] = []
@@ -108,13 +115,11 @@ async def complete_structured[ModelT: BaseModel](
             # made, and may have been paid for. ADR-0008 requires every attempt
             # to be recorded, so the failure is journaled before it propagates;
             # otherwise `llm_calls.error_code` could never be populated.
-            if journal is not None:
-                await journal(attempt_request, _failure_response(provider, exc), attempt)
+            await journal(attempt_request, _failure_response(provider, exc), attempt)
             raise
 
         responses.append(response)
-        if journal is not None:
-            await journal(attempt_request, response, attempt)
+        await journal(attempt_request, response, attempt)
 
         try:
             payload = json.loads(extract_json(response.content))

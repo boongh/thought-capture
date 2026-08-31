@@ -25,9 +25,11 @@ from tc_domain.capture import CaptureSource, ThoughtDraft, UserId, WorkspaceId
 from tc_infrastructure.db.tables import (
     document_revisions,
     documents,
+    external_identities,
     llm_calls,
     revision_sources,
     runs,
+    thoughts,
     users,
     workspace_memberships,
     workspaces,
@@ -280,6 +282,88 @@ async def test_a_journal_entry_cannot_attach_to_another_workspaces_run(
             )
 
 
+async def test_a_correction_cannot_point_at_another_workspaces_thought(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    two_workspaces: tuple[tuple[WorkspaceId, UserId], tuple[WorkspaceId, UserId]],
+) -> None:
+    """A correction must stay inside the workspace of the thought it corrects."""
+    (alpha, alpha_user), (beta, beta_user) = two_workspaces
+    repository = PostgresThoughtRepository(app_session_factory)
+    alphas_thought = await repository.append(draft(alpha, alpha_user, f"alpha-{uuid.uuid4()}"))
+
+    async with admin_session_factory() as session, session.begin():
+        with pytest.raises(sa.exc.IntegrityError):
+            await session.execute(
+                sa.insert(thoughts).values(
+                    workspace_id=beta,
+                    author_user_id=beta_user,
+                    source="api",
+                    source_message_id=f"beta-{uuid.uuid4()}",
+                    source_channel_id=None,
+                    body="a correction claiming to fix alpha's thought",
+                    client_created_at=dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.UTC),
+                    client_timezone="Asia/Bangkok",
+                    client_local_date=dt.date(2026, 8, 30),
+                    client_local_time=dt.time(20, 0),
+                    content_language="en",
+                    correction_of=alphas_thought.thought_id,
+                )
+            )
+
+
+async def test_a_thought_cannot_be_authored_by_a_non_member(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    two_workspaces: tuple[tuple[WorkspaceId, UserId], tuple[WorkspaceId, UserId]],
+) -> None:
+    """An imported or admin-created thought must still belong to a real member.
+
+    ``author_user_id`` was a global FK to ``users`` alone, so nothing stopped a
+    thought in workspace B from naming an author who belongs only to A.
+    """
+    (alpha, _), (_, beta_user) = two_workspaces
+
+    async with admin_session_factory() as session, session.begin():
+        with pytest.raises(sa.exc.IntegrityError):
+            await session.execute(
+                sa.insert(thoughts).values(
+                    workspace_id=alpha,
+                    # beta_user holds no membership in alpha.
+                    author_user_id=beta_user,
+                    source="api",
+                    source_message_id=f"synthetic-{uuid.uuid4()}",
+                    source_channel_id=None,
+                    body="claims an author who never joined this workspace",
+                    client_created_at=dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.UTC),
+                    client_timezone="Asia/Bangkok",
+                    client_local_date=dt.date(2026, 8, 30),
+                    client_local_time=dt.time(20, 0),
+                    content_language="en",
+                    correction_of=None,
+                )
+            )
+
+
+async def test_an_external_identity_requires_an_actual_membership(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    two_workspaces: tuple[tuple[WorkspaceId, UserId], tuple[WorkspaceId, UserId]],
+) -> None:
+    """Linking a user to a workspace must not bypass having actually joined it."""
+    (alpha, _), (_, beta_user) = two_workspaces
+
+    async with admin_session_factory() as session, session.begin():
+        with pytest.raises(sa.exc.IntegrityError):
+            await session.execute(
+                sa.insert(external_identities).values(
+                    # beta_user holds no membership in alpha.
+                    workspace_id=alpha,
+                    user_id=beta_user,
+                    provider="discord",
+                    external_user_id=f"synthetic-{uuid.uuid4()}",
+                )
+            )
+
+
 async def test_a_run_cannot_replay_another_workspaces_run(
     admin_session_factory: async_sessionmaker[AsyncSession],
     two_workspaces: tuple[tuple[WorkspaceId, UserId], tuple[WorkspaceId, UserId]],
@@ -465,3 +549,72 @@ async def test_the_raw_restore_flag_does_not_unlock_derived_records(
                 .where(llm_calls.c.id == call_id)
                 .values(model_requested="rewritten")
             )
+
+
+async def test_the_derived_restore_flag_permits_delete_but_never_update(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    two_workspaces: tuple[tuple[WorkspaceId, UserId], tuple[WorkspaceId, UserId]],
+) -> None:
+    """A restore session may remove a bad row, but never edit one in place.
+
+    `enforce_revision_checksum` validates only on INSERT. If the restore
+    bypass also permitted UPDATE, a restore session could change
+    ``body_markdown`` while leaving a stale ``body_sha256`` behind - the exact
+    mismatch the checksum exists to catch. Recovering a corrupted row is
+    DELETE-then-INSERT, never an edit in place.
+    """
+    (alpha, _), _ = two_workspaces
+    run_id = uuid.uuid4()
+    document_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    body = "## Summary\n\nsynthetic"
+
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(
+            sa.insert(runs).values(
+                id=run_id, workspace_id=alpha, kind="organize", status="succeeded"
+            )
+        )
+        await session.execute(
+            sa.insert(documents).values(
+                id=document_id,
+                workspace_id=alpha,
+                kind="project",
+                stable_key=f"k-{uuid.uuid4()}",
+                title="Synthetic",
+            )
+        )
+        await session.execute(
+            sa.insert(document_revisions).values(
+                id=revision_id,
+                document_id=document_id,
+                workspace_id=alpha,
+                run_id=run_id,
+                revision_number=1,
+                body_markdown=body,
+                body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+                change_summary="synthetic",
+                change_kind="organize",
+            )
+        )
+
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(sa.text("SET LOCAL tc.allow_derived_restore = 'on'"))
+        with pytest.raises(sa.exc.DBAPIError, match="append-only"):
+            await session.execute(
+                sa.update(document_revisions)
+                .where(document_revisions.c.id == revision_id)
+                .values(body_markdown="rewritten without updating the checksum")
+            )
+
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(sa.text("SET LOCAL tc.allow_derived_restore = 'on'"))
+        await session.execute(
+            sa.delete(document_revisions).where(document_revisions.c.id == revision_id)
+        )
+        remaining = await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(document_revisions)
+            .where(document_revisions.c.id == revision_id)
+        )
+        assert remaining == 0

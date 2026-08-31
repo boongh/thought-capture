@@ -7,7 +7,7 @@ workspace of the thing it pointed at. docs/DESIGN.md 6 states that every domain
 row carries workspace ownership; until now that was true of the *columns* but
 not of the *relationships*.
 
-Three further integrity gaps found in the same review are closed here:
+Six further integrity gaps found in the same review are closed here:
 
 1. ``thoughts`` was unique on ``(source, source_message_id)`` globally, so an
    API idempotency key reused in a second workspace would return the first
@@ -16,9 +16,18 @@ Three further integrity gaps found in the same review are closed here:
    were global, so a document could point at another document's revision.
 3. ``body_sha256`` was an unvalidated string, so the checksum that
    ``rebuild --verify`` depends on guaranteed nothing.
+4. ``thoughts.correction_of`` was a single-column self-reference, so a thought
+   in one workspace could claim to correct a thought owned by another.
+5. ``external_identities`` linked a user to a workspace without proving that
+   user actually holds a membership in it.
+6. ``thoughts.author_user_id`` was a single-column FK to ``users`` alone, so an
+   imported or admin-created thought in one workspace could name an author who
+   belongs only to another.
 
-And the shared restore bypass is split: the raw-thought restore escape must not
-also unlock immutable derived revisions and the model-call journal.
+And the shared restore bypass is split - and narrowed to DELETE only, since
+UPDATE under the bypass could change a revision's body while leaving its
+checksum stale: the raw-thought restore escape must not also unlock immutable
+derived revisions and the model-call journal.
 
 Revision ID: 0005
 Revises: 0004
@@ -178,6 +187,13 @@ COMPOSITE_KEYS: tuple[tuple[str, str, str, str, str], ...] = (
         "(thought_id, workspace_id)",
         "thoughts (id, workspace_id)",
     ),
+    (
+        "thoughts",
+        "thoughts_correction_of_fkey",
+        "thoughts_correction_of_ws_fk",
+        "(correction_of, workspace_id)",
+        "thoughts (id, workspace_id)",
+    ),
 )
 
 
@@ -213,6 +229,7 @@ _SINGLE_COLUMN_KEYS: dict[str, str] = {
     ),
     "runs_replay_of_run_id_fkey": "FOREIGN KEY (replay_of_run_id) REFERENCES runs(id)",
     "thought_attachments_thought_id_fkey": "FOREIGN KEY (thought_id) REFERENCES thoughts(id)",
+    "thoughts_correction_of_fkey": "FOREIGN KEY (correction_of) REFERENCES thoughts(id)",
 }
 
 
@@ -278,6 +295,30 @@ def upgrade() -> None:
         )
 
     # ------------------------------------------------------------------
+    # 4b. An external identity must belong to someone who actually holds a
+    # membership in that workspace. Nothing previously checked this: the two
+    # columns were independently valid FKs (to workspaces and to users) that
+    # said nothing about each other.
+    # ------------------------------------------------------------------
+    op.execute("""
+        ALTER TABLE external_identities
+          ADD CONSTRAINT external_identities_membership_fk
+          FOREIGN KEY (workspace_id, user_id) REFERENCES workspace_memberships (workspace_id, user_id)
+    """)
+
+    # ------------------------------------------------------------------
+    # 4c. A thought's author must likewise hold a membership in the workspace
+    # it is captured into. `author_user_id` was a global FK to `users` alone,
+    # so an imported or admin-created thought in workspace B could name an
+    # author who belongs only to workspace A.
+    # ------------------------------------------------------------------
+    op.execute("""
+        ALTER TABLE thoughts
+          ADD CONSTRAINT thoughts_author_ws_fk
+          FOREIGN KEY (workspace_id, author_user_id) REFERENCES workspace_memberships (workspace_id, user_id)
+    """)
+
+    # ------------------------------------------------------------------
     # 5. The checksum becomes an integrity guarantee.
     #
     # `rebuild --verify` re-renders Markdown and compares body_sha256
@@ -304,19 +345,29 @@ def upgrade() -> None:
     """)
 
     # ------------------------------------------------------------------
-    # 6. Split the restore bypass.
+    # 6. Split the restore bypass - and narrow it to DELETE only.
     #
     # 0004 reused `tc.allow_thought_restore` for derived tables, so restoring a
     # raw thought from backup also unlocked rewriting document revisions and
     # the model-call journal. Those are separate operations with separate
     # blast radii and now need separate, explicit settings.
+    #
+    # The bypass also no longer permits UPDATE, even under the flag.
+    # `enforce_revision_checksum` (below) validates only on INSERT, so an
+    # UPDATE let through here could change `body_markdown` while leaving a
+    # stale `body_sha256` in place - exactly the mismatch the checksum exists
+    # to catch. Restore is already specified as forward motion, a new revision
+    # whose parent is the current one, never an edit in place: recovering a
+    # corrupted or wrongly-inserted row is DELETE-then-INSERT, so DELETE is
+    # all the bypass needs to grant.
     # ------------------------------------------------------------------
     op.execute("""
         CREATE OR REPLACE FUNCTION reject_derived_mutation() RETURNS trigger
         LANGUAGE plpgsql AS $$
         BEGIN
-          IF coalesce(current_setting('tc.allow_derived_restore', true), 'off') = 'on' THEN
-            RETURN CASE TG_OP WHEN 'DELETE' THEN OLD ELSE NEW END;
+          IF TG_OP = 'DELETE'
+             AND coalesce(current_setting('tc.allow_derived_restore', true), 'off') = 'on' THEN
+            RETURN OLD;
           END IF;
           RAISE EXCEPTION
             '% is append-only: % rejected. Write a new row instead.',
@@ -370,6 +421,12 @@ def downgrade() -> None:
         END;
         $$
     """)
+
+    op.execute("ALTER TABLE thoughts DROP CONSTRAINT IF EXISTS thoughts_author_ws_fk")
+    op.execute(
+        "ALTER TABLE external_identities"
+        " DROP CONSTRAINT IF EXISTS external_identities_membership_fk"
+    )
 
     for table, dropped, name, _columns, _target in COMPOSITE_KEYS:
         op.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}")

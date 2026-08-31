@@ -49,11 +49,17 @@ class OpenRouterProvider:
         model_id: str,
         supports_strict_schema: bool,
         client: AsyncOpenAI | None = None,
+        allowed_served_models: frozenset[str] | None = None,
     ) -> None:
         if not model_id:
             raise ValueError("a pinned model slug is required; refusing a floating default")
         self._model_id = model_id
         self._strict = supports_strict_schema
+        # docs/DESIGN.md 11: "Disable silent fallback between materially
+        # different models for organization unless the fallback model is
+        # explicitly tested." Defaults to exact-match only; a deployment that
+        # has tested and accepted specific alternates passes them explicitly.
+        self._allowed_served_models = allowed_served_models or frozenset({model_id})
         self._client = client or AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -134,6 +140,22 @@ class OpenRouterProvider:
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         raw = completion.model_dump()
+
+        served = raw.get("model")
+        if served not in self._allowed_served_models:
+            # Rejected before any content is used: a document derived from an
+            # unapproved model is exactly the silent fallback docs/DESIGN.md 11
+            # prohibits, and the mismatch is worth knowing about even though
+            # the call otherwise succeeded.
+            logger.warning(
+                "llm.unapproved_model_served",
+                extra={"model_requested": self._model_id, "model_served": served},
+            )
+            raise LLMError(
+                f"{self._model_id} served unapproved model {served!r}; "
+                "add it to allowed_served_models once it has been explicitly tested, "
+                "or fix routing so the requested model is served"
+            )
 
         choices = raw.get("choices") or []
         content = ""

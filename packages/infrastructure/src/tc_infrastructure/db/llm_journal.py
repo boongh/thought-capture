@@ -12,6 +12,7 @@ or exported. Every method is workspace-scoped for the same reason.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -26,6 +27,18 @@ from tc_infrastructure.db.tables import llm_calls
 from tc_infrastructure.llm.offline import request_fingerprint
 
 logger = logging.getLogger(__name__)
+
+
+def _ordinal_lock_key(workspace_id: WorkspaceId, run_id: uuid.UUID) -> int:
+    """A stable 63-bit advisory-lock key for one run's ordinal allocation.
+
+    Same construction as ``windows.advisory_key``: a distinct namespace prefix
+    keeps this from ever colliding with the window lock's keys.
+    """
+    material = f"llm_journal_ordinal:{workspace_id}:{run_id}"
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
 
 # Stashed inside request_params so a replay does not have to reconstruct the
 # original request to find its answer.
@@ -57,19 +70,6 @@ class PostgresLLMJournal:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def next_ordinal(self, workspace_id: WorkspaceId, run_id: uuid.UUID) -> int:
-        """The next run-global call number."""
-        async with self._session_factory() as session:
-            used = await session.scalar(
-                sa.select(sa.func.count())
-                .select_from(llm_calls)
-                .where(
-                    llm_calls.c.workspace_id == workspace_id,
-                    llm_calls.c.run_id == run_id,
-                )
-            )
-        return int(used or 0) + 1
-
     async def record(
         self,
         *,
@@ -85,13 +85,33 @@ class PostgresLLMJournal:
         ``sequence`` is unique per ``(run_id, step)``; ``ordinal`` orders the
         whole run. When ``ordinal`` is omitted it is allocated, and ``sequence``
         falls back to it, so two stages that both need a repair cannot collide.
-        """
-        if ordinal is None:
-            ordinal = await self.next_ordinal(workspace_id, run_id)
-            sequence = ordinal
 
+        Allocation and insert happen inside one transaction, serialised by a
+        run-scoped advisory lock: counting existing rows in one transaction and
+        inserting in a later one (as this used to do) lets two concurrent
+        callers for the same run both count zero and both allocate ordinal 1,
+        producing nondeterministic replay order and, when ``sequence`` also
+        matches, a collision on the unique constraint instead of a clean retry.
+        """
         call_id = uuid.uuid4()
         async with self._session_factory() as session, session.begin():
+            if ordinal is None:
+                await session.execute(
+                    sa.select(
+                        sa.func.pg_advisory_xact_lock(_ordinal_lock_key(workspace_id, run_id))
+                    )
+                )
+                used = await session.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(llm_calls)
+                    .where(
+                        llm_calls.c.workspace_id == workspace_id,
+                        llm_calls.c.run_id == run_id,
+                    )
+                )
+                ordinal = int(used or 0) + 1
+                sequence = ordinal
+
             await session.execute(
                 sa.insert(llm_calls).values(
                     id=call_id,

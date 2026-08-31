@@ -84,7 +84,16 @@ class FilesystemBlobStore:
 
             if final_path.exists():
                 # Same bytes already stored. Keep the original and discard ours.
+                # Still re-sync the fan-out directories rather than trusting
+                # that `exists()` implies durable: a prior write can rename the
+                # file and then fail to fsync its directory entry, in which
+                # case that write already failed and its caller never got a
+                # StoredBlob back. A retry landing here on the same bytes must
+                # not report success without confirming durability itself -
+                # otherwise the gap the first attempt's failure existed to
+                # surface would just be carried forward silently.
                 temp_path.unlink(missing_ok=True)
+                _fsync_fanout_directories(self._root, storage_key)
                 logger.debug("blob.deduplicated", extra={"sha256": sha256, "size_bytes": size})
                 return StoredBlob(
                     sha256=sha256,
@@ -100,8 +109,11 @@ class FilesystemBlobStore:
             # The rename itself must survive a crash. Without this, PostgreSQL
             # can hold - and the bot can acknowledge - an attachment whose
             # directory entry never reached the disk, leaving a committed
-            # thought pointing at a blob that does not exist.
-            _fsync_directory(final_path.parent)
+            # thought pointing at a blob that does not exist. A never-before-
+            # seen prefix creates *two* new fan-out directories, not one, so
+            # every level this write may have created is synced, not just the
+            # leaf.
+            _fsync_fanout_directories(self._root, storage_key)
             logger.info("blob.stored", extra={"sha256": sha256, "size_bytes": size})
             return StoredBlob(
                 sha256=sha256, size_bytes=size, storage_key=storage_key, deduplicated=False
@@ -117,6 +129,23 @@ class FilesystemBlobStore:
         return self.path_for(storage_key).read_bytes()
 
 
+def _fsync_fanout_directories(root: Path, storage_key: str) -> None:
+    """Flush every fan-out directory level a write to ``storage_key`` may have created.
+
+    ``storage_key`` is ``ab/cd/<hash>``: two directory levels, both possibly
+    new. Fsyncing only the leaf (``ab/cd``) makes the file's own entry durable
+    but says nothing about whether the leaf directory itself durably exists
+    inside its parent (``ab``) - a fresh two-level prefix creates both in one
+    write. Every level is synced unconditionally rather than tracked as
+    "newly created": fsyncing a directory that already existed is cheap, and
+    finding out which levels were new would cost a stat call each anyway.
+    """
+    directory = root / Path(storage_key).parent
+    for _ in range(FANOUT_DEPTH):
+        _fsync_directory(directory)
+        directory = directory.parent
+
+
 def _fsync_directory(directory: Path) -> None:
     """Flush a directory entry to disk, where the platform supports it.
 
@@ -124,16 +153,19 @@ def _fsync_directory(directory: Path) -> None:
     durable; syncing the file alone is not enough. Windows has no equivalent
     and rejects opening a directory as a file, so the call is skipped there -
     the development platform, not the deployment platform (docs/DESIGN.md 13).
+
+    On POSIX, a failure here is deliberately **not** swallowed: it propagates
+    out of ``put()``, which is still inside its own exception handler and will
+    clean up the temporary file and re-raise. Treating this as a harmless,
+    debug-logged skip would let the database commit and Discord acknowledge a
+    thought whose canonical attachment rename was never made durable - a
+    directory entry that a crash before the next fsync can simply lose, with
+    nothing left for garbage collection to restore it from.
     """
     if os.name == "nt":
         return
     fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        # Some filesystems refuse directory fsync. The blob is still written
-        # and hashed; losing the entry is a recoverable garbage-collection
-        # problem, not a corrupt object.
-        logger.debug("blob.directory_fsync_unsupported")
     finally:
         os.close(fd)

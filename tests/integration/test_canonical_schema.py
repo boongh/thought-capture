@@ -41,6 +41,15 @@ def _seed_workspace_and_user(connection: sa.Connection) -> tuple[uuid.UUID, uuid
         ),
         {"id": workspace_id, "name": "synthetic workspace"},
     )
+    # A thought's author must hold a membership in its workspace
+    # (thoughts_author_ws_fk, migration 0005).
+    connection.execute(
+        sa.text(
+            "INSERT INTO workspace_memberships (workspace_id, user_id, role)"
+            " VALUES (:workspace_id, :user_id, 'owner')"
+        ),
+        {"workspace_id": workspace_id, "user_id": user_id},
+    )
     return workspace_id, user_id
 
 
