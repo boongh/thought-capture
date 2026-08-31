@@ -1,7 +1,7 @@
 # Thought Capture AI - System Design
 
 - **Status:** Accepted implementation anchor
-- **Version:** 1.1
+- **Version:** 1.2
 - **Date:** 2026-08-31
 - **Audience:** Small experienced engineering team
 - **Owner:** Project owner
@@ -666,6 +666,8 @@ Operational rules:
 - Disable silent fallback between materially different models for organization unless the fallback model is explicitly tested.
 - Cache development responses by a hash of redacted prompt, model, prompt version, and schema version; production capture content is not written to developer logs.
 
+Model selection has two modes (ADR-0006). **Safe mode** (the default) restricts `model_organize`/`model_query_plan` to a small allowlist of slugs that have actually been checked against the three rules above - retention/training policy, tested structured-output support, and the quoted-data prompt-injection assumption in section 12.2 - enforced at process startup, not left to review discipline. **Custom mode** lifts the allowlist for an operator who wants to pin an unreviewed model and accepts that responsibility themselves. Either way, the response actually served is still checked against the requested model before its content is used (see above): safe mode prevents sending prompts to a model nobody vetted; the served-model check catches a gateway silently substituting one after the fact. These are different failures and neither guard substitutes for the other.
+
 The embedding model is the deliberate exception to the OpenRouter default: from the organize second wave onward it runs locally (section 7.3.6), because text embedding is cheap to host, keeps the organize path free of an extra network round trip, and avoids disclosing document content to a second provider.
 
 Local models later implement the same `LLMProvider` port through an OpenAI-compatible server such as Ollama or vLLM. Switching is configuration plus evaluation, not business-logic work.
@@ -896,7 +898,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 | ADR-0003 | PostgreSQL precision retrieval plus Khoj semantic/Ask |
 | ADR-0004 | Immutable full-snapshot document revisions |
 | ADR-0005 | Workspace-scoped single-user-first schema |
-| ADR-0006 | OpenRouter behind provider port |
+| ADR-0006 | OpenRouter behind a provider port, with safe and custom model-selection modes |
 | ADR-0007 | Custom unified UI over stable gateway, no Khoj fork |
 
 Implementation should create these ADR files when the first code for each decision lands; this design remains the summary authority.

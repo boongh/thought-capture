@@ -10,10 +10,13 @@ from __future__ import annotations
 import datetime as dt
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from tc_infrastructure.llm.reviewed_models import REVIEWED_MODELS
 
 
 class Settings(BaseSettings):
@@ -57,6 +60,12 @@ class Settings(BaseSettings):
     # -- OpenRouter --------------------------------------------------------
     openrouter_api_key: SecretStr = SecretStr("")
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Safe mode (docs/adr/0006) restricts model_organize/model_query_plan to
+    # tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS. Custom mode lifts
+    # that restriction for a host who accepts responsibility for whatever
+    # model they pin. Defaults to safe: an operator who wants the wider
+    # selection has to say so.
+    model_selection_mode: Literal["safe", "custom"] = "safe"
     # Deliberately empty until a slug is pinned. An empty value selects the
     # deterministic offline adapter rather than silently calling a provider.
     model_organize: str = ""
@@ -103,6 +112,29 @@ class Settings(BaseSettings):
                 f"{value!r} is not a known IANA timezone (for example 'Asia/Bangkok')"
             ) from exc
         return value
+
+    @model_validator(mode="after")
+    def _safe_mode_restricts_to_reviewed_models(self) -> Settings:
+        """Safe mode is a startup guarantee, not a hint (docs/adr/0006).
+
+        A pinned slug that has not been reviewed for retention/training policy
+        and JSON-schema enforcement must not reach a live run silently - so
+        this fails at process start, the same way an unknown timezone does,
+        rather than at the first organize call. An empty slug is exempt: it
+        selects the deterministic offline adapter, not a provider call.
+        """
+        if self.model_selection_mode != "safe":
+            return self
+        for field_name in ("model_organize", "model_query_plan"):
+            slug = getattr(self, field_name)
+            if slug and slug not in REVIEWED_MODELS:
+                raise ValueError(
+                    f"{field_name}={slug!r} is not in the reviewed-models allowlist "
+                    "required by safe mode (docs/adr/0006). Either have it reviewed "
+                    "and added to tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS, "
+                    "or set TC_MODEL_SELECTION_MODE=custom to select models freely."
+                )
+        return self
 
     @property
     def timezone(self) -> ZoneInfo:

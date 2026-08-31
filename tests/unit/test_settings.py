@@ -87,3 +87,52 @@ def test_offline_model_adapter_is_selected_when_no_slug_is_pinned(
     assert build(monkeypatch, TC_MODEL_ORGANIZE="").uses_offline_model_adapter is True
     pinned = build(monkeypatch, TC_MODEL_ORGANIZE="qwen/qwen3.8-flash")
     assert pinned.uses_offline_model_adapter is False
+
+
+def test_safe_mode_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert build(monkeypatch).model_selection_mode == "safe"
+
+
+def test_safe_mode_accepts_a_reviewed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = build(
+        monkeypatch,
+        TC_MODEL_SELECTION_MODE="safe",
+        TC_MODEL_ORGANIZE="qwen/qwen3.8-flash",
+    )
+    assert settings.model_organize == "qwen/qwen3.8-flash"
+
+
+def test_safe_mode_rejects_an_unreviewed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """docs/adr/0006: a pinned slug must be reviewed before it can receive prompts."""
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(
+            monkeypatch,
+            TC_MODEL_SELECTION_MODE="safe",
+            TC_MODEL_ORGANIZE="nvidia/nemotron-3.5-lightning:free",
+        )
+
+
+def test_safe_mode_rejects_an_unreviewed_query_plan_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_QUERY_PLAN="an/unreviewed-model")
+
+
+def test_safe_mode_permits_an_empty_slug(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty selects the offline adapter, not a provider call - nothing to review."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_ORGANIZE="")
+    assert settings.uses_offline_model_adapter is True
+
+
+def test_custom_mode_accepts_an_unreviewed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The escape hatch: the host accepts responsibility for the model themselves."""
+    settings = build(
+        monkeypatch,
+        TC_MODEL_SELECTION_MODE="custom",
+        TC_MODEL_ORGANIZE="nvidia/nemotron-3.5-lightning:free",
+    )
+    assert settings.model_organize == "nvidia/nemotron-3.5-lightning:free"
+
+
+def test_an_unknown_selection_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError):
+        build(monkeypatch, TC_MODEL_SELECTION_MODE="reckless")
