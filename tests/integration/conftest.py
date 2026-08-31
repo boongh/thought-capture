@@ -25,14 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from tc_infrastructure.config import get_settings
+from tests.integration.support import CONNECT_ARGS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_DATABASE_NAME = "thought_capture_test"
-
-# Fail fast when PostgreSQL is not listening. Without this, every test in the
-# suite waits out the driver's default connect timeout, turning "the database is
-# down" into a four-minute run instead of a four-second one.
-CONNECT_ARGS = {"connect_timeout": 5}
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:

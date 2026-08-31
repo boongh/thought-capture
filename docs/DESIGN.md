@@ -430,6 +430,7 @@ Bodies are selected in two passes. The first is deterministic and free; the seco
 | `recency` | `entity_mentions` over the last `context.recency_windows` windows | Unnamed continuations of recent subjects |
 | `cooccurrence` | Historical co-mention frequency with already-selected entities, above `context.cooccurrence_threshold` | Structural expansion without embeddings |
 | `open_thread` | Documents of kind `todo` or `decision` with unresolved items | Standing context that is valuable whether or not it is mentioned |
+| `embedding` | Cosine similarity between the window text and locally computed entity-document embeddings, top `context.embedding_top_k` | Topical relevance where the entity is neither named, recent, nor co-occurring (second wave; see 7.3.6) |
 | `selector` | One `select` model call over the window text plus the Tier 1 index, returning `stable_key` values | Referential cases signals cannot resolve: pronouns, "the thing we discussed", implied projects |
 
 The `select` call is a single request with a small structured output, not an agentic loop. It resolves most of what a tool-calling retriever would find while re-sending context once instead of once per turn, and because it is one deterministic-shaped call it stays cacheable by prompt hash for development and reproducible for evaluation.
@@ -499,9 +500,13 @@ A document that was referenced while `index_only` is a retrieval miss. Without t
 | Instructions and schema | ~1k tokens |
 | **Total input** | **<= 13k tokens** |
 
-Once assembly is bounded this way, run cost is dominated by *output* tokens - the bodies actually rewritten - which is why invariant 5 is the largest single cost lever in the pipeline. Assembly configuration (`context.max_body_tokens`, `context.max_selected_documents`, `context.timeline_tail_entries`, `context.recency_windows`, `context.cooccurrence_threshold`) is workspace-scoped and versioned with the prompt.
+Once assembly is bounded this way, run cost is dominated by *output* tokens - the bodies actually rewritten - which is why invariant 5 is the largest single cost lever in the pipeline. Assembly configuration (`context.max_body_tokens`, `context.max_selected_documents`, `context.timeline_tail_entries`, `context.recency_windows`, `context.cooccurrence_threshold`, `context.embedding_enabled`, `context.embedding_top_k`) is workspace-scoped and versioned with the prompt.
 
-Embedding-based selection is deliberately deferred. At Release 1 corpus size the alias, recency, and co-occurrence signals plus one selector call are expected to be near-optimal, and the Khoj index is by construction one run stale at organize time. Revisit when `context_recall` shows the deterministic signals missing documents, or when the corpus exceeds a few hundred entity documents.
+Embedding selection is a planned second-wave signal, not a deferral. Entity-document embeddings are computed from each revision's `Summary` and `Current state` sections at revision-write time, inside the transaction that writes the revision, so they are fresh by construction. This is distinct from the Khoj semantic index, which covers generated documents and is by construction one run stale at organize time; organize must not depend on it, and depending on it would invert the Phase 1 / Phase 2 order.
+
+The embedding model runs locally rather than through OpenRouter. Text embedding is inexpensive to host, and keeping it local removes per-run cost, removes a network round trip from the organize path, and avoids disclosing document content to a second provider (section 12.1). At Release 1 corpus size the vectors are stored as `float4[]` alongside the revision and compared by direct cosine similarity; pgvector is unnecessary until a linear scan is measurably expensive, and the pinned `postgres` image does not carry the extension. Changing the embedding model requires a `reembed` run and is recorded in `runs.embedding_model_id`.
+
+Sequencing is driven by measurability, not effort. The deterministic signals and the selector call ship first so that `context_recall` has a baseline; the embedding signal is then enabled behind `context.embedding_enabled` and judged by whether that number moves. Enabling every signal at once makes an underperforming or redundant signal impossible to identify.
 
 ### 7.4 Structured output contract
 
@@ -661,6 +666,8 @@ Operational rules:
 - Disable silent fallback between materially different models for organization unless the fallback model is explicitly tested.
 - Cache development responses by a hash of redacted prompt, model, prompt version, and schema version; production capture content is not written to developer logs.
 
+The embedding model is the deliberate exception to the OpenRouter default: from the organize second wave onward it runs locally (section 7.3.6), because text embedding is cheap to host, keeps the organize path free of an extra network round trip, and avoids disclosing document content to a second provider.
+
 Local models later implement the same `LLMProvider` port through an OpenAI-compatible server such as Ollama or vLLM. Switching is configuration plus evaluation, not business-logic work.
 
 ## 12. Privacy, security, and threat model
@@ -671,7 +678,8 @@ Personal memory data is unusually sensitive: it can reveal relationships, health
 
 - Discord sees message content and attachments sent through Discord.
 - OpenRouter and the selected downstream model provider receive text included in model requests.
-- If OpenRouter embeddings are enabled, the provider receives indexed document chunks.
+- Entity-document embeddings for organize context assembly are computed locally and are not disclosed to any provider (section 7.3.6).
+- If OpenRouter embeddings are enabled instead of the local model, the provider receives indexed document chunks.
 - Khoj and PostgreSQL retain local copies.
 - Off-site backup providers receive encrypted ciphertext only.
 
@@ -866,7 +874,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 - Daily digest cutoff defaults to 20:00 local, using successful-cutoff capture windows.
 - Entity documents evolve through immutable full-snapshot revisions.
 - Khoj UI is used first; a unified custom UI is Phase 4.
-- Organize context is assembled from a complete entity index plus additive body selection; the organize pipeline uses no agentic retrieval loop.
+- Organize context is assembled from a complete entity index plus additive body selection, with locally computed embeddings as a second-wave signal.
 
 ### Deferred with explicit trigger
 
@@ -876,6 +884,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 - OCR/vision/transcription: new release only after capture habit validation.
 - Entity merge across weak aliases: require review workflow and quality data.
 - Cross-day non-entity rolling documents: evaluate after entity documents are used.
+- Agentic tool-calling retrieval in the organize pipeline: reconsider only when the complete entity index no longer fits the prompt budget, in the high hundreds of entity documents. Below that threshold the index is already fully visible to the model, while a loop costs roughly 2.5-5x the assembly input tokens and makes the section 15.3 regression diffs non-reproducible.
 - Public or multi-user access: requires Phase 5 security gate.
 
 ## 20. Initial ADR index

@@ -19,7 +19,7 @@ from alembic.config import Config
 from sqlalchemy.engine import URL, make_url
 
 from tc_infrastructure.config import get_settings
-from tests.integration.conftest import CONNECT_ARGS
+from tests.integration.support import CONNECT_ARGS
 
 pytestmark = pytest.mark.integration
 
