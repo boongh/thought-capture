@@ -122,6 +122,7 @@ async def test_the_same_step_and_sequence_cannot_be_recorded_twice(
     workspace: WorkspaceId,
     app_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """The uniqueness rule still holds when a caller pins both values."""
     run_id = await a_run(app_session_factory, workspace)
     await journal.record(
         workspace_id=workspace,
@@ -129,6 +130,7 @@ async def test_the_same_step_and_sequence_cannot_be_recorded_twice(
         request=a_request(),
         response=a_response(),
         sequence=1,
+        ordinal=1,
     )
 
     with pytest.raises(sa.exc.IntegrityError):
@@ -138,7 +140,41 @@ async def test_the_same_step_and_sequence_cannot_be_recorded_twice(
             request=a_request(),
             response=a_response(),
             sequence=1,
+            ordinal=1,
         )
+
+
+async def test_two_repaired_stages_in_one_run_do_not_collide(
+    journal: PostgresLLMJournal,
+    workspace: WorkspaceId,
+    app_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every stage's repair is attempt 2, so a naive (step, attempt) key clashes.
+
+    Select and organize each needing one repair would both try to record
+    ``(run, 'repair', 2)``. The run-global ordinal is what keeps them apart.
+    """
+    run_id = await a_run(app_session_factory, workspace)
+    repair = LLMRequest(
+        step=LLMStep.REPAIR,
+        messages=(Message(role="user", content="fix it"),),
+        schema_name="Thing",
+        json_schema={"type": "object"},
+        prompt_version="v1",
+        schema_version="v1",
+    )
+
+    # Two stages, each recording its own repair, with no ordinal supplied.
+    await journal.record(
+        workspace_id=workspace, run_id=run_id, request=repair, response=a_response(), sequence=2
+    )
+    await journal.record(
+        workspace_id=workspace, run_id=run_id, request=repair, response=a_response(), sequence=2
+    )
+
+    calls = await journal.calls_for(workspace, run_id)
+    assert len(calls) == 2
+    assert [c.ordinal for c in calls] == [1, 2]
 
 
 async def test_the_application_role_cannot_rewrite_the_journal(
@@ -237,7 +273,7 @@ async def test_usage_sums_every_attempt(
         sequence=2,
     )
 
-    assert await journal.usage_for(run_id) == (200, 40)
+    assert await journal.usage_for(workspace, run_id) == (200, 40)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +305,7 @@ async def test_a_journaled_run_replays_without_calling_a_provider(
         ),
     )
 
-    recorded = await journal.replay_map(run_id)
+    recorded = await journal.replay_map(workspace, run_id)
     assert request_fingerprint(request) in recorded
 
     replayed_provider = OfflineLLMProvider(recorded=recorded)
@@ -294,7 +330,7 @@ async def test_replaying_a_question_that_was_never_asked_fails(
         sequence=1,
     )
 
-    provider = OfflineLLMProvider(recorded=await journal.replay_map(run_id))
+    provider = OfflineLLMProvider(recorded=await journal.replay_map(workspace, run_id))
 
     from tc_domain.llm import LLMError
 
@@ -317,6 +353,6 @@ async def test_calls_for_a_run_are_returned_in_order(
             sequence=sequence,
         )
 
-    calls = await journal.calls_for(run_id)
+    calls = await journal.calls_for(workspace, run_id)
 
     assert [c.sequence for c in calls] == [1, 2, 3]

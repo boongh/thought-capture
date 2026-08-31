@@ -139,7 +139,7 @@ async def test_marking_organized_records_the_run(
     await store.record(workspace, window, status="closed")
     await store.mark_organized(workspace, window, run_id)
 
-    assert await store.last_organized_cutoff(workspace) == window.end
+    assert await store.organized_frontier(workspace) == window.end
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ async def test_catch_up_offers_every_missed_window_oldest_first(
         now=utc(2026, 8, 31, 14),
         digest_local_time=CUTOFF,
         timezone=BANGKOK,
-        first_capture_at=utc(2026, 8, 28, 13),
+        first_capture_at=utc(2026, 8, 29, 6),
     )
 
     assert [w.end for w in due] == [
@@ -206,7 +206,7 @@ async def test_an_organized_window_is_never_offered_again(
         now=utc(2026, 8, 31, 14),
         digest_local_time=CUTOFF,
         timezone=BANGKOK,
-        first_capture_at=utc(2026, 8, 28, 13),
+        first_capture_at=utc(2026, 8, 29, 6),
     )
 
     assert first.end not in [w.end for w in due]
@@ -229,7 +229,7 @@ async def test_nothing_is_due_before_the_next_cutoff(
         now=utc(2026, 8, 31, 12),  # before today's 13:00 UTC cutoff
         digest_local_time=CUTOFF,
         timezone=BANGKOK,
-        first_capture_at=utc(2026, 8, 28, 13),
+        first_capture_at=utc(2026, 8, 29, 6),
     )
     assert due == []
 

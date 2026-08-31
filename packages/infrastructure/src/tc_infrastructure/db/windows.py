@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
-from tc_domain.windows import CaptureWindow, windows_since
+from tc_domain.windows import CaptureWindow, previous_cutoff_before, windows_since
 from tc_infrastructure.db.tables import capture_windows
 
 logger = logging.getLogger(__name__)
@@ -50,16 +50,34 @@ class PostgresCaptureWindows:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def last_organized_cutoff(self, workspace_id: WorkspaceId) -> dt.datetime | None:
-        """The end of the most recent successfully organized window."""
+    async def organized_frontier(self, workspace_id: WorkspaceId) -> dt.datetime | None:
+        """The end of the newest *contiguously* organized window.
+
+        Deliberately not ``MAX(window_end)``. If 30 August fails and 31 August
+        then succeeds, the maximum jumps past the failure and 30 August is never
+        offered again - a day's thoughts silently never become a digest. The
+        frontier stops at the first gap instead, so a failed window keeps being
+        retried until it succeeds.
+        """
         async with self._session_factory() as session:
-            latest = await session.scalar(
-                sa.select(sa.func.max(capture_windows.c.window_end)).where(
-                    capture_windows.c.workspace_id == workspace_id,
-                    capture_windows.c.status == "organized",
+            rows = (
+                await session.execute(
+                    sa.select(capture_windows.c.window_start, capture_windows.c.window_end)
+                    .where(
+                        capture_windows.c.workspace_id == workspace_id,
+                        capture_windows.c.status == "organized",
+                    )
+                    .order_by(capture_windows.c.window_end)
                 )
-            )
-        return latest if latest is None else dt.datetime.fromisoformat(latest.isoformat())
+            ).all()
+
+        frontier: dt.datetime | None = None
+        for row in rows:
+            if frontier is not None and row.window_start != frontier:
+                # A gap: an earlier window is still unorganized.
+                break
+            frontier = row.window_end
+        return frontier
 
     async def due_windows(
         self,
@@ -76,11 +94,16 @@ class PostgresCaptureWindows:
         so that a brand-new workspace does not enumerate windows reaching back
         to the epoch.
         """
-        anchor = await self.last_organized_cutoff(workspace_id)
+        anchor = await self.organized_frontier(workspace_id)
         if anchor is None:
             if first_capture_at is None:
                 return []
-            anchor = first_capture_at
+            # The *cutoff before* the first capture, not the capture instant.
+            # A window is (start, end], so anchoring on the capture itself would
+            # exclude that very thought - and starting mid-day would skip its
+            # own cutoff entirely, because enumeration steps to the next local
+            # date.
+            anchor = previous_cutoff_before(first_capture_at, digest_local_time, timezone)
 
         already = await self._organized_ends(workspace_id)
         return [
@@ -99,10 +122,42 @@ class PostgresCaptureWindows:
             )
         return {row[0] for row in rows}
 
+    async def claim(self, workspace_id: WorkspaceId, window: CaptureWindow) -> bool:
+        """Mark the window in progress, unless it is already organized.
+
+        Returns False when another worker completed it first. The check happens
+        *inside* the write rather than before it: a worker can compute its due
+        list, wait on the advisory lock while another worker finishes the same
+        window, and then acquire the lock afterwards. Overwriting the status
+        unconditionally would regress an organized row back to closed and run
+        the pipeline a second time, producing a duplicate digest.
+        """
+        async with self._session_factory() as session, session.begin():
+            result = await session.execute(
+                pg_insert(capture_windows)
+                .values(
+                    workspace_id=workspace_id,
+                    window_start=window.start,
+                    window_end=window.end,
+                    status="closed",
+                )
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "window_end"],
+                    set_={"status": "closed"},
+                    where=capture_windows.c.status != "organized",
+                )
+                .returning(capture_windows.c.window_end)
+            )
+            claimed = result.scalar_one_or_none() is not None
+
+        if not claimed:
+            logger.info("window.already_organized", extra={"window_end": window.end.isoformat()})
+        return claimed
+
     async def record(
         self, workspace_id: WorkspaceId, window: CaptureWindow, *, status: str
     ) -> None:
-        """Upsert the window row. Idempotent on ``(workspace_id, window_end)``."""
+        """Upsert the window row. Never downgrades an organized window."""
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 pg_insert(capture_windows)
@@ -115,6 +170,7 @@ class PostgresCaptureWindows:
                 .on_conflict_do_update(
                     index_elements=["workspace_id", "window_end"],
                     set_={"status": status},
+                    where=capture_windows.c.status != "organized",
                 )
             )
 

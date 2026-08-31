@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from tc_domain.attachment_origin import AttachmentOriginPolicy
 from tc_domain.capture import ArchivedAttachment, AttachmentCandidate, ExtractedStatus, Sha256
 from tc_domain.errors import AttachmentArchiveFailed
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
@@ -31,12 +32,18 @@ class HttpAttachmentArchive:
         client: httpx.AsyncClient,
         *,
         max_bytes: int,
+        origin_policy: AttachmentOriginPolicy | None = None,
     ) -> None:
         self._blobs = blob_store
         self._client = client
         self._max_bytes = max_bytes
+        self._origins = origin_policy or AttachmentOriginPolicy()
 
     async def archive(self, candidate: AttachmentCandidate) -> ArchivedAttachment:
+        # Checked before any request is made. The service must not be usable as
+        # a proxy for reaching its own network.
+        self._origins.check(candidate.url, filename=candidate.filename)
+
         try:
             stored = await self._blobs.put(self._download(candidate))
         except AttachmentArchiveFailed:
@@ -72,8 +79,17 @@ class HttpAttachmentArchive:
 
     async def _download(self, candidate: AttachmentCandidate) -> AsyncIterator[bytes]:
         async with self._client.stream(
-            "GET", candidate.url, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            "GET",
+            candidate.url,
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            # A followed redirect is a second, unvetted request to a host the
+            # policy never approved. The attachment CDNs serve directly.
+            follow_redirects=self._origins.allow_redirects,
         ) as response:
+            if response.is_redirect:
+                raise AttachmentArchiveFailed(
+                    f"{candidate.filename!r} redirected; attachment origins are not followed"
+                )
             response.raise_for_status()
 
             received = 0

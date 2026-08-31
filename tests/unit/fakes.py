@@ -17,6 +17,7 @@ from tc_domain.capture import (
     Sha256,
     ThoughtDraft,
     ThoughtId,
+    WorkspaceId,
 )
 from tc_domain.errors import AttachmentArchiveFailed
 
@@ -26,7 +27,7 @@ class FakeThoughtRepository:
 
     def __init__(self) -> None:
         self.appended: list[ThoughtDraft] = []
-        self._ids_by_key: dict[tuple[CaptureSource, str], ThoughtId] = {}
+        self._ids_by_key: dict[tuple[WorkspaceId, CaptureSource, str], ThoughtId] = {}
         self._next_id = 1
         # When True, `find_id_by_source_message` pretends not to know about a
         # row that `append` will nonetheless conflict with. This reproduces the
@@ -34,14 +35,17 @@ class FakeThoughtRepository:
         self.hide_from_lookup = False
 
     async def find_id_by_source_message(
-        self, source: CaptureSource, source_message_id: str
+        self,
+        workspace_id: WorkspaceId,
+        source: CaptureSource,
+        source_message_id: str,
     ) -> ThoughtId | None:
         if self.hide_from_lookup:
             return None
-        return self._ids_by_key.get((source, source_message_id))
+        return self._ids_by_key.get((workspace_id, source, source_message_id))
 
     async def append(self, draft: ThoughtDraft) -> AppendOutcome:
-        key = (draft.source, draft.source_message_id)
+        key = (draft.workspace_id, draft.source, draft.source_message_id)
         existing = self._ids_by_key.get(key)
         if existing is not None:
             return AppendOutcome(thought_id=existing, created=False)

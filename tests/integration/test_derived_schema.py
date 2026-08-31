@@ -7,6 +7,7 @@ the pipeline is trusted to keep.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 import pytest
@@ -65,6 +66,7 @@ def _revision(
     connection: sa.Connection,
     document_id: uuid.UUID,
     run_id: uuid.UUID,
+    workspace_id: uuid.UUID,
     *,
     number: int,
     parent: uuid.UUID | None = None,
@@ -75,21 +77,25 @@ def _revision(
     connection.execute(
         sa.text("""
             INSERT INTO document_revisions (
-              id, document_id, parent_revision_id, run_id, revision_number,
+              id, document_id, workspace_id, parent_revision_id, run_id, revision_number,
               body_markdown, body_sha256, change_summary, change_kind
             ) VALUES (
-              :id, :document_id, :parent, :run_id, :number,
-              :body, repeat('a', 64), 'synthetic change', :change_kind
+              :id, :document_id, :workspace_id, :parent, :run_id, :number,
+              :body, :sha, 'synthetic change', :change_kind
             )
         """),
         {
             "id": revision_id,
             "document_id": document_id,
+            "workspace_id": workspace_id,
             "parent": parent,
             "run_id": run_id,
             "number": number,
             "body": body,
             "change_kind": change_kind,
+            # Computed, not invented: migration 0005 validates the checksum on
+            # insert, so `rebuild --verify` can rely on it.
+            "sha": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         },
     )
     return revision_id
@@ -120,7 +126,7 @@ def test_a_revision_cannot_be_edited(connection: sa.Connection) -> None:
     workspace_id, _ = _seed(connection)
     run_id = _run(connection, workspace_id)
     document_id = _document(connection, workspace_id)
-    revision_id = _revision(connection, document_id, run_id, number=1)
+    revision_id = _revision(connection, document_id, run_id, workspace_id, number=1)
 
     with pytest.raises(sa.exc.DBAPIError, match="append-only"):
         connection.execute(
@@ -133,7 +139,7 @@ def test_a_revision_cannot_be_deleted(connection: sa.Connection) -> None:
     workspace_id, _ = _seed(connection)
     run_id = _run(connection, workspace_id)
     document_id = _document(connection, workspace_id)
-    revision_id = _revision(connection, document_id, run_id, number=1)
+    revision_id = _revision(connection, document_id, run_id, workspace_id, number=1)
 
     with pytest.raises(sa.exc.DBAPIError, match="append-only"):
         connection.execute(
@@ -145,10 +151,10 @@ def test_revision_numbers_are_unique_per_document(connection: sa.Connection) -> 
     workspace_id, _ = _seed(connection)
     run_id = _run(connection, workspace_id)
     document_id = _document(connection, workspace_id)
-    _revision(connection, document_id, run_id, number=1)
+    _revision(connection, document_id, run_id, workspace_id, number=1)
 
     with pytest.raises(sa.exc.IntegrityError):
-        _revision(connection, document_id, run_id, number=1)
+        _revision(connection, document_id, run_id, workspace_id, number=1)
 
 
 def test_a_restore_appends_a_new_revision_pointing_at_the_current_one(
@@ -163,12 +169,15 @@ def test_a_restore_appends_a_new_revision_pointing_at_the_current_one(
     run_id = _run(connection, workspace_id)
     document_id = _document(connection, workspace_id)
 
-    first = _revision(connection, document_id, run_id, number=1, body="original")
-    second = _revision(connection, document_id, run_id, number=2, parent=first, body="changed")
+    first = _revision(connection, document_id, run_id, workspace_id, number=1, body="original")
+    second = _revision(
+        connection, document_id, run_id, workspace_id, number=2, parent=first, body="changed"
+    )
     third = _revision(
         connection,
         document_id,
         run_id,
+        workspace_id,
         number=3,
         parent=second,
         body="original",
@@ -211,15 +220,15 @@ def test_revision_sources_link_to_real_thoughts(connection: sa.Connection) -> No
     workspace_id, _ = _seed(connection)
     run_id = _run(connection, workspace_id)
     document_id = _document(connection, workspace_id)
-    revision_id = _revision(connection, document_id, run_id, number=1)
+    revision_id = _revision(connection, document_id, run_id, workspace_id, number=1)
 
     with pytest.raises(sa.exc.IntegrityError):
         connection.execute(
             sa.text("""
-                INSERT INTO revision_sources (revision_id, thought_id, support_type)
-                VALUES (:revision_id, 999999999, 'direct')
+                INSERT INTO revision_sources (revision_id, thought_id, workspace_id, support_type)
+                VALUES (:revision_id, 999999999, :workspace_id, 'direct')
             """),
-            {"revision_id": revision_id},
+            {"revision_id": revision_id, "workspace_id": workspace_id},
         )
 
 
@@ -375,10 +384,10 @@ def test_context_selection_records_signals_and_inclusion(connection: sa.Connecti
     connection.execute(
         sa.text("""
             INSERT INTO run_context_selections
-              (run_id, document_id, signals, inclusion, body_tokens, referenced_in_output)
-            VALUES (:run_id, :document_id, ARRAY['alias','recency'], 'partial', 640, true)
+              (run_id, document_id, workspace_id, signals, inclusion, body_tokens, referenced_in_output)
+            VALUES (:run_id, :document_id, :workspace_id, ARRAY['alias','recency'], 'partial', 640, true)
         """),
-        {"run_id": run_id, "document_id": document_id},
+        {"run_id": run_id, "document_id": document_id, "workspace_id": workspace_id},
     )
 
     row = connection.execute(
@@ -403,10 +412,10 @@ def test_inclusion_mode_is_constrained(connection: sa.Connection) -> None:
         connection.execute(
             sa.text("""
                 INSERT INTO run_context_selections
-                  (run_id, document_id, signals, inclusion)
-                VALUES (:run_id, :document_id, ARRAY['alias'], 'everything')
+                  (run_id, document_id, workspace_id, signals, inclusion)
+                VALUES (:run_id, :document_id, :workspace_id, ARRAY['alias'], 'everything')
             """),
-            {"run_id": run_id, "document_id": document_id},
+            {"run_id": run_id, "document_id": document_id, "workspace_id": workspace_id},
         )
 
 

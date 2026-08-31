@@ -15,7 +15,13 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tc_domain.capture import AppendOutcome, CaptureSource, ThoughtDraft, ThoughtId
+from tc_domain.capture import (
+    AppendOutcome,
+    CaptureSource,
+    ThoughtDraft,
+    ThoughtId,
+    WorkspaceId,
+)
 from tc_infrastructure.db.tables import blobs, outbox_events, thought_attachments, thoughts
 
 THOUGHT_CAPTURED_EVENT = "thought.captured"
@@ -35,12 +41,16 @@ class PostgresThoughtRepository:
         self._session_factory = session_factory
 
     async def find_id_by_source_message(
-        self, source: CaptureSource, source_message_id: str
+        self,
+        workspace_id: WorkspaceId,
+        source: CaptureSource,
+        source_message_id: str,
     ) -> ThoughtId | None:
         """Advisory fast path for redelivery; the constraint is authoritative."""
         async with self._session_factory() as session:
             found = await session.scalar(
                 sa.select(thoughts.c.id).where(
+                    thoughts.c.workspace_id == workspace_id,
                     thoughts.c.source == str(source),
                     thoughts.c.source_message_id == source_message_id,
                 )
@@ -57,6 +67,7 @@ class PostgresThoughtRepository:
                 # message means one thought and one acknowledgement.
                 existing = await session.scalar(
                     sa.select(thoughts.c.id).where(
+                        thoughts.c.workspace_id == draft.workspace_id,
                         thoughts.c.source == str(draft.source),
                         thoughts.c.source_message_id == draft.source_message_id,
                     )
@@ -95,7 +106,7 @@ class PostgresThoughtRepository:
                 content_language=draft.content_language,
                 correction_of=draft.correction_of,
             )
-            .on_conflict_do_nothing(index_elements=["source", "source_message_id"])
+            .on_conflict_do_nothing(index_elements=["workspace_id", "source", "source_message_id"])
             .returning(thoughts.c.id)
         )
         inserted = await session.scalar(statement)
@@ -121,6 +132,9 @@ class PostgresThoughtRepository:
                 pg_insert(thought_attachments)
                 .values(
                     thought_id=thought_id,
+                    # Carried explicitly so the composite foreign key can check
+                    # that the link and its thought share a workspace.
+                    workspace_id=draft.workspace_id,
                     blob_sha256=attachment.sha256,
                     source_filename=attachment.source_filename,
                     source_url_expires_at=attachment.source_url_expires_at,

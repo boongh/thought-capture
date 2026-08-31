@@ -49,6 +49,10 @@ def request_fingerprint(request: LLMRequest) -> str:
             "prompt_version": request.prompt_version,
             "schema_version": request.schema_version,
             "temperature": request.temperature,
+            # An output cap changes what comes back - a truncated reply is a
+            # different answer - so two requests differing only in their cap
+            # must not share a recorded response.
+            "max_output_tokens": request.max_output_tokens,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -62,11 +66,17 @@ class OfflineLLMProvider:
     def __init__(
         self,
         *,
-        recorded: dict[str, str] | None = None,
+        recorded: dict[str, list[str]] | dict[str, str] | None = None,
         responder: Responder | None = None,
         model_id: str = OFFLINE_MODEL_ID,
     ) -> None:
-        self._recorded = dict(recorded or {})
+        # Each fingerprint maps to the *sequence* of replies recorded for it.
+        # A run that asked the same question twice and got two different
+        # answers must replay both, in order, or it is not a reproduction.
+        self._recorded: dict[str, list[str]] = {}
+        for fingerprint, value in (recorded or {}).items():
+            self._recorded[fingerprint] = [value] if isinstance(value, str) else list(value)
+        self._consumed: dict[str, int] = {}
         self._responder = responder
         self._model_id = model_id
         self.calls: list[LLMRequest] = []
@@ -87,14 +97,23 @@ class OfflineLLMProvider:
         return False
 
     def record(self, request: LLMRequest, content: str) -> None:
-        self._recorded[request_fingerprint(request)] = content
+        """Append a reply for this request, preserving earlier ones."""
+        self._recorded.setdefault(request_fingerprint(request), []).append(content)
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         self.calls.append(request)
         fingerprint = request_fingerprint(request)
 
-        content = self._recorded.get(fingerprint)
+        content: str | None = None
         source = "replay"
+        replies = self._recorded.get(fingerprint)
+        if replies:
+            # Consume in order; the last recorded reply repeats if a replay
+            # asks more times than the original run did.
+            index = min(self._consumed.get(fingerprint, 0), len(replies) - 1)
+            content = replies[index]
+            self._consumed[fingerprint] = index + 1
+
         if content is None and self._responder is not None:
             content = self._responder(request)
             source = "scripted"

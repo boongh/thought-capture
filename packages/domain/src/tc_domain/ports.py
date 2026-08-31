@@ -18,6 +18,7 @@ from tc_domain.capture import (
     CaptureSource,
     ThoughtDraft,
     ThoughtId,
+    WorkspaceId,
 )
 
 
@@ -58,12 +59,19 @@ class ThoughtRepository(Protocol):
     """Append-only access to the canonical capture log."""
 
     async def find_id_by_source_message(
-        self, source: CaptureSource, source_message_id: str
+        self,
+        workspace_id: WorkspaceId,
+        source: CaptureSource,
+        source_message_id: str,
     ) -> ThoughtId | None:
         """Return the existing thought for this source message, if any.
 
         A fast path for redelivery. It is advisory only: the authoritative
         idempotency guarantee is the unique constraint enforced by ``append``.
+
+        Scoped by workspace, because the constraint is. A global lookup would
+        let an API idempotency key reused in a second workspace return the
+        first workspace's thought instead of capturing the caller's.
         """
         ...
 

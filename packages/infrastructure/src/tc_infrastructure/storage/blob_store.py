@@ -96,6 +96,12 @@ class FilesystemBlobStore:
             # Atomic within a single filesystem, which is why the temporary file
             # was created inside the store's own directory.
             temp_path.replace(final_path)
+
+            # The rename itself must survive a crash. Without this, PostgreSQL
+            # can hold - and the bot can acknowledge - an attachment whose
+            # directory entry never reached the disk, leaving a committed
+            # thought pointing at a blob that does not exist.
+            _fsync_directory(final_path.parent)
             logger.info("blob.stored", extra={"sha256": sha256, "size_bytes": size})
             return StoredBlob(
                 sha256=sha256, size_bytes=size, storage_key=storage_key, deduplicated=False
@@ -109,3 +115,25 @@ class FilesystemBlobStore:
     def open_stream(self, storage_key: str) -> bytes:
         """Read a stored blob back. Used by export and restore verification."""
         return self.path_for(storage_key).read_bytes()
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush a directory entry to disk, where the platform supports it.
+
+    POSIX requires an explicit fsync of the *directory* for a rename to be
+    durable; syncing the file alone is not enough. Windows has no equivalent
+    and rejects opening a directory as a file, so the call is skipped there -
+    the development platform, not the deployment platform (docs/DESIGN.md 13).
+    """
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Some filesystems refuse directory fsync. The blob is still written
+        # and hashed; losing the entry is a recoverable garbage-collection
+        # problem, not a corrupt object.
+        logger.debug("blob.directory_fsync_unsupported")
+    finally:
+        os.close(fd)

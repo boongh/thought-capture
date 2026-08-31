@@ -8,6 +8,7 @@ as Ollama or vLLM, so the portable client is the one worth depending on
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from decimal import Decimal
@@ -26,6 +27,15 @@ REQUEST_TIMEOUT_SECONDS = 120.0
 # (docs/DESIGN.md 11).
 APP_TITLE = "Thought Capture AI"
 APP_URL = "https://github.com/boongh/thought-capture"
+
+
+def schema_instruction(request: LLMRequest) -> str:
+    """The schema, rendered for a model that cannot be given it structurally."""
+    return (
+        f"Reply with a single JSON object matching the {request.schema_name} schema below. "
+        "Return only the JSON: no prose, no explanation, no code fences.\n\n"
+        f"{json.dumps(request.json_schema, indent=2, sort_keys=True)}"
+    )
 
 
 class OpenRouterProvider:
@@ -63,18 +73,11 @@ class OpenRouterProvider:
         return self._strict
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
-        params: dict[str, Any] = {
-            "model": self._model_id,
-            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
-            "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
-        }
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
-        # Only sent when the pinned model actually supports it. Sending
-        # response_format to a model that does not can be rejected outright by
-        # provider routing, turning a working call into an error.
         if self._strict:
-            params["response_format"] = {
+            # The provider enforces the schema server-side.
+            response_format: dict[str, Any] | None = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": request.schema_name,
@@ -82,18 +85,52 @@ class OpenRouterProvider:
                     "schema": request.json_schema,
                 },
             }
+        else:
+            # A non-strict model must still be told the shape it has to
+            # produce, or it is being asked to guess - and the repair prompt
+            # refers to "the required JSON schema" it was never shown.
+            # `response_format` is deliberately not sent: provider routing can
+            # reject a model that does not advertise support, turning a working
+            # call into an error.
+            response_format = None
+            messages.append({"role": "system", "content": schema_instruction(request)})
+
+        params: dict[str, Any] = {
+            "model": self._model_id,
+            "messages": messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_output_tokens,
+        }
+        if response_format is not None:
+            params["response_format"] = response_format
 
         started = time.perf_counter()
+        # Each failure is re-raised `from None`, deliberately. Chaining with
+        # `from exc` keeps the original SDK exception as __cause__, and
+        # `logger.exception` renders the whole chain - including OpenAI status
+        # error bodies, which can echo the provider's copy of the prompt. For
+        # this system that is raw thought text, so the sanitized message must
+        # be the only thing that can reach a log.
         try:
             completion = await self._client.chat.completions.create(**params)
-        except APITimeoutError as exc:
-            raise LLMError(f"{self._model_id} timed out after {REQUEST_TIMEOUT_SECONDS}s") from exc
+        except APITimeoutError:
+            logger.warning(
+                "llm.timeout",
+                extra={"model_requested": self._model_id, "timeout_s": REQUEST_TIMEOUT_SECONDS},
+            )
+            raise LLMError(f"{self._model_id} timed out after {REQUEST_TIMEOUT_SECONDS}s") from None
         except APIStatusError as exc:
-            # Status and model only. A provider error body can echo the prompt,
-            # which for this system is raw thought text.
-            raise LLMError(f"{self._model_id} returned HTTP {exc.status_code}") from exc
+            status = exc.status_code
+            logger.warning(
+                "llm.status_error", extra={"model_requested": self._model_id, "status": status}
+            )
+            raise LLMError(f"{self._model_id} returned HTTP {status}") from None
         except (APIError, httpx.HTTPError) as exc:
-            raise LLMError(f"{self._model_id} call failed: {type(exc).__name__}") from exc
+            kind = type(exc).__name__
+            logger.warning(
+                "llm.transport_error", extra={"model_requested": self._model_id, "kind": kind}
+            )
+            raise LLMError(f"{self._model_id} call failed: {kind}") from None
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         raw = completion.model_dump()

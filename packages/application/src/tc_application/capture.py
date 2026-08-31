@@ -55,7 +55,7 @@ class CaptureThought:
             self._policy.validate(candidate)
 
         existing_id = await self._thoughts.find_id_by_source_message(
-            command.source, command.source_message_id
+            command.workspace_id, command.source, command.source_message_id
         )
         if existing_id is not None:
             # Normal for a Discord redelivery. The same acknowledgement is

@@ -85,6 +85,7 @@ blobs = sa.Table(
 thought_attachments = sa.Table(
     "thought_attachments",
     metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("thought_id", sa.BigInteger, primary_key=True),
     sa.Column("blob_sha256", sa.CHAR(64), primary_key=True),
     sa.Column("source_filename", sa.Text, primary_key=True),
@@ -134,6 +135,7 @@ document_revisions = sa.Table(
     "document_revisions",
     metadata,
     sa.Column("id", pg.UUID(as_uuid=True), primary_key=True),
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("document_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("parent_revision_id", pg.UUID(as_uuid=True)),
     sa.Column("run_id", pg.UUID(as_uuid=True), nullable=False),
@@ -148,6 +150,7 @@ document_revisions = sa.Table(
 revision_sources = sa.Table(
     "revision_sources",
     metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("revision_id", pg.UUID(as_uuid=True), primary_key=True),
     sa.Column("thought_id", sa.BigInteger, primary_key=True),
     sa.Column("support_type", sa.Text, nullable=False),
@@ -167,6 +170,7 @@ entities = sa.Table(
 entity_aliases = sa.Table(
     "entity_aliases",
     metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("entity_id", pg.UUID(as_uuid=True), primary_key=True),
     sa.Column("alias", sa.Text, nullable=False),
     sa.Column("normalized_alias", sa.Text, primary_key=True),
@@ -175,6 +179,7 @@ entity_aliases = sa.Table(
 entity_mentions = sa.Table(
     "entity_mentions",
     metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("entity_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("thought_id", sa.BigInteger),
     sa.Column("revision_id", pg.UUID(as_uuid=True)),
@@ -225,6 +230,7 @@ llm_calls = sa.Table(
 run_context_selections = sa.Table(
     "run_context_selections",
     metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("run_id", pg.UUID(as_uuid=True), primary_key=True),
     sa.Column("document_id", pg.UUID(as_uuid=True), primary_key=True),
     sa.Column("signals", pg.ARRAY(sa.Text), nullable=False),

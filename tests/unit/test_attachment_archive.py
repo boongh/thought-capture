@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tc_domain.attachment_origin import AttachmentOriginPolicy
 from tc_domain.capture import AttachmentCandidate
 from tc_domain.errors import AttachmentArchiveFailed
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
@@ -37,7 +38,11 @@ def archive_with(
 ) -> tuple[HttpAttachmentArchive, FilesystemBlobStore, httpx.AsyncClient]:
     store = FilesystemBlobStore(tmp_path)
     client = httpx.AsyncClient(transport=handler)
-    return HttpAttachmentArchive(store, client, max_bytes=max_bytes), store, client
+    # The fake CDN is allowlisted explicitly; the policy itself is tested in
+    # tests/unit/test_attachment_origin.py.
+    policy = AttachmentOriginPolicy(allowed_hosts=frozenset({"cdn.example.invalid"}))
+    archive = HttpAttachmentArchive(store, client, max_bytes=max_bytes, origin_policy=policy)
+    return archive, store, client
 
 
 async def test_archives_bytes_into_content_addressed_storage(tmp_path: Path) -> None:

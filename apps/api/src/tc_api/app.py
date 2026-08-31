@@ -71,7 +71,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    http = httpx.AsyncClient(follow_redirects=True)
+    http = httpx.AsyncClient()
     try:
         app.state.context = await build_context(settings, http)
         yield

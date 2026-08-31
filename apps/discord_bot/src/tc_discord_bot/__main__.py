@@ -52,7 +52,7 @@ async def serve(settings: Settings) -> None:
 
     allowlist = build_allowlist(settings)
     engine = create_engine(settings)
-    http = httpx.AsyncClient(follow_redirects=True)
+    http = httpx.AsyncClient()
 
     try:
         sessions = create_session_factory(engine)

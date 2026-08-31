@@ -109,9 +109,15 @@ class CaptureClient(discord.Client):
         except CaptureRejected as rejection:
             logger.info("capture.rejected", extra={"reason_class": type(rejection).__name__})
             return
-        except Exception:
+        except Exception as exc:
             # No acknowledgement, because nothing is known to be committed.
-            logger.exception("capture.failed")
+            #
+            # The exception class only, never the chain. `logger.exception`
+            # renders __cause__, and a database or HTTP failure here carries
+            # connection strings, signed attachment URLs, filenames, and in
+            # some drivers the parameters of the failing statement - which for
+            # this system include the message body (docs/DESIGN.md 14.2).
+            logger.error("capture.failed", extra={"error_class": type(exc).__name__})
             await self._reply(
                 message,
                 "❌ not captured — the store did not confirm the write. "
@@ -119,7 +125,7 @@ class CaptureClient(discord.Client):
             )
             return
 
-        await self._reply(
+        delivered = await self._reply(
             message,
             acknowledgement_for(
                 thought_id=int(result.thought_id),
@@ -127,7 +133,18 @@ class CaptureClient(discord.Client):
                 deduplicated=result.deduplicated,
             ),
         )
-        await self._settle_acknowledgement(result.thought_id)
+
+        # Only settle a confirmed reply. Settling unconditionally would mark
+        # the queued acknowledgement delivered when the user saw nothing, and
+        # the outbox - the safety net that exists precisely for this - would
+        # never retry it.
+        if delivered:
+            await self._settle_acknowledgement(result.thought_id)
+        else:
+            logger.warning(
+                "capture.acknowledgement_deferred",
+                extra={"thought_id": int(result.thought_id)},
+            )
 
     async def _capture_with_retry(self, command: CaptureCommand) -> CaptureResult:
         """Retry transient store failures with bounded backoff.
@@ -159,13 +176,17 @@ class CaptureClient(discord.Client):
             event_id = await self._outbox.find_pending(THOUGHT_CAPTURED_EVENT, str(thought_id))
             if event_id is not None:
                 await self._outbox.mark_delivered(event_id)
-        except Exception:
-            logger.warning("outbox.settle_failed", exc_info=True)
+        except Exception as exc:
+            logger.warning("outbox.settle_failed", extra={"error_class": type(exc).__name__})
 
-    async def _reply(self, message: discord.Message, text: str) -> None:
+    async def _reply(self, message: discord.Message, text: str) -> bool:
+        """Send a reply. Returns whether it was actually delivered."""
         try:
             await message.reply(text, mention_author=False)
-        except discord.DiscordException:
-            # The thought is committed regardless; the outbox will retry the
-            # acknowledgement.
-            logger.warning("discord.reply_failed", exc_info=True)
+        except discord.DiscordException as exc:
+            # Sanitized: a Discord exception can carry request URLs and
+            # response bodies (docs/DESIGN.md 14.2). The thought is committed
+            # regardless, and the outbox retries the acknowledgement.
+            logger.warning("discord.reply_failed", extra={"error_class": type(exc).__name__})
+            return False
+        return True

@@ -281,12 +281,17 @@ async def test_find_id_by_source_message(
     repository = PostgresThoughtRepository(app_session_factory)
 
     assert (
-        await repository.find_id_by_source_message(CaptureSource.DISCORD, unique_message_id) is None
+        await repository.find_id_by_source_message(
+            workspace_id, CaptureSource.DISCORD, unique_message_id
+        )
+        is None
     )
 
     outcome = await repository.append(make_draft(workspace_id, user_id, unique_message_id))
 
-    found = await repository.find_id_by_source_message(CaptureSource.DISCORD, unique_message_id)
+    found = await repository.find_id_by_source_message(
+        workspace_id, CaptureSource.DISCORD, unique_message_id
+    )
     assert found == outcome.thought_id
 
 

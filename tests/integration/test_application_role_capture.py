@@ -118,10 +118,10 @@ def test_application_role_can_archive_an_attachment(
     )
     app_connection.execute(
         sa.text("""
-            INSERT INTO thought_attachments (thought_id, blob_sha256, source_filename)
-            VALUES (:thought_id, :sha, 'note.png')
+            INSERT INTO thought_attachments (thought_id, workspace_id, blob_sha256, source_filename)
+            VALUES (:thought_id, :workspace_id, :sha, 'note.png')
         """),
-        {"thought_id": thought_id, "sha": digest},
+        {"thought_id": thought_id, "workspace_id": workspace_id, "sha": digest},
     )
 
     status = app_connection.execute(

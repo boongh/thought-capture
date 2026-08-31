@@ -89,6 +89,22 @@ def most_recent_cutoff(now: dt.datetime, local_time: dt.time, timezone: str) -> 
     return cutoff_on(local_now.date() - dt.timedelta(days=1), local_time, timezone)
 
 
+def previous_cutoff_before(instant: dt.datetime, local_time: dt.time, timezone: str) -> dt.datetime:
+    """The latest cutoff strictly *before* ``instant``.
+
+    Used to anchor a brand-new workspace. Anchoring on the first capture itself
+    would place that thought exactly on a window boundary, and a window is
+    ``(start, end]`` - so the very thought that started the workspace would
+    belong to no window at all.
+    """
+    _require_aware(instant)
+    latest = most_recent_cutoff(instant, local_time, timezone)
+    if latest < instant:
+        return latest
+    zone = ZoneInfo(timezone)
+    return cutoff_on(instant.astimezone(zone).date() - dt.timedelta(days=1), local_time, timezone)
+
+
 def next_cutoff_after(now: dt.datetime, local_time: dt.time, timezone: str) -> dt.datetime:
     """The first cutoff strictly after ``now``. Used to schedule the next run."""
     _require_aware(now)

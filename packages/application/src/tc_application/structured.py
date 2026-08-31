@@ -17,6 +17,7 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from tc_domain.llm import (
+    LLMError,
     LLMOutputInvalid,
     LLMProvider,
     LLMRequest,
@@ -100,7 +101,17 @@ async def complete_structured[ModelT: BaseModel](
     last_errors = ""
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        response = await provider.complete(attempt_request)
+        try:
+            response = await provider.complete(attempt_request)
+        except LLMError as exc:
+            # A call that never produced output is still an attempt that was
+            # made, and may have been paid for. ADR-0008 requires every attempt
+            # to be recorded, so the failure is journaled before it propagates;
+            # otherwise `llm_calls.error_code` could never be populated.
+            if journal is not None:
+                await journal(attempt_request, _failure_response(provider, exc), attempt)
+            raise
+
         responses.append(response)
         if journal is not None:
             await journal(attempt_request, response, attempt)
@@ -134,6 +145,21 @@ async def complete_structured[ModelT: BaseModel](
     raise LLMOutputInvalid(
         f"{request.schema_name} was not produced after {MAX_ATTEMPTS} attempts: {last_errors}",
         attempts=MAX_ATTEMPTS,
+    )
+
+
+def _failure_response(provider: LLMProvider, error: LLMError) -> LLMResponse:
+    """A journalable record of a call that never returned output.
+
+    The message is the adapter's already-sanitized text, never a provider error
+    body, which can echo the prompt.
+    """
+    return LLMResponse(
+        content="",
+        raw={"error": str(error)},
+        latency_ms=0,
+        model_requested=provider.model_id,
+        error_code=type(error).__name__,
     )
 
 
