@@ -1,10 +1,10 @@
 # Thought Capture AI - System Design
 
-**Status:** Accepted implementation anchor  
-**Version:** 1.0  
-**Date:** 2026-08-30  
-**Audience:** Small experienced engineering team  
-**Owner:** Project owner  
+- **Status:** Accepted implementation anchor
+- **Version:** 1.1
+- **Date:** 2026-08-31
+- **Audience:** Small experienced engineering team
+- **Owner:** Project owner
 
 ## 1. Executive decision
 
@@ -362,7 +362,7 @@ Automatic alias merges are forbidden below a configurable confidence threshold. 
 
 Use a transactional outbox so a database commit and Discord acknowledgement/digest intent cannot diverge. `outbox_events` contains event type, aggregate ID, JSON payload, attempt count, lease, next attempt, and delivery timestamp. Workers use `FOR UPDATE SKIP LOCKED`.
 
-`capture_windows` records cutoff boundaries and the successful organize run. `khoj_index_items` maps each exported Markdown filename and SHA-256 to document/revision, last synced time, and Khoj response. A revision becomes searchable only after successful index acknowledgement.
+`capture_windows` records cutoff boundaries and the successful organize run. `khoj_index_items` maps each exported Markdown filename and SHA-256 to document/revision, last synced time, and Khoj response. A revision becomes searchable only after successful index acknowledgement. `run_context_selections` (section 7.3.5) records per-run organize context assembly and is diagnostic, not canonical.
 
 ## 7. Core workflows
 
@@ -391,16 +391,119 @@ If blob storage succeeds and the database transaction fails, a garbage-collectio
 1. Acquire a workspace/window advisory lock.
 2. Create a run row and load raw thoughts in stable timestamp/ID order.
 3. Normalize Discord markup while preserving original body.
-4. Detect candidate entities using structured model output plus existing aliases.
-5. Cluster thoughts using time proximity, shared entities, and semantic hints. Release 1 may use the LLM for clustering; its output is validated and source-complete.
-6. Generate the daily digest and proposed entity-document updates as Pydantic-validated JSON.
-7. Verify every referenced thought belongs to the window/workspace and every input thought is either covered or explicitly classified `unorganized`.
-8. Write full document revisions and provenance in one transaction. Never write a partial document set after validation failure.
-9. Export changed revisions to deterministic Markdown files.
-10. Index changed files in Khoj and record item hashes. Failure marks the run `partial`; canonical revisions remain valid and sync retries independently.
-11. Enqueue the Discord digest and mark success only after canonical commit. Discord delivery can retry without rerunning the LLM.
+4. Assemble model context under the contract in section 7.3: the complete entity index plus selected entity-document bodies.
+5. Detect candidate entities using structured model output plus existing aliases.
+6. Cluster thoughts using time proximity, shared entities, and semantic hints. Release 1 may use the LLM for clustering; its output is validated and source-complete.
+7. Generate the daily digest and proposed updates for touched entity documents only, as Pydantic-validated JSON. Untouched documents are not regenerated.
+8. Verify every referenced thought belongs to the window/workspace and every input thought is either covered or explicitly classified `unorganized`. Record context recall for the run.
+9. Write full document revisions and provenance in one transaction. Never write a partial document set after validation failure.
+10. Export changed revisions to deterministic Markdown files.
+11. Index changed files in Khoj and record item hashes. Failure marks the run `partial`; canonical revisions remain valid and sync retries independently.
+12. Enqueue the Discord digest and mark success only after canonical commit. Discord delivery can retry without rerunning the LLM.
 
-### 7.3 Structured output contract
+### 7.3 Context assembly for organization
+
+The organize prompt must carry enough context to extend existing entity documents correctly without carrying the whole corpus. Context assembly is therefore a first-class pipeline stage with its own contract, its own invariants, and its own failure metric. It is not prompt plumbing.
+
+Two properties of this workload set the design. First, the entity *index* is cheap and the entity *bodies* are expensive: a name, type, alias list, one-line summary, and last-mentioned date cost roughly 40 tokens per document, while a body costs 500-1500 and grows monotonically. Second, prompt caching is not a cost lever at this cadence. The longest available cache lifetime is one hour and the scheduled organize run fires once per day, so a cached corpus prefix has always expired before the next run and would incur the cache-write premium every time. Selection, not caching, is what keeps this stage affordable.
+
+The two failure modes are asymmetric and must be treated differently:
+
+- **Fragmentation** - the model creates a second document for an entity that already exists because it did not know the entity existed. This corrupts the corpus silently and compounds across runs. It is prevented outright by always supplying the complete index.
+- **Thin detail** - the model updates a document without its full prior body. This is visible in the digest, bounded to one revision, and correctable on a later run.
+
+Assembly buys out the first failure for a fixed, small token cost and then optimizes the second.
+
+#### 7.3.1 Tier 1 - the complete entity index
+
+Every organize prompt contains one index row for every entity document in the workspace, with no selection applied. A row contains the document `stable_key`, entity type, canonical name, known aliases, the document's bounded `Summary` section, the last-mentioned date, and the open-thread count.
+
+The index is what makes entity reuse possible, so it is never truncated, sampled, or filtered. If index size ever becomes material, the response is to shorten each row, not to drop rows.
+
+#### 7.3.2 Tier 2 - selected document bodies
+
+Bodies are selected in two passes. The first is deterministic and free; the second is a single cheap model call.
+
+| Signal | Source | Purpose |
+|---|---|---|
+| `alias` | `entities.normalized_name` and `entity_aliases`, exact and trigram matched against window text | Direct naming, including misspellings |
+| `recency` | `entity_mentions` over the last `context.recency_windows` windows | Unnamed continuations of recent subjects |
+| `cooccurrence` | Historical co-mention frequency with already-selected entities, above `context.cooccurrence_threshold` | Structural expansion without embeddings |
+| `open_thread` | Documents of kind `todo` or `decision` with unresolved items | Standing context that is valuable whether or not it is mentioned |
+| `selector` | One `select` model call over the window text plus the Tier 1 index, returning `stable_key` values | Referential cases signals cannot resolve: pronouns, "the thing we discussed", implied projects |
+
+The `select` call is a single request with a small structured output, not an agentic loop. It resolves most of what a tool-calling retriever would find while re-sending context once instead of once per turn, and because it is one deterministic-shaped call it stays cacheable by prompt hash for development and reproducible for evaluation.
+
+#### 7.3.3 Generated document format
+
+Generated entity documents use a fixed section order so that partial inclusion is well defined:
+
+```markdown
+## Summary          # bounded; source of the Tier 1 index line
+## Current state    # bounded
+## Open threads     # bounded
+## Timeline         # append-oriented; truncatable from the tail
+```
+
+Inclusion is graded rather than binary:
+
+| Mode | Content sent | Applies to |
+|---|---|---|
+| `index_only` | Tier 1 row only | Every unselected document |
+| `partial` | Summary, Current state, Open threads, last `context.timeline_tail_entries` timeline entries | Marginal selections and documents over `context.max_body_tokens` |
+| `full` | Entire body | High-confidence selections within budget |
+
+Document format is a retrieval concern, not only a readability concern. Changing this section contract after the corpus exists requires regenerating documents, so it is fixed before the first organize prompt ships.
+
+#### 7.3.4 Invariants
+
+1. The entity index is complete. Every entity document in the workspace appears in every organize prompt.
+2. Selection is additive. The final set is the union of the deterministic signals and the selector output; the selector can add documents but can never remove one that a deterministic signal produced.
+3. Selector failure is non-fatal. On timeout, invalid output, or provider error, assembly proceeds with the deterministic set and the run records the degradation.
+4. Expansion is bounded. If generation or validation reveals a required document that was not loaded, generation may be retried exactly once with the expanded set. There is no loop.
+5. Only touched documents are regenerated. Full-snapshot revisions do not require rewriting untouched documents; those keep their current revision and no new revision row is written.
+6. Assembly is recorded. Every run persists what was considered, what was selected, by which signal, and at which inclusion mode.
+
+Invariant 2 is what makes a cheap model safe in this position: a poor selector call costs tokens, never correctness.
+
+#### 7.3.5 Observability and context recall
+
+```sql
+CREATE TABLE run_context_selections (
+  run_id uuid NOT NULL REFERENCES runs(id),
+  document_id uuid NOT NULL REFERENCES documents(id),
+  signals text[] NOT NULL,
+  inclusion text NOT NULL CHECK (inclusion IN ('index_only','partial','full')),
+  body_tokens integer NOT NULL DEFAULT 0,
+  referenced_in_output boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (run_id, document_id)
+);
+```
+
+After generation, every document referenced by the model output is marked `referenced_in_output`. This defines the stage's own quality metric:
+
+```text
+context_recall = referenced documents included as partial or full
+                 / referenced documents
+```
+
+A document that was referenced while `index_only` is a retrieval miss. Without this metric an incorrect digest cannot be attributed: a selection failure and a generation failure look identical from the output alone. Target `context_recall >= 0.95`, alerting below.
+
+#### 7.3.6 Cost envelope
+
+| Component | Per-run input budget |
+|---|---:|
+| Entity index, all documents | ~2k tokens |
+| Selected bodies | <= 8k tokens |
+| Window thoughts | ~2k tokens |
+| Instructions and schema | ~1k tokens |
+| **Total input** | **<= 13k tokens** |
+
+Once assembly is bounded this way, run cost is dominated by *output* tokens - the bodies actually rewritten - which is why invariant 5 is the largest single cost lever in the pipeline. Assembly configuration (`context.max_body_tokens`, `context.max_selected_documents`, `context.timeline_tail_entries`, `context.recency_windows`, `context.cooccurrence_threshold`) is workspace-scoped and versioned with the prompt.
+
+Embedding-based selection is deliberately deferred. At Release 1 corpus size the alias, recency, and co-occurrence signals plus one selector call are expected to be near-optimal, and the Khoj index is by construction one run stale at organize time. Revisit when `context_recall` shows the deterministic signals missing documents, or when the corpus exceeds a few hundred entity documents.
+
+### 7.4 Structured output contract
 
 ```python
 class ProposedDocument(BaseModel):
@@ -423,7 +526,7 @@ class OrganizationResult(BaseModel):
 
 The prompt forbids facts absent from sources, requires first-person voice where appropriate, resolves relative dates using each thought's timestamp/timezone, and never treats attachments as understood content in Release 1. One repair attempt may include validation errors; a second failure aborts the stage.
 
-### 7.4 Search sequence
+### 7.5 Search sequence
 
 The request may provide structured filters directly. If it provides only natural language, the coordinator may ask a cheap model to produce a validated `QueryPlan`; the original query is always retained.
 
@@ -435,7 +538,7 @@ The request may provide structured filters directly. If it provides only natural
 
 If Khoj is unavailable, hybrid search degrades to exact search with `degraded=true`; it never returns an empty success that implies no memory exists.
 
-### 7.5 Ask sequence
+### 7.6 Ask sequence
 
 Release 1 Ask delegates to Khoj `/notes` mode with generated Markdown indexed and query filters appended. The gateway streams the answer and normalizes references. During the first integration milestone, test whether Khoj's query-file attachment path can accept the coordinator's prefiltered evidence packet. If supported and stable, strict filters use that path. If not, strict Ask returns a clear capability code and offers exact search results; it does not silently answer from an unconstrained corpus. Direct first-party answer generation is a separately approved future ADR, not an implicit fallback.
 
@@ -545,7 +648,7 @@ Discord slash commands map to use cases, not HTTP loopback calls:
 
 OpenRouter is an API gateway, not the model itself. The application sends an OpenAI-compatible HTTPS request to `https://openrouter.ai/api/v1` with an OpenRouter API key and a model slug. OpenRouter authenticates the project, routes the request to a provider that serves that model, normalizes the response, and bills the OpenRouter account. This allows model changes without replacing the SDK.
 
-The first-party adapter uses the official OpenAI Python client pointed at OpenRouter's base URL. Configuration contains separate model IDs for `organize`, `query_plan`, and optional `embedding`. Never use floating “latest” aliases in production; pin a tested slug and record the actual returned model/provider on every run.
+The first-party adapter uses the official OpenAI Python client pointed at OpenRouter's base URL. Configuration contains separate model IDs for `organize`, `select` (context assembly, section 7.3), `query_plan`, and optional `embedding`. Never use floating “latest” aliases in production; pin a tested slug and record the actual returned model/provider on every run.
 
 Operational rules:
 
@@ -671,6 +774,7 @@ Build at least 30 owner-written questions with expected thought/document IDs and
 
 ### 15.3 Organization evaluation
 
+- Context recall: every entity document referenced by the output had its body supplied to the prompt, not only its index row (section 7.3.5).
 - Coverage: every input thought is cited or explicitly unorganized.
 - Grounding: sampled claims are supported by cited raw text.
 - Temporal correctness: relative dates resolve from source timestamp/timezone.
@@ -762,6 +866,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 - Daily digest cutoff defaults to 20:00 local, using successful-cutoff capture windows.
 - Entity documents evolve through immutable full-snapshot revisions.
 - Khoj UI is used first; a unified custom UI is Phase 4.
+- Organize context is assembled from a complete entity index plus additive body selection; the organize pipeline uses no agentic retrieval loop.
 
 ### Deferred with explicit trigger
 
