@@ -119,7 +119,12 @@ services:
       # (docs/DESIGN.md 12.2).
       TC_API_HOST: "0.0.0.0"
       TC_API_PORT: "8080"
-      TC_API_BEARER_TOKEN: ${TC_API_BEARER_TOKEN:?TC_API_BEARER_TOKEN must be set in .env}
+      # Deliberately not `:?`. Compose interpolates every service in the file
+      # before starting any of them, so a required variable here would stop
+      # `up postgres` from working when only the API is unconfigured. The API
+      # entrypoint refuses to start without a token instead, which fails the
+      # service that actually needs it rather than the whole stack.
+      TC_API_BEARER_TOKEN: ${TC_API_BEARER_TOKEN:-}
     ports:
       - "127.0.0.1:${TC_API_PORT:-8080}:8080"
     volumes:
