@@ -222,3 +222,16 @@ async def test_no_provider_restriction_by_default() -> None:
     await provider.complete(a_request())
 
     assert "only" not in sent_provider_routing(completions)
+
+
+async def test_the_effective_routing_policy_is_journaled_with_the_response() -> None:
+    """A historical run must be able to establish what routing was actually
+    requested, not just the model - REVIEWED_MODELS and Settings can both
+    change after the call that used them was journaled."""
+    provider, completions = a_provider(
+        served_model=MODEL_ID, only_providers=frozenset({"reviewed-provider"})
+    )
+
+    response = await provider.complete(a_request())
+
+    assert response.request_params["provider_routing"] == sent_provider_routing(completions)

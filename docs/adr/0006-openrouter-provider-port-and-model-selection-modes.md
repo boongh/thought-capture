@@ -161,6 +161,14 @@ flags, defaulting to the conservative values (`allow_fallbacks=False`,
 `deny_data_collection=True`) so a direct construction that forgot to wire
 `Settings` fails safe rather than silently permissive.
 
+The full `provider` routing object actually sent is also recorded in
+`LLMResponse.request_params`, which the `llm_calls` journal (`docs/adr/0008`)
+persists verbatim with every call, not just the temperature/max-tokens/
+strict-schema fields already there - `REVIEWED_MODELS` and `Settings` can
+both change after a call is journaled, so reconstructing "what routing
+policy was actually in effect for this historical run" from current config
+would be unreliable.
+
 **Provider-endpoint pinning.** `allow_fallbacks: false` refuses a *second*
 provider after the first fails; it does not restrict OpenRouter's *first*
 choice, made under its own default load-balancing across every current
@@ -293,8 +301,9 @@ allowing fallback without denying data collection sends `allow_fallbacks:
 true` with no `data_collection` key at all, rather than an explicit
 `"allow"`; `require_parameters` is present for a strict-schema call and
 absent for a non-strict one; `only_providers` produces `provider.only` when
-given and is absent by default; and the separate served-model guard this ADR
-does not change is still covered.
+given and is absent by default; the journaled `request_params["provider_routing"]`
+matches the object actually sent; and the separate served-model guard this
+ADR does not change is still covered.
 
 `tests/unit/test_reviewed_models.py` asserts every registry entry records at
 least one provider, that the registry is currently empty (documenting why,

@@ -256,5 +256,10 @@ class OpenRouterProvider:
                 "temperature": request.temperature,
                 "max_tokens": request.max_output_tokens,
                 "strict_schema": self._strict,
+                # The routing/retention policy actually requested, not just
+                # the model - a historical run needs this to establish what
+                # was asked for, since REVIEWED_MODELS and Settings can both
+                # change after the call that used them was journaled.
+                "provider_routing": provider_routing,
             },
         )
