@@ -1,7 +1,7 @@
 [project]
 name = "tc-discord-bot"
 version = "0.1.0"
-description = "Discord Gateway transport: capture adapter, acknowledgements, slash commands, digest delivery."
+description = "Discord Gateway transport for allowlisted capture and acknowledgements."
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "tc-domain",

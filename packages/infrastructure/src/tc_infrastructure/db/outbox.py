@@ -1,9 +1,10 @@
-"""Transactional outbox consumer.
+"""Transactional outbox persistence and leasing primitives.
 
-Delivery is at-least-once, never exactly-once: a worker can succeed and then die
-before recording that it succeeded. Consumers must therefore be idempotent. For
-capture acknowledgements that is cheap - a duplicate reply is a cosmetic fault,
-whereas a missing one is a broken promise (docs/DESIGN.md 6.5).
+When a persistent consumer is wired, delivery is at-least-once, never
+exactly-once: a worker can succeed and then die before recording that it
+succeeded. Consumers must therefore be idempotent. For capture acknowledgements
+that is cheap - a duplicate reply is a cosmetic fault, whereas a missing one is
+a broken promise (docs/DESIGN.md 6.5).
 """
 
 from __future__ import annotations

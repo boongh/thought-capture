@@ -1,7 +1,7 @@
 [project]
 name = "tc-api"
 version = "0.1.0"
-description = "FastAPI gateway: health, capture, raw log reads, run commands."
+description = "FastAPI gateway: health, capture, and raw-log reads."
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "tc-domain",

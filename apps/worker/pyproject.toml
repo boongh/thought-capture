@@ -1,7 +1,7 @@
 [project]
 name = "tc-worker"
 version = "0.1.0"
-description = "Scheduler and outbox consumer: capture windows, organization, rebuild, digest dispatch."
+description = "Migration bootstrap and organization-scheduling building blocks."
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "tc-domain",

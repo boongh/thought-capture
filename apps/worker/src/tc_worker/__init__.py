@@ -1,3 +1,3 @@
-"""Scheduler and outbox consumer entrypoints."""
+"""Migration bootstrap and organization-scheduling building blocks."""
 
 __all__: list[str] = []

@@ -4,7 +4,16 @@ Thought Capture AI is a self-hosted, single-user-first personal memory system. A
 
 ## Project status
 
-Design-first. The implementation target and acceptance criteria are defined in [docs/DESIGN.md](docs/DESIGN.md). That document is the project anchor: changes that alter its accepted decisions require an Architecture Decision Record (ADR) and a design version update.
+Implementation in progress. The durable-capture slice is runnable: PostgreSQL,
+one-shot migration and workspace bootstrap, the Discord capture bot, and the
+raw-thought HTTP API are available through the `core` Compose profile. The
+organization pipeline, digest worker, Khoj integration, and custom UI are not
+runnable yet.
+
+The implementation target and acceptance criteria are defined in
+[docs/DESIGN.md](docs/DESIGN.md). That document remains the project anchor:
+changes that alter its accepted decisions require an Architecture Decision
+Record (ADR) and a design version update.
 
 ## First release outcome
 
@@ -47,20 +56,25 @@ never be committed:
 cp env.example .env
 ```
 
-Start the local database. `--env-file .env` is required: Compose resolves a bare
-`.env` relative to the compose file, not the repository root, so without it the
-required password variables are unset and the command fails.
+Start the runnable local stack. `--env-file .env` is required: Compose resolves
+a bare `.env` relative to the compose file, not the repository root, so without
+it the required configuration is unset and the command fails.
 
 ```bash
-docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d
+docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build
 ```
 
-Apply the schema. Migrations are a deployment step and never run from API
-startup:
+The one-shot `migrate` service applies Alembic migrations and seeds the
+workspace before the API and bot start. Check readiness and inspect service
+state with:
 
 ```bash
-uv run alembic upgrade head
+docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core ps
+curl http://127.0.0.1:8080/health/ready
 ```
+
+See [docs/OPERATING.md](docs/OPERATING.md) for required configuration, logs,
+API access, database inspection, and shutdown commands.
 
 Run the checks before declaring any change complete:
 
@@ -74,32 +88,33 @@ reachable. When Docker is unavailable it reports the integration tests as
 `NOT RUN` rather than passing silently — a run with skips is not full
 verification.
 
-## Repository shape
+## Current repository shape
 
 ```text
 thought-capture-ai/
   apps/
     api/                 # public gateway and read API
     discord_bot/         # Discord Gateway adapter
-    worker/              # organize, index, digest, retry jobs
+    worker/              # migration bootstrap and organization scheduling primitives
   packages/
     domain/              # entities, commands, policies, ports
     application/         # use cases and orchestration
-    infrastructure/      # PostgreSQL, Khoj, OpenRouter, object store adapters
-  prompts/               # versioned structured-output prompts
+    infrastructure/      # PostgreSQL, OpenRouter, and object-store adapters
   migrations/            # Alembic migrations
-  tests/                 # unit, integration, contract, eval, end-to-end
+  tests/                 # unit and PostgreSQL integration tests
   docs/
     DESIGN.md            # canonical design
     adr/                  # decision records created during implementation
   deploy/
-    compose/              # local and VPS Compose overlays
-  exports/               # generated locally; ignored by Git
+    compose/              # current local Compose stack
 ```
 
 ## Development sequence
 
-Implementation must follow the release gates in the design document. The first vertical slice is Discord text -> append-only PostgreSQL -> acknowledgement. Khoj, LLM organization, and the future custom UI are deliberately added only after capture durability is proven.
+Implementation follows the release gates in the design document. The durable
+capture slice — Discord text and attachments -> append-only PostgreSQL ->
+acknowledgement — and the raw-log HTTP API are implemented. Organization,
+digests, Khoj, and the future custom UI remain later slices.
 
 ## AI-assisted development workflow
 

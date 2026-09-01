@@ -9,7 +9,7 @@
 # file, not the repository root.
 #
 # Profiles:
-#   core          postgres, migrate, discord-bot (api and worker follow)
+#   core          postgres, one-shot migrate, api, discord-bot
 #   ai            Khoj and its own database (Phase 2, not yet defined)
 #   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
 

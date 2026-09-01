@@ -27,8 +27,9 @@ from tc_infrastructure.db.tables import blobs, outbox_events, thought_attachment
 THOUGHT_CAPTURED_EVENT = "thought.captured"
 
 # The bot acknowledges on the fast path, immediately after this transaction
-# commits, and then marks the event delivered. The outbox is the safety net for
-# when that does not happen - the process died, or Discord was unreachable.
+# commits, and then marks the event delivered. The outbox preserves the work
+# when that does not happen - the process died, or Discord was unreachable -
+# although the persistent retry runtime is not wired yet.
 # Holding the event back briefly keeps the safety net from racing the fast path
 # and sending a second acknowledgement for a message that already got one.
 ACK_DELIVERY_GRACE = dt.timedelta(seconds=60)

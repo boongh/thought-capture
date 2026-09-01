@@ -135,9 +135,9 @@ class CaptureClient(discord.Client):
         )
 
         # Only settle a confirmed reply. Settling unconditionally would mark
-        # the queued acknowledgement delivered when the user saw nothing, and
-        # the outbox - the safety net that exists precisely for this - would
-        # never retry it.
+        # the queued acknowledgement delivered when the user saw nothing.
+        # Keeping it pending preserves the work for the persistent retry
+        # consumer once that runtime is wired.
         if delivered:
             await self._settle_acknowledgement(result.thought_id)
         else:
@@ -168,9 +168,10 @@ class CaptureClient(discord.Client):
     async def _settle_acknowledgement(self, thought_id: ThoughtId) -> None:
         """Mark the queued acknowledgement delivered, since we just sent it.
 
-        Best-effort: if this fails, the outbox consumer sends a duplicate
-        acknowledgement later. A duplicate reply is cosmetic; a missing one
-        would break the promise that capture is confirmed.
+        Best-effort: if this fails, the event remains pending for inspection
+        and for the persistent retry consumer once that runtime is wired. Such
+        a consumer may send a duplicate acknowledgement; a duplicate reply is
+        cosmetic, whereas a missing one breaks the confirmation promise.
         """
         try:
             event_id = await self._outbox.find_pending(THOUGHT_CAPTURED_EVENT, str(thought_id))
@@ -186,7 +187,7 @@ class CaptureClient(discord.Client):
         except discord.DiscordException as exc:
             # Sanitized: a Discord exception can carry request URLs and
             # response bodies (docs/DESIGN.md 14.2). The thought is committed
-            # regardless, and the outbox retries the acknowledgement.
+            # regardless, and the outbox event remains pending.
             logger.warning("discord.reply_failed", extra={"error_class": type(exc).__name__})
             return False
         return True
