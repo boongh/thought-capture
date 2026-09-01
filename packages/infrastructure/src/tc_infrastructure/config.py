@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     model_organize: str = ""
     model_query_plan: str = ""
     model_supports_strict_schema: bool = False
+    # Only consulted in custom mode - safe mode never allows provider
+    # fallback, regardless of this value. See openrouter_allow_fallbacks.
+    model_allow_fallback: bool = True
     monthly_budget_usd: float = Field(default=5.0, ge=0)
 
     # -- Attachments -------------------------------------------------------
@@ -135,6 +138,32 @@ class Settings(BaseSettings):
                     "or set TC_MODEL_SELECTION_MODE=custom to select models freely."
                 )
         return self
+
+    @property
+    def openrouter_allow_fallbacks(self) -> bool:
+        """Whether OpenRouter may route to a different provider than the vetted one.
+
+        Safe mode never allows it, unconditionally - a model that reaches
+        REVIEWED_MODELS was checked for *that model's* retention/schema
+        behavior, not whatever OpenRouter might substitute it with. Custom
+        mode is the host's call, via ``model_allow_fallback``.
+        """
+        if self.model_selection_mode == "safe":
+            return False
+        return self.model_allow_fallback
+
+    @property
+    def openrouter_deny_data_collection(self) -> bool:
+        """Whether to tell OpenRouter to route only through non-retaining providers.
+
+        Safe mode always denies it: REVIEWED_MODELS entries were checked to
+        not require a training/retention opt-in, and this is the request-side
+        enforcement of that, not just trust in the registry. Custom mode
+        leaves OpenRouter's own default in place, because forcing "deny" here
+        would silently break the one documented custom-mode use case - a
+        free, training-opted-in tier the host has deliberately chosen.
+        """
+        return self.model_selection_mode == "safe"
 
     @property
     def timezone(self) -> ZoneInfo:

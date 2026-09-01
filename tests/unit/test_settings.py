@@ -136,3 +136,34 @@ def test_custom_mode_accepts_an_unreviewed_model(monkeypatch: pytest.MonkeyPatch
 def test_an_unknown_selection_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValidationError):
         build(monkeypatch, TC_MODEL_SELECTION_MODE="reckless")
+
+
+def test_safe_mode_never_allows_fallback_even_if_the_flag_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/adr/0006: a reviewed model was vetted, whatever it might fall back to was not."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_ALLOW_FALLBACK="true")
+    assert settings.openrouter_allow_fallbacks is False
+
+
+def test_safe_mode_always_denies_data_collection(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.openrouter_deny_data_collection is True
+
+
+def test_custom_mode_follows_the_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    allow = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_ALLOW_FALLBACK="true")
+    deny = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_ALLOW_FALLBACK="false")
+    assert allow.openrouter_allow_fallbacks is True
+    assert deny.openrouter_allow_fallbacks is False
+
+
+def test_custom_mode_never_forces_data_collection_deny(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forcing deny here would silently break the documented free-tier custom-mode use case."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.openrouter_deny_data_collection is False
+
+
+def test_fallback_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Matches OpenRouter's own default, so custom mode without this set behaves as documented."""
+    assert build(monkeypatch).model_allow_fallback is True

@@ -77,21 +77,26 @@ def a_provider(
     *,
     served_model: str,
     allowed_served_models: frozenset[str] | None = None,
-) -> OpenRouterProvider:
+    allow_fallbacks: bool = False,
+    deny_data_collection: bool = True,
+) -> tuple[OpenRouterProvider, FakeCompletions]:
     completions = FakeCompletions(FakeCompletion(completion_payload(served_model=served_model)))
     client = FakeClient(completions)
-    return OpenRouterProvider(
+    provider = OpenRouterProvider(
         api_key="synthetic-key",
         base_url="https://synthetic.example/v1",
         model_id=MODEL_ID,
         supports_strict_schema=True,
         client=client,  # type: ignore[arg-type]
         allowed_served_models=allowed_served_models,
+        allow_fallbacks=allow_fallbacks,
+        deny_data_collection=deny_data_collection,
     )
+    return provider, completions
 
 
 async def test_a_response_from_the_requested_model_succeeds() -> None:
-    provider = a_provider(served_model=MODEL_ID)
+    provider, _ = a_provider(served_model=MODEL_ID)
 
     response = await provider.complete(a_request())
 
@@ -101,7 +106,7 @@ async def test_a_response_from_the_requested_model_succeeds() -> None:
 
 async def test_an_unapproved_served_model_is_rejected() -> None:
     """Silent routing to a different model must fail rather than be trusted."""
-    provider = a_provider(served_model="vendor/some-other-model")
+    provider, _ = a_provider(served_model="vendor/some-other-model")
 
     with pytest.raises(LLMError, match="unapproved"):
         await provider.complete(a_request())
@@ -109,7 +114,7 @@ async def test_an_unapproved_served_model_is_rejected() -> None:
 
 async def test_an_explicitly_allowed_alternate_model_is_accepted() -> None:
     """A deployment that has tested and accepted a fallback may allow it."""
-    provider = a_provider(
+    provider, _ = a_provider(
         served_model="vendor/tested-fallback",
         allowed_served_models=frozenset({MODEL_ID, "vendor/tested-fallback"}),
     )
@@ -117,3 +122,59 @@ async def test_an_explicitly_allowed_alternate_model_is_accepted() -> None:
     response = await provider.complete(a_request())
 
     assert response.model_served == "vendor/tested-fallback"
+
+
+# ---------------------------------------------------------------------------
+# Request-side provider routing (docs/adr/0006)
+# ---------------------------------------------------------------------------
+
+
+def sent_provider_routing(completions: FakeCompletions) -> dict[str, Any]:
+    """The `provider` object actually sent, unwrapped from `extra_body`.
+
+    `provider` is an OpenRouter extension with no field on the OpenAI SDK's
+    typed `create()`, so it travels via `extra_body` - this is what the
+    adapter's caller (OpenRouter itself, here the fake) actually receives.
+    """
+    extra_body = completions.calls[0]["extra_body"]
+    routing: dict[str, Any] = extra_body["provider"]
+    return routing
+
+
+async def test_the_conservative_defaults_deny_fallback_and_retention() -> None:
+    """Constructing this class directly - a test, or an un-wired caller - must fail safe."""
+    provider, completions = a_provider(served_model=MODEL_ID)
+
+    await provider.complete(a_request())
+
+    assert sent_provider_routing(completions) == {
+        "allow_fallbacks": False,
+        "data_collection": "deny",
+    }
+
+
+async def test_fallback_can_be_allowed_without_permitting_data_collection() -> None:
+    """A custom-mode host can allow fallback without that also opening retention."""
+    provider, completions = a_provider(
+        served_model=MODEL_ID, allow_fallbacks=True, deny_data_collection=False
+    )
+
+    await provider.complete(a_request())
+
+    routing = sent_provider_routing(completions)
+    assert routing["allow_fallbacks"] is True
+    assert "data_collection" not in routing
+
+
+async def test_declining_to_deny_data_collection_omits_the_key_rather_than_allowing() -> None:
+    """Not sending `data_collection` lets OpenRouter's own account default apply.
+
+    Sending `data_collection: "allow"` explicitly would be this adapter
+    choosing that on the operator's behalf; omitting the key leaves whatever
+    the operator already configured on their own OpenRouter account.
+    """
+    provider, completions = a_provider(served_model=MODEL_ID, deny_data_collection=False)
+
+    await provider.complete(a_request())
+
+    assert "data_collection" not in sent_provider_routing(completions)

@@ -50,6 +50,8 @@ class OpenRouterProvider:
         supports_strict_schema: bool,
         client: AsyncOpenAI | None = None,
         allowed_served_models: frozenset[str] | None = None,
+        allow_fallbacks: bool = False,
+        deny_data_collection: bool = True,
     ) -> None:
         if not model_id:
             raise ValueError("a pinned model slug is required; refusing a floating default")
@@ -60,6 +62,18 @@ class OpenRouterProvider:
         # explicitly tested." Defaults to exact-match only; a deployment that
         # has tested and accepted specific alternates passes them explicitly.
         self._allowed_served_models = allowed_served_models or frozenset({model_id})
+        # Request-side routing constraints (docs/adr/0006), independent of the
+        # post-response served-model check above: that check catches a
+        # gateway that substituted a model anyway; these ask it not to in the
+        # first place, and not to route through a provider that retains or
+        # trains on the request. Both default to the conservative setting -
+        # no fallback, deny retention - so constructing this class directly
+        # (a test, or a caller that forgot to wire mode-awareness) fails safe.
+        # `docs/adr/0006` ties the *effective* values to safe/custom mode via
+        # `Settings.openrouter_allow_fallbacks`/`openrouter_deny_data_collection`;
+        # this class itself has no notion of "mode", only these two flags.
+        self._allow_fallbacks = allow_fallbacks
+        self._deny_data_collection = deny_data_collection
         self._client = client or AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -101,11 +115,30 @@ class OpenRouterProvider:
             response_format = None
             messages.append({"role": "system", "content": schema_instruction(request)})
 
+        # OpenRouter's own defaults permit provider fallback and allow
+        # data collection (https://openrouter.ai/docs/guides/routing/provider-selection,
+        # https://openrouter.ai/docs/guides/features/zdr) - neither is safe to
+        # inherit silently for a system whose prompts are raw personal memory
+        # content. `allow_fallbacks: false` refuses to route to a different
+        # provider than the one actually vetted for `model_id`; omitting
+        # `data_collection` rather than never sending it lets a caller that
+        # deliberately wants OpenRouter's default (a custom-mode host on a
+        # free, training-opted-in tier) actually get it - sending "allow"
+        # explicitly would be us choosing that on their behalf.
+        provider_routing: dict[str, Any] = {"allow_fallbacks": self._allow_fallbacks}
+        if self._deny_data_collection:
+            provider_routing["data_collection"] = "deny"
+
         params: dict[str, Any] = {
             "model": self._model_id,
             "messages": messages,
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
+            # `provider` is an OpenRouter extension, not an OpenAI Chat
+            # Completions field, so the typed `create()` call has no
+            # parameter for it - `extra_body` is the OpenAI SDK's documented
+            # escape hatch for vendor-specific request fields like this one.
+            "extra_body": {"provider": provider_routing},
         }
         if response_format is not None:
             params["response_format"] = response_format
