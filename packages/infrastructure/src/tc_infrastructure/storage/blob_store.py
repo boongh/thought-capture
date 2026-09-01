@@ -130,18 +130,24 @@ class FilesystemBlobStore:
 
 
 def _fsync_fanout_directories(root: Path, storage_key: str) -> None:
-    """Flush every fan-out directory level a write to ``storage_key`` may have created.
+    """Flush every directory a write to ``storage_key`` may have created, root included.
 
-    ``storage_key`` is ``ab/cd/<hash>``: two directory levels, both possibly
-    new. Fsyncing only the leaf (``ab/cd``) makes the file's own entry durable
-    but says nothing about whether the leaf directory itself durably exists
-    inside its parent (``ab``) - a fresh two-level prefix creates both in one
-    write. Every level is synced unconditionally rather than tracked as
-    "newly created": fsyncing a directory that already existed is cheap, and
-    finding out which levels were new would cost a stat call each anyway.
+    ``storage_key`` is ``ab/cd/<hash>``: two fan-out levels, both possibly
+    new. Fsyncing a directory only makes durable the entries *inside* it - it
+    says nothing about whether that directory's own entry in its *parent* is
+    durable. So a brand-new two-level prefix needs three fsyncs, not two:
+    ``root/ab/cd`` (makes the file's entry inside it durable), ``root/ab``
+    (makes ``cd``'s entry inside it durable), and ``root`` itself (makes
+    ``ab``'s entry inside *it* durable). Stopping at the fan-out levels and
+    never syncing ``root`` was the bug: ``ab`` could be fully durable
+    internally while root still had no durable record that ``ab`` exists at
+    all, and a crash there loses the whole prefix. Every level is synced
+    unconditionally rather than tracked as "newly created": fsyncing a
+    directory that already existed is cheap, and finding out which levels
+    were new would cost a stat call each anyway.
     """
     directory = root / Path(storage_key).parent
-    for _ in range(FANOUT_DEPTH):
+    for _ in range(FANOUT_DEPTH + 1):
         _fsync_directory(directory)
         directory = directory.parent
 

@@ -125,11 +125,14 @@ async def test_a_directory_fsync_failure_fails_the_write(
 async def test_every_fanout_directory_level_is_synced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A brand-new two-character prefix creates two directories, not one.
+    """A brand-new two-character prefix creates two directories, not one - and
+    ``root`` needs its own fsync too, or its record that either exists is not durable.
 
-    Fsyncing only the leaf makes the file's own entry durable but says
-    nothing about whether the leaf directory itself durably exists inside its
-    parent - both can be new in the same write.
+    Fsyncing a directory only makes durable the entries *inside* it. Syncing
+    just the leaf and its immediate parent confirms the file's entry and the
+    leaf's entry are durable, but not that the leaf's parent's entry is
+    durable *inside root* - so root must be synced too, not just the two
+    fan-out levels below it.
     """
     payload = b"a payload under a brand-new fan-out prefix"
     expected_key = storage_key_for(hashlib.sha256(payload).hexdigest())
@@ -141,7 +144,7 @@ async def test_every_fanout_directory_level_is_synced(
 
     assert stored.storage_key == expected_key
     leaf = tmp_path / Path(expected_key).parent
-    assert synced == [leaf, leaf.parent]
+    assert synced == [leaf, leaf.parent, tmp_path]
 
 
 async def test_a_deduplicated_write_still_confirms_directory_durability(
