@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -60,6 +60,23 @@ owner is also the only operator. So the guard this ADR adds is not protecting
 one party from another; it is protecting a rushed `.env` edit from silently
 overriding a decision the design already asks the owner to make deliberately.
 
+A third review pass questioned the registry's one entry itself, not just the
+request-side controls around it: `qwen/qwen3.8-flash`'s only endpoint
+(provider tag `alibaba`) does not appear on OpenRouter's own
+zero-data-retention endpoint list
+(`openrouter.ai/api/v1/endpoints/zdr`, checked 2026-09-01), and the registry's
+own note already recorded that Alibaba's raw API-traffic retention (distinct
+from console session-history retention, which it does retain) was never
+independently confirmed. `data_collection: "deny"` and `provider.only` are
+real request-side controls, but they enforce *routing*, not the underlying
+provider's actual retention behavior - and the registry had admitted this
+entry while that behavior was still an open question rather than a checked
+"no". That is a failure of the **private** admission bar this ADR itself
+defines, not a gap the routing controls can close. The owner's decision:
+remove the entry rather than keep it as an accepted-risk exception. See
+"Provider-endpoint pinning" and the Decision/Consequences sections below for
+what the registry contains now.
+
 ## Decision
 
 Model selection has two modes, set by `TC_MODEL_SELECTION_MODE` (`safe` by
@@ -84,9 +101,13 @@ default):
   "Provider-endpoint pinning" below for why this is a separate field rather
   than folded into the model-review criteria above.
 
-  The registry starts with one entry, `qwen/qwen3.8-flash`, carrying forward
-  the research `env.example` already staged. Adding a model means adding an
-  entry after doing the review above - a code change and a commit, not a
+  The registry is currently empty - `qwen/qwen3.8-flash`, the research
+  `env.example` originally staged, was added and then removed the same day
+  once its endpoint failed the private bar (see Context). With an empty
+  registry, a non-empty `model_organize`/`model_query_plan` in safe mode is
+  always rejected, so organize/query-plan run on the deterministic offline
+  adapter until a model actually passes review. Adding a model means adding
+  an entry after doing the review above - a code change and a commit, not a
   config edit, which is the point: the review has to have actually happened.
 
 - **Custom mode.** `TC_MODEL_SELECTION_MODE=custom` lifts the allowlist. Any
@@ -149,19 +170,17 @@ this restricts the initial choice too, to specific provider endpoints. `None`
 (the default) sends no restriction, which is not itself "safe": a caller in
 safe mode is expected to pass `ReviewedModel.providers` for the pinned model.
 
-For `qwen/qwen3.8-flash`, researched via OpenRouter's endpoints API
+`qwen/qwen3.8-flash` was researched via OpenRouter's endpoints API
 (`openrouter.ai/api/v1/models/qwen/qwen3.8-flash/endpoints`, checked
-2026-09-01): exactly one endpoint exists, provider tag `alibaba`, which
-supports `require_parameters` with `response_format`/structured outputs.
-Alibaba Cloud's own FAQ states it does not train on this data; whether it
-retains raw API traffic specifically (distinct from console session history,
-which it does retain) was not confirmed and is recorded as an open item in
-`REVIEWED_MODELS`' note rather than assumed. With a single current endpoint,
-`provider.only: ["alibaba"]` and the already-present `allow_fallbacks: false`
-produce identical routing today; `only` is kept anyway as the literal
-enforcement of "never route a reviewed model to an unreviewed provider" - it
-stops mattering only if OpenRouter never adds a second endpoint for this
-model, which is not something to rely on.
+2026-09-01) as the mechanism's first real example: exactly one endpoint
+existed, provider tag `alibaba`, confirmed to support `require_parameters`
+with `response_format`/structured outputs. It no longer appears in the
+registry - checking OpenRouter's zero-data-retention endpoint list the same
+day showed that endpoint was not on it, which meant the raw-API-traffic
+retention question the entry's note had already flagged as unconfirmed was
+actually an unconfirmed "no", not an open "maybe". The mechanism itself
+(`provider.only`, sourced from `ReviewedModel.providers`) is unchanged and
+still exists for whichever model is added next.
 
 Custom mode never sends `provider.only`: `Settings.openrouter_only_providers`
 returns `None` unconditionally outside safe mode, even for a model slug that
@@ -187,8 +206,10 @@ their own `.env` that they are outside the reviewed set.
 
 **Positive.** The reviewed-models registry is the one place this project's
 actual position on "is this model acceptable" lives in code, instead of only
-in a comment. It is small on purpose: Release 1 needs exactly one working
-model, not a curated marketplace.
+in a comment. It is small on purpose - Release 1 needs exactly one working
+model, not a curated marketplace - and, as of 2026-09-01, currently empty:
+removing an entry that failed review is the registry doing its job, not a
+regression.
 
 **Positive.** Closes the specific gap the Slice 9 follow-up review named: a
 reviewed model pinned in safe mode can no longer be silently served by an
@@ -210,12 +231,19 @@ diverging from `model_requested` is still caught only after the call
 returns - that remains `OpenRouterProvider`'s separate, unchanged job.
 
 **Negative.** `ReviewedModel.providers` is a claim recorded at review time,
-not a live check - if OpenRouter deprecates the `alibaba` endpoint for
-`qwen/qwen3.8-flash` and no other is added, `provider.only` simply makes
-every safe-mode request fail rather than silently falling through to an
-unreviewed endpoint, which is the intended failure direction but does mean
-the registry entry needs revisiting if OpenRouter's endpoint list for a
-reviewed model changes.
+not a live check - if OpenRouter's endpoint list for a reviewed model changes
+after review (an endpoint is deprecated, or the provider's retention policy
+changes) and no one revisits the entry, `provider.only` simply makes every
+safe-mode request for that model fail rather than silently falling through to
+an unreviewed endpoint. That is the intended failure direction, but it does
+mean an accepted entry is not a permanent guarantee.
+
+**Negative.** With the registry empty, safe mode - the default - has no
+provider-backed model to organize or answer queries with; both run on the
+deterministic offline adapter until a model is added. This is the direct
+cost of treating "private" as a checked fact rather than a plausible one:
+Release 1's safe-mode LLM path is blocked on finding a model with a
+confirmed-eligible endpoint, not merely a plausible one.
 
 **Negative.** Every new model requires a code change to adopt in safe mode.
 This is deliberate friction, not an oversight: it is what makes "reviewed"
@@ -230,10 +258,14 @@ ADR extends, so the startup allowlist, the request-side routing flags, and
 the post-call served-model guard all stay backed by one source of truth
 rather than drifting apart.
 
-**Deferred.** Whether Alibaba retains raw API traffic (as opposed to console
-session history, which it explicitly does retain) was not confirmed against
-its Terms of Service, only its FAQ. Recorded as an open item in
-`REVIEWED_MODELS`, not resolved by this ADR.
+**Deferred.** Finding a model that is confirmed to meet all three admission
+bars - safe, private (ideally via a confirmed OpenRouter zero-data-retention
+endpoint, `provider.zdr`, not just a "deny" data-collection tag - see
+Context) - and JSON-structure enforceable, so safe mode has a working
+provider-backed path again. `provider.zdr` itself is not yet sent by
+`OpenRouterProvider` at all; adopting it, and confirming its actual
+undocumented failure behavior when no eligible endpoint exists, is separate
+follow-up work, not assumed safe by this ADR.
 
 ## Verification
 
@@ -265,5 +297,10 @@ given and is absent by default; and the separate served-model guard this ADR
 does not change is still covered.
 
 `tests/unit/test_reviewed_models.py` asserts every registry entry records at
-least one provider, and that `qwen/qwen3.8-flash`'s entry is exactly
-`frozenset({"alibaba"})`.
+least one provider, that the registry is currently empty (documenting why,
+so a future entry is a deliberate change to that test rather than a silent
+diff), and guards `ReviewedModel`'s field shape with a synthetic entry
+independent of the registry's actual contents. Because the real registry is
+empty, `tests/unit/test_settings.py`'s safe-mode-accepts/restricts-providers
+tests inject their own synthetic `REVIEWED_MODELS` entry via `monkeypatch`
+rather than depend on a specific model having been reviewed.

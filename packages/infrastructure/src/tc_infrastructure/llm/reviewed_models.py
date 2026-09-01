@@ -23,9 +23,20 @@ picks *first* under its own default load-balancing. ``providers`` is what
 to a reviewed endpoint too - a model can be "reviewed" while a provider newly
 added to serve it has not been.
 
-This list starts with the one candidate already researched during initial
-setup (see ``env.example``'s OpenRouter section); custom mode exists
-precisely for operating with a model that has not been through this review.
+This list is currently empty. ``qwen/qwen3.8-flash`` was the one candidate
+staged in ``env.example`` during initial setup, but was removed on
+2026-09-01: its only OpenRouter endpoint (provider tag ``alibaba``) does not
+appear on OpenRouter's zero-data-retention endpoint list
+(``openrouter.ai/api/v1/endpoints/zdr``), and Alibaba's own FAQ does not
+clearly distinguish raw API-traffic retention (unconfirmed) from console
+session-history retention (confirmed retained) - so it did not actually meet
+the **private** bar above, despite having been admitted while that gap was
+still recorded as merely "unconfirmed" rather than "checked and failed."
+Until a model is found that is confirmed to meet all three bars, safe mode
+has no eligible provider-backed model and organize/query-plan run on the
+deterministic offline adapter (``uses_offline_model_adapter``). Custom mode
+exists precisely for operating with a model that has not been through this
+review, at the host's own risk.
 """
 
 from __future__ import annotations
@@ -41,25 +52,6 @@ class ReviewedModel:
     note: str
 
 
-_ENTRIES = (
-    ReviewedModel(
-        model_id="qwen/qwen3.8-flash",
-        supports_strict_schema=True,
-        providers=frozenset({"alibaba"}),
-        note=(
-            "~$0.25/month at one run per day; supports strict JSON-schema "
-            "structured outputs; no training opt-in required. Exactly one "
-            "OpenRouter endpoint as of 2026-09-01 (Alibaba - "
-            "openrouter.ai/api/v1/models/qwen/qwen3.8-flash/endpoints, "
-            "provider tag 'alibaba'), confirmed to support "
-            "require_parameters with response_format/structured_outputs. "
-            "Alibaba Cloud's own FAQ states it does not train on this data; "
-            "whether it retains raw API traffic (distinct from console "
-            "session history, which it does retain) was not confirmed - "
-            "worth an explicit ToS check if that distinction matters before "
-            "relying on it further."
-        ),
-    ),
-)
+_ENTRIES: tuple[ReviewedModel, ...] = ()
 
 REVIEWED_MODELS: dict[str, ReviewedModel] = {entry.model_id: entry for entry in _ENTRIES}

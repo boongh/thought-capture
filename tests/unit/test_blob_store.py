@@ -144,7 +144,10 @@ async def test_every_fanout_directory_level_is_synced(
 
     assert stored.storage_key == expected_key
     leaf = tmp_path / Path(expected_key).parent
-    assert synced == [leaf, leaf.parent, tmp_path]
+    # The leading entry is the once-per-lifetime root-durability confirmation
+    # (see test_an_existing_root_is_confirmed_once_per_store_lifetime_not_every_write),
+    # which runs before any fan-out directory is touched.
+    assert synced == [tmp_path.parent, leaf, leaf.parent, tmp_path]
 
 
 async def test_a_nonexistent_root_is_created_durably(
@@ -186,14 +189,15 @@ async def test_a_multi_level_nonexistent_root_syncs_every_new_level(
     assert tmp_path in synced, "'data''s own entry inside tmp_path was not synced"
 
 
-async def test_an_existing_root_is_never_resynced_just_for_existing(
+async def test_an_existing_root_is_confirmed_once_per_store_lifetime_not_every_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unlike the fan-out levels, root-creation durability is checked, not unconditional.
-
-    It only needs to run once per store lifetime, so the cheap path - root
-    already exists, do nothing - should stay cheap rather than fsync root on
-    every single write forever.
+    """On-disk existence is never trusted as proof of durability on its own -
+    see ``_ensure_durable_root`` - so a fresh store instance confirms root's
+    own entry in its parent once, even though root already exists on disk
+    when the store is constructed. It must not repeat that confirmation on
+    every subsequent write in the same store's lifetime, which is what keeps
+    the common case cheap.
     """
     payload = b"a payload into an already-existing root"
     synced: list[Path] = []
@@ -201,12 +205,55 @@ async def test_an_existing_root_is_never_resynced_just_for_existing(
     store = FilesystemBlobStore(tmp_path)
 
     await store.put(chunks_of(payload))
+    assert tmp_path.parent in synced, "a fresh instance must confirm root's parent entry once"
+    synced.clear()
 
-    # tmp_path is synced once, by _fsync_fanout_directories walking up to
-    # root for the new fan-out prefix - not by root-creation durability,
-    # since root already existed and _ensure_durable_directory never ran the
-    # sync branch for it.
-    assert synced.count(tmp_path) == 1
+    await store.put(chunks_of(b"a different payload"))
+    assert tmp_path.parent not in synced, "root durability must not be reconfirmed on every write"
+
+
+async def test_a_failed_root_confirmation_is_retried_not_trusted_from_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash (or any exception) between ``mkdir`` and the confirming fsync
+    leaves the root directory present on disk but unconfirmed. The bug this
+    guards against: treating that on-disk presence as proof of durability
+    would let a retry - in this process, or a fresh one after a restart -
+    report success without ever successfully confirming the root's own
+    directory entry, silently carrying the first attempt's failure forward.
+    """
+    root = tmp_path / "attachments"
+    payload = b"the first attachment this store has ever seen"
+    real_fsync_directory = blob_store._fsync_directory
+    synced: list[Path] = []
+    should_fail = [True]
+
+    def flaky_fsync_directory(directory: Path) -> None:
+        synced.append(directory)
+        if should_fail[0]:
+            should_fail[0] = False
+            raise OSError("synthetic root-parent fsync failure")
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(blob_store, "_fsync_directory", flaky_fsync_directory)
+    store = FilesystemBlobStore(root)
+
+    with pytest.raises(OSError, match="synthetic root-parent fsync failure"):
+        await store.put(chunks_of(payload))
+
+    assert root.is_dir(), "mkdir already ran before the fsync failed - present but unconfirmed"
+    assert store._root_confirmed_durable is False, (
+        "a failed sync must never be recorded as confirmed"
+    )
+
+    synced.clear()
+    stored = await store.put(chunks_of(payload))
+
+    assert tmp_path in synced, (
+        "the retry must redo the confirming fsync, not skip it because root exists"
+    )
+    assert store._root_confirmed_durable is True
+    assert stored.deduplicated is False
 
 
 async def test_a_deduplicated_write_still_confirms_directory_durability(

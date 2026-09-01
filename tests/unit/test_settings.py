@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from tc_infrastructure.config import Settings
+from tc_infrastructure.llm.reviewed_models import REVIEWED_MODELS, ReviewedModel
 
 REQUIRED_ENV = {
     "TC_WORKSPACE_TIMEZONE": "Asia/Bangkok",
@@ -22,6 +23,32 @@ def build(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
         monkeypatch.setenv(key, value)
     # _env_file=None keeps a developer's real .env out of the test.
     return Settings(_env_file=None)
+
+
+def stub_reviewed_model(
+    monkeypatch: pytest.MonkeyPatch,
+    model_id: str,
+    providers: frozenset[str] = frozenset({"test-provider"}),
+) -> None:
+    """Inject a synthetic allowlist entry.
+
+    The real registry (``REVIEWED_MODELS``) is empty as of 2026-09-01 - its
+    one candidate failed the private bar on review, see
+    ``reviewed_models.py``. Tests of the safe-mode *mechanism* (accepts a
+    reviewed slug, restricts to its recorded providers) must not depend on
+    any specific model actually being reviewed, so they inject their own
+    entry directly into the shared dict rather than naming a real slug.
+    """
+    monkeypatch.setitem(
+        REVIEWED_MODELS,
+        model_id,
+        ReviewedModel(
+            model_id=model_id,
+            supports_strict_schema=True,
+            providers=providers,
+            note="synthetic entry for test use only",
+        ),
+    )
 
 
 def test_blank_optional_discord_ids_are_read_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,7 +112,11 @@ def test_offline_model_adapter_is_selected_when_no_slug_is_pinned(
 ) -> None:
     """An unpinned model must not silently fall through to a provider call."""
     assert build(monkeypatch, TC_MODEL_ORGANIZE="").uses_offline_model_adapter is True
-    pinned = build(monkeypatch, TC_MODEL_ORGANIZE="qwen/qwen3.8-flash")
+    # custom mode: this test is about pinned-vs-unpinned, not about whether
+    # the slug has been reviewed - the real allowlist may have no entries.
+    pinned = build(
+        monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_ORGANIZE="some/pinned-model"
+    )
     assert pinned.uses_offline_model_adapter is False
 
 
@@ -94,12 +125,13 @@ def test_safe_mode_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_safe_mode_accepts_a_reviewed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
     settings = build(
         monkeypatch,
         TC_MODEL_SELECTION_MODE="safe",
-        TC_MODEL_ORGANIZE="qwen/qwen3.8-flash",
+        TC_MODEL_ORGANIZE="test/reviewed-model",
     )
-    assert settings.model_organize == "qwen/qwen3.8-flash"
+    assert settings.model_organize == "test/reviewed-model"
 
 
 def test_safe_mode_rejects_an_unreviewed_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,8 +204,9 @@ def test_fallback_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_safe_mode_restricts_a_reviewed_model_to_its_reviewed_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    stub_reviewed_model(monkeypatch, "test/reviewed-model", providers=frozenset({"test-provider"}))
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
-    assert settings.openrouter_only_providers("qwen/qwen3.8-flash") == frozenset({"alibaba"})
+    assert settings.openrouter_only_providers("test/reviewed-model") == frozenset({"test-provider"})
 
 
 def test_safe_mode_has_no_restriction_for_a_model_not_looked_up(
@@ -189,5 +222,6 @@ def test_safe_mode_has_no_restriction_for_a_model_not_looked_up(
 def test_custom_mode_never_restricts_providers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Even for a slug that happens to also be reviewed - custom mode's promise is
     freedom from the allowlist entirely, not a silent partial application of it."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
-    assert settings.openrouter_only_providers("qwen/qwen3.8-flash") is None
+    assert settings.openrouter_only_providers("test/reviewed-model") is None
