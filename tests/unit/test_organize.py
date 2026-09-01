@@ -1,0 +1,148 @@
+"""The organize pipeline's orchestration, driven with fakes (docs/DESIGN.md 7.2)."""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import uuid
+
+import pytest
+
+from tc_application.organize import OrganizeWindow
+from tc_domain.capture import ThoughtId, WorkspaceId
+from tc_domain.llm import LLMError, LLMRequest, LLMResponse
+from tc_domain.organize import OrganizeCoverageError, WindowThought
+from tc_domain.windows import CaptureWindow
+from tc_infrastructure.llm.offline import OfflineLLMProvider
+from tests.unit.fakes import (
+    FakeContextIndex,
+    FakeOrganizeWriter,
+    FakeRunLedger,
+    FakeThoughtWindowReader,
+)
+
+WORKSPACE = WorkspaceId(uuid.uuid4())
+WINDOW = CaptureWindow(
+    start=dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC),
+    end=dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC),
+)
+
+
+def journal_factory(workspace_id: WorkspaceId, run_id: uuid.UUID):
+    async def write(request: LLMRequest, response: LLMResponse, attempt: int) -> None:
+        return None
+
+    return write
+
+
+async def no_usage(workspace_id: WorkspaceId, run_id: uuid.UUID) -> tuple[int, int]:
+    return 0, 0
+
+
+def make_pipeline(
+    *,
+    thoughts: list[WindowThought],
+    provider: object,
+    context_index: FakeContextIndex | None = None,
+    writer: FakeOrganizeWriter | None = None,
+    run_ledger: FakeRunLedger | None = None,
+) -> tuple[OrganizeWindow, FakeOrganizeWriter, FakeRunLedger]:
+    writer = writer or FakeOrganizeWriter()
+    run_ledger = run_ledger or FakeRunLedger()
+    pipeline = OrganizeWindow(
+        thoughts=FakeThoughtWindowReader(thoughts),
+        context_index=context_index or FakeContextIndex(),
+        provider=provider,  # type: ignore[arg-type]
+        journal_factory=journal_factory,
+        writer=writer,
+        run_ledger=run_ledger,
+        usage_for=no_usage,
+        clock=lambda: dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC),
+    )
+    return pipeline, writer, run_ledger
+
+
+def a_thought(id_: int, body: str = "went for a walk") -> WindowThought:
+    return WindowThought(
+        id=ThoughtId(id_), body=body, client_local_date="2026-08-31", client_local_time="10:00:00"
+    )
+
+
+async def test_an_empty_window_skips_the_llm_and_writer() -> None:
+    provider = OfflineLLMProvider()
+    pipeline, writer, run_ledger = make_pipeline(thoughts=[], provider=provider)
+
+    run_id = await pipeline(WORKSPACE, WINDOW)
+
+    assert provider.calls == []
+    assert writer.calls == []
+    assert len(run_ledger.succeeded) == 1
+    assert run_ledger.succeeded[0]["run_id"] == run_id
+    assert run_ledger.succeeded[0]["input_tokens"] == 0
+
+
+async def test_the_happy_path_writes_and_marks_the_run_succeeded() -> None:
+    organize_reply = json.dumps(
+        {
+            "documents": [
+                {
+                    "stable_key": "daily_digest:2026-08-31",
+                    "kind": "daily_digest",
+                    "title": "Daily digest",
+                    "body_markdown": "## Summary\n\nWalked.\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- walked",
+                    "source_thought_ids": [1],
+                    "mentioned_entities": [],
+                    "change_summary": "first digest",
+                    "confidence": 1.0,
+                }
+            ],
+            "unorganized_thought_ids": [],
+            "referenced_document_keys": [],
+        }
+    )
+    provider = OfflineLLMProvider(responder=lambda _req: organize_reply)
+    pipeline, writer, run_ledger = make_pipeline(thoughts=[a_thought(1)], provider=provider)
+
+    run_id = await pipeline(WORKSPACE, WINDOW)
+
+    assert len(writer.calls) == 1
+    assert writer.calls[0].documents[0].stable_key == "daily_digest:2026-08-31"
+    assert len(run_ledger.succeeded) == 1
+    assert run_ledger.succeeded[0]["run_id"] == run_id
+    assert run_ledger.failed == []
+
+
+async def test_incomplete_coverage_fails_the_run_and_raises() -> None:
+    organize_reply = json.dumps(
+        {"documents": [], "unorganized_thought_ids": [], "referenced_document_keys": []}
+    )
+    provider = OfflineLLMProvider(responder=lambda _req: organize_reply)
+    pipeline, writer, run_ledger = make_pipeline(thoughts=[a_thought(1)], provider=provider)
+
+    with pytest.raises(OrganizeCoverageError):
+        await pipeline(WORKSPACE, WINDOW)
+
+    assert writer.calls == []
+    assert len(run_ledger.failed) == 1
+    assert run_ledger.failed[0]["error_code"] == "OrganizeCoverageError"
+    assert run_ledger.succeeded == []
+
+
+async def test_a_provider_failure_on_organize_fails_the_run_and_raises() -> None:
+    class FailingProvider:
+        model_id = "failing/model"
+        supports_strict_schema = False
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            raise LLMError("synthetic outage")
+
+    pipeline, writer, run_ledger = make_pipeline(
+        thoughts=[a_thought(1)], provider=FailingProvider()
+    )
+
+    with pytest.raises(LLMError):
+        await pipeline(WORKSPACE, WINDOW)
+
+    assert writer.calls == []
+    assert len(run_ledger.failed) == 1
+    assert run_ledger.failed[0]["error_code"] == "LLMError"

@@ -69,6 +69,18 @@ class PostgresContextIndex:
             for row in entity_rows
         )
 
+    async def bodies_for(
+        self, workspace_id: WorkspaceId, stable_keys: frozenset[str]
+    ) -> dict[str, str]:
+        """Full current ``body_markdown`` for an already-selected set of keys.
+
+        For the documents context assembly picked for ``full`` inclusion
+        (docs/DESIGN.md 7.3.2) - the Tier 1 index itself only carries the
+        bounded ``Summary`` section, not the whole body.
+        """
+        async with self._session_factory() as session:
+            return await self._current_bodies(session, workspace_id, list(stable_keys))
+
     async def _aliases_for(
         self, session: AsyncSession, entity_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, list[str]]:

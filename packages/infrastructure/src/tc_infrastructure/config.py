@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     workspace_timezone: str = "Asia/Bangkok"
     digest_local_time: dt.time = dt.time(20, 0)
 
+    # -- Organize context assembly (docs/DESIGN.md 7.3.6) -------------------
+    context_max_selected_documents: int = Field(default=12, ge=1)
+    context_recency_days: float = Field(default=3.0, gt=0)
+
     # -- Database ----------------------------------------------------------
     # The application role is denied UPDATE/DELETE on `thoughts`. The migration
     # role owns the schema and is used only by the one-shot migrate step.

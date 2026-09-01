@@ -9,7 +9,7 @@
 # file, not the repository root.
 #
 # Profiles:
-#   core          postgres, one-shot migrate, api, discord-bot
+#   core          postgres, one-shot migrate, api, discord-bot, worker
 #   ai            Khoj and its own database (Phase 2, not yet defined)
 #   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
 
@@ -151,6 +151,23 @@ services:
       <<: *service-env
     volumes:
       - attachments:/data/attachments
+
+  # Runs the organize/digest scheduler (docs/DESIGN.md 7.2): wakes at the
+  # configured local digest time, catches up any missed window on restart,
+  # then organizes each subsequent window as it closes. No published ports -
+  # this process only talks to postgres.
+  worker:
+    <<: *service-image
+    profiles: ["core"]
+    command: ["python", "-m", "tc_worker"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *service-env
 
 volumes:
   postgres-data:
