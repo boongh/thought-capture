@@ -156,9 +156,9 @@ rather than disclosing anything on its first organize run.
 gets *asked for*; it says nothing about what OpenRouter does with that
 request once sent. Every `OpenRouterProvider.complete` call now includes an
 OpenRouter `provider` routing object (sent via the OpenAI SDK's `extra_body`,
-since `provider` is not a field the SDK's typed client knows about), built
-from two flags on the provider itself - `allow_fallbacks` and
-`deny_data_collection` - which `Settings` computes from mode:
+since `provider` is not a field the SDK's typed client knows about). Its
+fallback, data-collection, and ZDR controls are computed from mode; an
+optional reviewed-provider restriction is supplied for safe-mode models.
 
 - **Safe mode**: `openrouter_allow_fallbacks` is always `False` and
   `openrouter_deny_data_collection` is always `True`, regardless of any other
@@ -184,10 +184,10 @@ from two flags on the provider itself - `allow_fallbacks` and
   use case in this ADR - `nvidia/nemotron-3.5-lightning:free`, which requires
   accepting training/publishing to use at all.
 
-`OpenRouterProvider` itself has no notion of "mode" - it only takes the two
-flags, defaulting to the conservative values (`allow_fallbacks=False`,
-`deny_data_collection=True`) so a direct construction that forgot to wire
-`Settings` fails safe rather than silently permissive.
+`OpenRouterProvider` itself has no notion of "mode" - it takes routing
+controls directly, defaulting to conservative values (`allow_fallbacks=False`,
+`deny_data_collection=True`, `require_zdr=True`) so a direct construction that
+forgot to wire `Settings` fails safe rather than silently permissive.
 
 The full `provider` routing object actually sent is also recorded in
 `LLMResponse.request_params`, which the `llm_calls` journal (`docs/adr/0008`)
@@ -243,9 +243,9 @@ OpenRouter's own maintained zero-data-retention endpoint list
 (`openrouter.ai/api/v1/endpoints/zdr`) - a live per-request check, unlike
 `ReviewedModel.providers`/`provider.only`, which only records what was true
 at review time. `require_zdr=False` omits the key rather than sending
-`zdr: false`: OpenRouter documents no such value, only the absence of the
-constraint, matching how `data_collection` is omitted rather than sent as
-`"allow"` when not denied. `Settings.openrouter_require_zdr` follows the same
+`zdr: false`: OpenRouter documents that `false` and omission have no
+request-level effect, so omission avoids an unnecessary override while still
+allowing account- or guardrail-level ZDR enforcement. `Settings.openrouter_require_zdr` follows the same
 safe/custom split as the other two request-side flags: always `True` in safe
 mode, and `model_require_zdr` (default `false`) in custom mode - see "Request-
 side provider routing" above.

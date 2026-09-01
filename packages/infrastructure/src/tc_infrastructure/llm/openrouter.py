@@ -157,8 +157,8 @@ class OpenRouterProvider:
             # `ReviewedModel.providers`/`only`, which is a claim recorded at
             # review time. Omitted rather than sent as `false` when not
             # required, matching `data_collection`'s omit-to-inherit
-            # behavior: OpenRouter has no documented "zdr: false", only the
-            # absence of the constraint.
+            # behavior: `zdr: false` and omission have no request-level
+            # effect, so omission avoids an unnecessary override.
             provider_routing["zdr"] = True
         if self._strict:
             # OpenRouter defaults `require_parameters` to false, meaning a
