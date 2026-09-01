@@ -53,3 +53,7 @@ class AttachmentArchiveFailed(CaptureRejected):
 
 class InvalidCaptureCommand(CaptureRejected):
     """The command is internally inconsistent, e.g. a naive timestamp."""
+
+
+class InvalidThresholds(DomainError):
+    """A configured pair of thresholds is not a valid ordering (docs/DESIGN.md 6.4)."""
