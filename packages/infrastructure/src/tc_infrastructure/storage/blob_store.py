@@ -59,7 +59,7 @@ class FilesystemBlobStore:
         the store's own directory so that the final ``os.replace`` stays within
         one filesystem, where it is atomic.
         """
-        self._root.mkdir(parents=True, exist_ok=True)
+        _ensure_durable_directory(self._root)
         digest = hashlib.sha256()
         size = 0
 
@@ -127,6 +127,40 @@ class FilesystemBlobStore:
     def open_stream(self, storage_key: str) -> bytes:
         """Read a stored blob back. Used by export and restore verification."""
         return self.path_for(storage_key).read_bytes()
+
+
+def _ensure_durable_directory(path: Path) -> None:
+    """Create ``path`` (and any missing parents), and make the creation durable.
+
+    ``FilesystemBlobStore.put`` calls this on every write, but the common case
+    - the store's root already exists - is one cheap ``exists()`` call and a
+    return. The uncommon case is the one that matters: a clean install whose
+    configured root (``./attachments`` by default) does not exist yet. Merely
+    calling ``mkdir(parents=True)`` there is exactly the bug fixed in
+    ``_fsync_fanout_directories`` one level up - the new directory's entry in
+    *its* parent is not durable until that parent is fsynced too, and a power
+    loss right after the first acknowledged attachment can take the whole
+    store with it.
+
+    Unlike the fan-out directories (created constantly, once per new
+    two-character prefix, where detecting "is this new" would cost a stat per
+    level on every single blob write), the root is created at most once per
+    store lifetime - so checking first, rather than syncing unconditionally,
+    is worth the branch here. ``mkdir(parents=True)`` can create more than one
+    level in one call (a root nested under a parent that also doesn't exist
+    yet), so every level actually created is walked and synced, not just the
+    leaf.
+    """
+    if path.exists():
+        return
+    existing_ancestor = path.parent
+    while not existing_ancestor.exists():
+        existing_ancestor = existing_ancestor.parent
+    path.mkdir(parents=True, exist_ok=True)
+    directory = path
+    while directory != existing_ancestor:
+        _fsync_directory(directory.parent)
+        directory = directory.parent
 
 
 def _fsync_fanout_directories(root: Path, storage_key: str) -> None:

@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -40,7 +40,20 @@ collection
 reviewed model could still be silently served by an unreviewed backup
 provider, or by one that trains on the request, and nothing in the adapter
 said otherwise. The first draft of this ADR named that gap and deliberately
-left it open rather than claim it was covered; this revision closes it.
+left it open rather than claim it was covered; that revision closed data
+collection and *backup* fallback specifically.
+
+A second review pass on that revision (same day) found it still incomplete:
+`allow_fallbacks: false` only refuses a *second* provider once OpenRouter has
+already picked and failed over from a first one - it does nothing to
+constrain that first, initial pick, which OpenRouter makes under its own
+default load-balancing across whatever providers currently serve the pinned
+model. `data_collection: "deny"` filters by policy but is not the same thing
+as an owner-reviewed allowlist of specific providers. The reviewer also noted
+that OpenRouter defaults `require_parameters` to `false`, so a provider that
+does not actually honor every parameter in the request - the strict
+JSON-schema enforcement, specifically - can be selected anyway and silently
+drop it rather than failing loudly. This revision closes both.
 
 The system is Release-1 single-owner, self-hosted (`docs/DESIGN.md` 1). The
 owner is also the only operator. So the guard this ADR adds is not protecting
@@ -65,6 +78,11 @@ default):
   - **JSON structure enforceable** - confirmed to support
     `response_format: {"type": "json_schema", "strict": true}` server-side,
     not just a prompted best-effort shape.
+
+  A fourth field, `ReviewedModel.providers`, records which specific
+  OpenRouter provider endpoint(s) were checked - not just the model. See
+  "Provider-endpoint pinning" below for why this is a separate field rather
+  than folded into the model-review criteria above.
 
   The registry starts with one entry, `qwen/qwen3.8-flash`, carrying forward
   the research `env.example` already staged. Adding a model means adding an
@@ -122,6 +140,43 @@ flags, defaulting to the conservative values (`allow_fallbacks=False`,
 `deny_data_collection=True`) so a direct construction that forgot to wire
 `Settings` fails safe rather than silently permissive.
 
+**Provider-endpoint pinning.** `allow_fallbacks: false` refuses a *second*
+provider after the first fails; it does not restrict OpenRouter's *first*
+choice, made under its own default load-balancing across every current
+endpoint for the pinned model. `OpenRouterProvider` gains a third flag,
+`only_providers: frozenset[str] | None`, sent as `provider.only` when set -
+this restricts the initial choice too, to specific provider endpoints. `None`
+(the default) sends no restriction, which is not itself "safe": a caller in
+safe mode is expected to pass `ReviewedModel.providers` for the pinned model.
+
+For `qwen/qwen3.8-flash`, researched via OpenRouter's endpoints API
+(`openrouter.ai/api/v1/models/qwen/qwen3.8-flash/endpoints`, checked
+2026-09-01): exactly one endpoint exists, provider tag `alibaba`, which
+supports `require_parameters` with `response_format`/structured outputs.
+Alibaba Cloud's own FAQ states it does not train on this data; whether it
+retains raw API traffic specifically (distinct from console session history,
+which it does retain) was not confirmed and is recorded as an open item in
+`REVIEWED_MODELS`' note rather than assumed. With a single current endpoint,
+`provider.only: ["alibaba"]` and the already-present `allow_fallbacks: false`
+produce identical routing today; `only` is kept anyway as the literal
+enforcement of "never route a reviewed model to an unreviewed provider" - it
+stops mattering only if OpenRouter never adds a second endpoint for this
+model, which is not something to rely on.
+
+Custom mode never sends `provider.only`: `Settings.openrouter_only_providers`
+returns `None` unconditionally outside safe mode, even for a model slug that
+happens to also appear in `REVIEWED_MODELS` - custom mode's promise is
+freedom from the allowlist machinery entirely, not a silent partial
+application of it.
+
+**`require_parameters`.** OpenRouter defaults this to `false`, so a provider
+that does not actually honor the parameters in the request - the strict
+`response_format` enforcement, specifically - can still be selected and
+silently ignore it rather than failing loudly. `OpenRouterProvider` now sends
+`require_parameters: true` whenever `supports_strict_schema` is set, since
+that flag is this class's own promise that schema enforcement is load-bearing
+for the call; there is nothing to require for the non-strict, prompted path.
+
 ## Consequences
 
 **Positive.** The gap between "the design says review the model" and "the
@@ -141,12 +196,26 @@ unreviewed fallback provider or one that retains the request, because the
 adapter now says so on every request rather than only checking after the
 fact.
 
+**Positive.** Closes the second-pass finding too: the *initial* provider
+choice is now restricted to reviewed endpoints (`provider.only`), not just
+backup attempts after a failure, and a provider that can't actually enforce
+the schema it's asked for is excluded outright (`require_parameters`) rather
+than silently serving a best-effort approximation.
+
 **Negative.** Safe mode's model allowlist is a startup-time check; it cannot
 verify that a reviewed model's provider hasn't changed its policy since
-review. The request-side routing flags added in this revision narrow that
-gap for *fallback and retention* specifically, but `model_served` diverging
-from `model_requested` is still caught only after the call returns - that
-remains `OpenRouterProvider`'s separate, unchanged job.
+review. The request-side routing flags narrow that gap for *fallback,
+retention, and initial provider choice* specifically, but `model_served`
+diverging from `model_requested` is still caught only after the call
+returns - that remains `OpenRouterProvider`'s separate, unchanged job.
+
+**Negative.** `ReviewedModel.providers` is a claim recorded at review time,
+not a live check - if OpenRouter deprecates the `alibaba` endpoint for
+`qwen/qwen3.8-flash` and no other is added, `provider.only` simply makes
+every safe-mode request fail rather than silently falling through to an
+unreviewed endpoint, which is the intended failure direction but does mean
+the registry entry needs revisiting if OpenRouter's endpoint list for a
+reviewed model changes.
 
 **Negative.** Every new model requires a code change to adopt in safe mode.
 This is deliberate friction, not an oversight: it is what makes "reviewed"
@@ -155,10 +224,16 @@ mean something more than "someone typed a slug into `.env`".
 **Deferred.** Nothing in this ADR yet wires `OpenRouterProvider` into a
 composition root - no `apps/*` process constructs one today. When that
 composition lands, it should read `model_selection_mode`, `REVIEWED_MODELS`,
-`openrouter_allow_fallbacks`, and `openrouter_deny_data_collection` from the
-same `Settings` object this ADR extends, so the startup allowlist, the
-request-side routing flags, and the post-call served-model guard all stay
-backed by one source of truth rather than drifting apart.
+`openrouter_allow_fallbacks`, `openrouter_deny_data_collection`, and
+`openrouter_only_providers(model_id)` from the same `Settings` object this
+ADR extends, so the startup allowlist, the request-side routing flags, and
+the post-call served-model guard all stay backed by one source of truth
+rather than drifting apart.
+
+**Deferred.** Whether Alibaba retains raw API traffic (as opposed to console
+session history, which it explicitly does retain) was not confirmed against
+its Terms of Service, only its FAQ. Recorded as an open item in
+`REVIEWED_MODELS`, not resolved by this ADR.
 
 ## Verification
 
@@ -172,10 +247,23 @@ mode regardless (it selects the offline adapter, not a provider);
 `openrouter_deny_data_collection` is `True` in safe mode and `False` in
 custom mode unconditionally.
 
+`tests/unit/test_settings.py` additionally asserts `openrouter_only_providers`
+returns `ReviewedModel.providers` for a reviewed slug in safe mode, `None` for
+an unrecognized slug, and `None` unconditionally in custom mode even for a
+slug that is also reviewed.
+
 `tests/unit/test_openrouter_provider.py` asserts the `provider` object
 actually sent (via `extra_body`, since `AsyncCompletions.create` has no typed
 `provider` parameter): the conservative defaults produce
-`{"allow_fallbacks": false, "data_collection": "deny"}`; allowing fallback
-without denying data collection sends `allow_fallbacks: true` with no
-`data_collection` key at all, rather than an explicit `"allow"`; and the
-separate served-model guard this ADR does not change is still covered.
+`{"allow_fallbacks": false, "data_collection": "deny", "require_parameters":
+true}` (the last because the test provider defaults to strict-schema);
+allowing fallback without denying data collection sends `allow_fallbacks:
+true` with no `data_collection` key at all, rather than an explicit
+`"allow"`; `require_parameters` is present for a strict-schema call and
+absent for a non-strict one; `only_providers` produces `provider.only` when
+given and is absent by default; and the separate served-model guard this ADR
+does not change is still covered.
+
+`tests/unit/test_reviewed_models.py` asserts every registry entry records at
+least one provider, and that `qwen/qwen3.8-flash`'s entry is exactly
+`frozenset({"alibaba"})`.

@@ -147,6 +147,68 @@ async def test_every_fanout_directory_level_is_synced(
     assert synced == [leaf, leaf.parent, tmp_path]
 
 
+async def test_a_nonexistent_root_is_created_durably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean install's configured root (``./attachments`` by default) does not exist yet.
+
+    ``mkdir(parents=True)`` alone creates the directory but does not make its
+    entry in *its own* parent durable - a power loss right after the first
+    acknowledged attachment could take the whole freshly-created store with
+    it, the same bug fixed for the fan-out levels but one level higher.
+    """
+    root = tmp_path / "attachments"
+    payload = b"the first attachment this store has ever seen"
+    synced: list[Path] = []
+    monkeypatch.setattr(blob_store, "_fsync_directory", lambda directory: synced.append(directory))
+    store = FilesystemBlobStore(root)
+
+    await store.put(chunks_of(payload))
+
+    assert root.is_dir()
+    assert tmp_path in synced, "root's own entry in its parent was never made durable"
+
+
+async def test_a_multi_level_nonexistent_root_syncs_every_new_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mkdir(parents=True)`` can create more than one new directory in one call."""
+    root = tmp_path / "data" / "attachments"
+    payload = b"a payload under a root nested two levels deep"
+    synced: list[Path] = []
+    monkeypatch.setattr(blob_store, "_fsync_directory", lambda directory: synced.append(directory))
+    store = FilesystemBlobStore(root)
+
+    await store.put(chunks_of(payload))
+
+    assert root.is_dir()
+    assert tmp_path / "data" in synced, "the intermediate 'data' directory was not synced"
+    assert tmp_path in synced, "'data''s own entry inside tmp_path was not synced"
+
+
+async def test_an_existing_root_is_never_resynced_just_for_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike the fan-out levels, root-creation durability is checked, not unconditional.
+
+    It only needs to run once per store lifetime, so the cheap path - root
+    already exists, do nothing - should stay cheap rather than fsync root on
+    every single write forever.
+    """
+    payload = b"a payload into an already-existing root"
+    synced: list[Path] = []
+    monkeypatch.setattr(blob_store, "_fsync_directory", lambda directory: synced.append(directory))
+    store = FilesystemBlobStore(tmp_path)
+
+    await store.put(chunks_of(payload))
+
+    # tmp_path is synced once, by _fsync_fanout_directories walking up to
+    # root for the new fan-out prefix - not by root-creation durability,
+    # since root already existed and _ensure_durable_directory never ran the
+    # sync branch for it.
+    assert synced.count(tmp_path) == 1
+
+
 async def test_a_deduplicated_write_still_confirms_directory_durability(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

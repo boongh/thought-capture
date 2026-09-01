@@ -52,6 +52,7 @@ class OpenRouterProvider:
         allowed_served_models: frozenset[str] | None = None,
         allow_fallbacks: bool = False,
         deny_data_collection: bool = True,
+        only_providers: frozenset[str] | None = None,
     ) -> None:
         if not model_id:
             raise ValueError("a pinned model slug is required; refusing a floating default")
@@ -74,6 +75,16 @@ class OpenRouterProvider:
         # this class itself has no notion of "mode", only these two flags.
         self._allow_fallbacks = allow_fallbacks
         self._deny_data_collection = deny_data_collection
+        # `allow_fallbacks: false` alone only refuses a *second* provider
+        # after the first fails - it does not restrict which provider
+        # OpenRouter picks first under its own default load-balancing.
+        # `only_providers`, when given, is sent as `provider.only` to
+        # restrict that initial choice to specific reviewed providers too.
+        # `None` (the default) sends no restriction at all, which is not the
+        # same as "safe": a caller in safe mode is expected to pass the
+        # provider(s) actually recorded against the reviewed model, once
+        # `ReviewedModel` carries that data.
+        self._only_providers = only_providers
         self._client = client or AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -128,6 +139,23 @@ class OpenRouterProvider:
         provider_routing: dict[str, Any] = {"allow_fallbacks": self._allow_fallbacks}
         if self._deny_data_collection:
             provider_routing["data_collection"] = "deny"
+        if self._strict:
+            # OpenRouter defaults `require_parameters` to false, meaning a
+            # provider that does not actually support every parameter we send
+            # - `response_format`'s strict JSON-schema enforcement, here -
+            # can still be selected and silently ignore it rather than
+            # failing loudly. `supports_strict_schema` is this class's own
+            # promise that schema enforcement is load-bearing for this call;
+            # `require_parameters: true` makes OpenRouter honor that promise
+            # by excluding any provider that can't actually keep it.
+            provider_routing["require_parameters"] = True
+        if self._only_providers:
+            # Restricts which provider OpenRouter may route to *initially*,
+            # not just after a failure - `allow_fallbacks: false` alone only
+            # blocks backup attempts once a provider is already selected, it
+            # does not constrain that first selection under OpenRouter's
+            # default load-balancing.
+            provider_routing["only"] = list(self._only_providers)
 
         params: dict[str, Any] = {
             "model": self._model_id,

@@ -14,6 +14,15 @@ three of docs/DESIGN.md 11's model-selection concerns:
   OpenRouter's ``response_format: {"type": "json_schema", "strict": true}``
   rather than only a best-effort prompted schema.
 
+A fourth field, ``providers``, records which specific OpenRouter provider
+endpoint(s) were actually reviewed for that model - not just the model
+itself. ``allow_fallbacks: false`` alone only blocks a *second* provider
+after the first one fails; it does not restrict which provider OpenRouter
+picks *first* under its own default load-balancing. ``providers`` is what
+``OpenRouterProvider`` sends as ``provider.only`` to pin that initial choice
+to a reviewed endpoint too - a model can be "reviewed" while a provider newly
+added to serve it has not been.
+
 This list starts with the one candidate already researched during initial
 setup (see ``env.example``'s OpenRouter section); custom mode exists
 precisely for operating with a model that has not been through this review.
@@ -28,6 +37,7 @@ from dataclasses import dataclass
 class ReviewedModel:
     model_id: str
     supports_strict_schema: bool
+    providers: frozenset[str]
     note: str
 
 
@@ -35,9 +45,19 @@ _ENTRIES = (
     ReviewedModel(
         model_id="qwen/qwen3.8-flash",
         supports_strict_schema=True,
+        providers=frozenset({"alibaba"}),
         note=(
             "~$0.25/month at one run per day; supports strict JSON-schema "
-            "structured outputs; no training opt-in required."
+            "structured outputs; no training opt-in required. Exactly one "
+            "OpenRouter endpoint as of 2026-09-01 (Alibaba - "
+            "openrouter.ai/api/v1/models/qwen/qwen3.8-flash/endpoints, "
+            "provider tag 'alibaba'), confirmed to support "
+            "require_parameters with response_format/structured_outputs. "
+            "Alibaba Cloud's own FAQ states it does not train on this data; "
+            "whether it retains raw API traffic (distinct from console "
+            "session history, which it does retain) was not confirmed - "
+            "worth an explicit ToS check if that distinction matters before "
+            "relying on it further."
         ),
     ),
 )

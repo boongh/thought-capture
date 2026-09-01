@@ -79,6 +79,8 @@ def a_provider(
     allowed_served_models: frozenset[str] | None = None,
     allow_fallbacks: bool = False,
     deny_data_collection: bool = True,
+    only_providers: frozenset[str] | None = None,
+    supports_strict_schema: bool = True,
 ) -> tuple[OpenRouterProvider, FakeCompletions]:
     completions = FakeCompletions(FakeCompletion(completion_payload(served_model=served_model)))
     client = FakeClient(completions)
@@ -86,11 +88,12 @@ def a_provider(
         api_key="synthetic-key",
         base_url="https://synthetic.example/v1",
         model_id=MODEL_ID,
-        supports_strict_schema=True,
+        supports_strict_schema=supports_strict_schema,
         client=client,  # type: ignore[arg-type]
         allowed_served_models=allowed_served_models,
         allow_fallbacks=allow_fallbacks,
         deny_data_collection=deny_data_collection,
+        only_providers=only_providers,
     )
     return provider, completions
 
@@ -150,6 +153,7 @@ async def test_the_conservative_defaults_deny_fallback_and_retention() -> None:
     assert sent_provider_routing(completions) == {
         "allow_fallbacks": False,
         "data_collection": "deny",
+        "require_parameters": True,
     }
 
 
@@ -178,3 +182,43 @@ async def test_declining_to_deny_data_collection_omits_the_key_rather_than_allow
     await provider.complete(a_request())
 
     assert "data_collection" not in sent_provider_routing(completions)
+
+
+async def test_strict_schema_calls_require_the_provider_to_honor_it() -> None:
+    """OpenRouter defaults `require_parameters` to false - a provider that can't
+    actually enforce the schema could otherwise be selected and silently ignore it."""
+    provider, completions = a_provider(served_model=MODEL_ID, supports_strict_schema=True)
+
+    await provider.complete(a_request())
+
+    assert sent_provider_routing(completions)["require_parameters"] is True
+
+
+async def test_non_strict_calls_do_not_require_parameters() -> None:
+    """There's no schema-enforcement promise to hold a provider to here."""
+    provider, completions = a_provider(served_model=MODEL_ID, supports_strict_schema=False)
+
+    await provider.complete(a_request())
+
+    assert "require_parameters" not in sent_provider_routing(completions)
+
+
+async def test_only_providers_restricts_the_initial_route_when_given() -> None:
+    """`allow_fallbacks: false` alone only blocks a *second* provider after the
+    first fails - `provider.only` is what constrains the first choice too."""
+    provider, completions = a_provider(
+        served_model=MODEL_ID, only_providers=frozenset({"reviewed-provider"})
+    )
+
+    await provider.complete(a_request())
+
+    assert sent_provider_routing(completions)["only"] == ["reviewed-provider"]
+
+
+async def test_no_provider_restriction_by_default() -> None:
+    """`only_providers=None` is a distinct, unrestricted state - not an implicit allowlist."""
+    provider, completions = a_provider(served_model=MODEL_ID)
+
+    await provider.complete(a_request())
+
+    assert "only" not in sent_provider_routing(completions)

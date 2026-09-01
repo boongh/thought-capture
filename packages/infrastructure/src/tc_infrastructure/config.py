@@ -152,6 +152,27 @@ class Settings(BaseSettings):
             return False
         return self.model_allow_fallback
 
+    def openrouter_only_providers(self, model_id: str) -> frozenset[str] | None:
+        """Provider endpoint(s) OpenRouter may route ``model_id`` to, or ``None`` for no restriction.
+
+        ``allow_fallbacks: false`` alone only blocks a *second* provider
+        after the first fails; it says nothing about which provider
+        OpenRouter picks first under its own default load-balancing. This is
+        what restricts that initial choice too, from
+        ``ReviewedModel.providers``.
+
+        Only meaningful in safe mode. `_safe_mode_restricts_to_reviewed_models`
+        already guarantees a non-empty ``model_organize``/``model_query_plan``
+        is a ``REVIEWED_MODELS`` key by the time this can be called with it,
+        so the lookup here cannot silently return ``None`` because the model
+        itself was never reviewed. Custom mode always returns ``None``: an
+        unreviewed model has no reviewed provider list to restrict to.
+        """
+        if self.model_selection_mode != "safe":
+            return None
+        reviewed = REVIEWED_MODELS.get(model_id)
+        return reviewed.providers if reviewed is not None else None
+
     @property
     def openrouter_deny_data_collection(self) -> bool:
         """Whether to tell OpenRouter to route only through non-retaining providers.

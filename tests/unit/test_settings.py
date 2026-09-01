@@ -167,3 +167,27 @@ def test_custom_mode_never_forces_data_collection_deny(monkeypatch: pytest.Monke
 def test_fallback_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """Matches OpenRouter's own default, so custom mode without this set behaves as documented."""
     assert build(monkeypatch).model_allow_fallback is True
+
+
+def test_safe_mode_restricts_a_reviewed_model_to_its_reviewed_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.openrouter_only_providers("qwen/qwen3.8-flash") == frozenset({"alibaba"})
+
+
+def test_safe_mode_has_no_restriction_for_a_model_not_looked_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a realistic call in practice - the validator already rejects an unreviewed
+    pin - but the lookup itself must not fabricate a restriction for a model it
+    doesn't recognize."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.openrouter_only_providers("an/unreviewed-model") is None
+
+
+def test_custom_mode_never_restricts_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even for a slug that happens to also be reviewed - custom mode's promise is
+    freedom from the allowlist entirely, not a silent partial application of it."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.openrouter_only_providers("qwen/qwen3.8-flash") is None
