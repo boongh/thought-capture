@@ -14,8 +14,10 @@ import argparse
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -24,11 +26,24 @@ from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from tc_infrastructure.config import get_settings
+from tc_api.app import create_app
+from tc_api.dependencies import ApiContext
+from tc_application.capture import CaptureThought
+from tc_domain.capture import UserId, WorkspaceId
+from tc_domain.policy import AttachmentPolicy
+from tc_infrastructure.config import Settings, get_settings
+from tc_infrastructure.db.document_reader import PostgresDocumentReader
+from tc_infrastructure.db.entity_reader import PostgresEntityReader
+from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.thought_reader import PostgresThoughtReader
+from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
 from tests.integration.support import CONNECT_ARGS
+from tests.unit.fakes import FakeAttachmentArchive
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_DATABASE_NAME = "thought_capture_test"
+
+API_TOKEN = "test-bearer-token-value"
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -251,3 +266,82 @@ async def admin_session_factory(
 def unique_message_id() -> str:
     """A source_message_id no other test will collide with."""
     return f"test-{uuid.uuid4()}"
+
+
+async def _api_client(
+    app_session_factory: async_sessionmaker[AsyncSession], identity: tuple[uuid.UUID, uuid.UUID]
+) -> AsyncIterator[httpx.AsyncClient]:
+    """The real app, wired to the test database with a known bearer token.
+
+    Shared by every ``/v1`` and ``/debug`` test file, since the lifespan
+    replacement and ``ApiContext`` construction is identical across all of
+    them - duplicating it per file would mean every new reader added to
+    ``ApiContext`` needs updating in every copy.
+
+    The lifespan is replaced so the test does not depend on a seeded Discord
+    identity or a live HTTP client; everything else is the production code path.
+    """
+    workspace_id, user_id = identity
+    settings = Settings(
+        _env_file=None, api_bearer_token=API_TOKEN, workspace_timezone="Asia/Bangkok"
+    )
+
+    context = ApiContext(
+        settings=settings,
+        capture=CaptureThought(
+            PostgresThoughtRepository(app_session_factory),
+            FakeAttachmentArchive(),
+            AttachmentPolicy(max_bytes=1024),
+        ),
+        reader=PostgresThoughtReader(app_session_factory),
+        documents=PostgresDocumentReader(app_session_factory),
+        entities=PostgresEntityReader(app_session_factory),
+        outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
+        session_factory=app_session_factory,
+        workspace_id=WorkspaceId(workspace_id),
+        user_id=UserId(user_id),
+    )
+
+    @asynccontextmanager
+    async def no_startup(_: object) -> AsyncIterator[None]:
+        """Skip the production lifespan; the context is injected above."""
+        yield
+
+    app = create_app(lifespan_handler=no_startup)
+    app.state.context = context
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest.fixture
+async def api(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> AsyncIterator[httpx.AsyncClient]:
+    """API client scoped to the shared, session-wide workspace.
+
+    Use this for read-only checks and writes that never set ``runs.window_start``
+    (e.g. plain entity resolution) - anything that does must use ``api_fresh``
+    instead, or it collides with ``test_organize_scheduler.py``'s cleanup of
+    windowed runs in this same shared workspace.
+    """
+    async for client in _api_client(app_session_factory, seeded_identity):
+        yield client
+
+
+@pytest.fixture
+async def api_fresh(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> AsyncIterator[httpx.AsyncClient]:
+    """API client scoped to a private, per-test workspace.
+
+    Required for any test that writes through ``PostgresOrganizeWriter`` /
+    ``PostgresRunLedger``, since those always set ``runs.window_start`` -
+    see ``fresh_identity``'s own docstring for why that collides with the
+    shared workspace.
+    """
+    async for client in _api_client(app_session_factory, fresh_identity):
+        yield client
