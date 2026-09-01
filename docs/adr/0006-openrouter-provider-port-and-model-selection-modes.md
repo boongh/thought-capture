@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -76,6 +76,34 @@ defines, not a gap the routing controls can close. The owner's decision:
 remove the entry rather than keep it as an accepted-risk exception. See
 "Provider-endpoint pinning" and the Decision/Consequences sections below for
 what the registry contains now.
+
+Follow-up research (2026-09-01) resolved the question the "Deferred" section
+below originally left open - what `provider.zdr` actually is and how it fails.
+OpenRouter's zero-data-retention control is not a single account-wide toggle:
+Settings > Privacy exposes it as per-model-group switches (Anthropic, OpenAI,
+Google, xAI, and a catch-all "non-frontier" group), and a newer, separate
+"guardrails" feature (announced 2026-05-29) lets an org admin layer stricter
+per-key ZDR settings on top of the account default - account, guardrail, and
+the per-request `zdr` parameter all combine with OR logic specifically for
+ZDR, meaning any one of them can only add the restriction, never lift one set
+by another (`openrouter.ai/docs/guides/features/zdr`,
+`openrouter.ai/docs/guides/features/guardrails`, checked 2026-09-01). More
+directly relevant to this ADR: `data_collection: "deny"` and `zdr: true` are
+independent checks - a provider can retain requests operationally without
+"training" on them, satisfy `data_collection: "deny"`, and still not appear on
+OpenRouter's actual ZDR endpoint list, exactly the gap the third review pass
+found in `qwen/qwen3.8-flash`'s Alibaba endpoint. `zdr: true` is a live,
+per-request check against that list rather than a claim recorded once at
+review time. On failure - no ZDR-compliant endpoint exists for the requested
+model - the request errors (`No endpoints found matching your data policy
+(Zero data retention)`) rather than silently falling through to a
+non-compliant provider; this is corroborated by consistent independent
+runtime reports across several unrelated OpenRouter client tools rather than
+one explicit sentence on OpenRouter's own ZDR docs page, so it is treated as
+strongly evidenced rather than primary-source-guaranteed. `zdr` enforcement
+also only applies to inference routing, not plugins/tools (e.g. web search),
+and BYOK keys are not exempt from it. This ADR adopts `zdr: true` on that
+basis - see "Zero-data-retention enforcement" under Decision.
 
 ## Decision
 
@@ -204,6 +232,24 @@ silently ignore it rather than failing loudly. `OpenRouterProvider` now sends
 that flag is this class's own promise that schema enforcement is load-bearing
 for the call; there is nothing to require for the non-strict, prompted path.
 
+**Zero-data-retention enforcement (`zdr`).** `data_collection: "deny"` filters
+providers by their *declared policy tag*; it is not the same thing as a
+*checked* zero-data-retention guarantee, and the Context section's third
+review pass found exactly that gap in `qwen/qwen3.8-flash`'s Alibaba
+endpoint. `OpenRouterProvider` gains a fourth flag, `require_zdr: bool = True`
+(fail-safe default, same rationale as `deny_data_collection`), sent as
+`provider.zdr: true` when set. This restricts routing to providers on
+OpenRouter's own maintained zero-data-retention endpoint list
+(`openrouter.ai/api/v1/endpoints/zdr`) - a live per-request check, unlike
+`ReviewedModel.providers`/`provider.only`, which only records what was true
+at review time. `require_zdr=False` omits the key rather than sending
+`zdr: false`: OpenRouter documents no such value, only the absence of the
+constraint, matching how `data_collection` is omitted rather than sent as
+`"allow"` when not denied. `Settings.openrouter_require_zdr` follows the same
+safe/custom split as the other two request-side flags: always `True` in safe
+mode, and `model_require_zdr` (default `false`) in custom mode - see "Request-
+side provider routing" above.
+
 ## Consequences
 
 **Positive.** The gap between "the design says review the model" and "the
@@ -244,7 +290,21 @@ after review (an endpoint is deprecated, or the provider's retention policy
 changes) and no one revisits the entry, `provider.only` simply makes every
 safe-mode request for that model fail rather than silently falling through to
 an unreviewed endpoint. That is the intended failure direction, but it does
-mean an accepted entry is not a permanent guarantee.
+mean an accepted entry is not a permanent guarantee. `provider.zdr: true`
+narrows this specifically for retention: it re-checks OpenRouter's actual
+zero-data-retention endpoint list on every request rather than trusting a
+point-in-time claim, so a provider that quietly drops off that list fails the
+request instead of silently keeping "private" status from a stale review.
+This does not extend to the other two admission bars - a provider's
+prompt-injection handling or `response_format` support can still drift
+unnoticed between reviews.
+
+**Positive.** Closes the Context section's follow-up-research gap and the
+"Deferred" item below it: `provider.zdr: true` is now sent on every request in
+safe mode (and optionally in custom mode, via `model_require_zdr`), giving the
+**private** admission bar a live, per-request check against OpenRouter's own
+zero-data-retention endpoint list, rather than relying solely on the
+registry's point-in-time claim.
 
 **Negative.** With the registry empty, safe mode - the default - has no
 provider-backed model to organize or answer queries with; both run on the
@@ -260,20 +320,22 @@ mean something more than "someone typed a slug into `.env`".
 **Deferred.** Nothing in this ADR yet wires `OpenRouterProvider` into a
 composition root - no `apps/*` process constructs one today. When that
 composition lands, it should read `model_selection_mode`, `REVIEWED_MODELS`,
-`openrouter_allow_fallbacks`, `openrouter_deny_data_collection`, and
-`openrouter_only_providers(model_id)` from the same `Settings` object this
-ADR extends, so the startup allowlist, the request-side routing flags, and
-the post-call served-model guard all stay backed by one source of truth
-rather than drifting apart.
+`openrouter_allow_fallbacks`, `openrouter_deny_data_collection`,
+`openrouter_require_zdr`, and `openrouter_only_providers(model_id)` from the
+same `Settings` object this ADR extends, so the startup allowlist, the
+request-side routing flags, and the post-call served-model guard all stay
+backed by one source of truth rather than drifting apart.
 
 **Deferred.** Finding a model that is confirmed to meet all three admission
-bars - safe, private (ideally via a confirmed OpenRouter zero-data-retention
-endpoint, `provider.zdr`, not just a "deny" data-collection tag - see
-Context) - and JSON-structure enforceable, so safe mode has a working
-provider-backed path again. `provider.zdr` itself is not yet sent by
-`OpenRouterProvider` at all; adopting it, and confirming its actual
-undocumented failure behavior when no eligible endpoint exists, is separate
-follow-up work, not assumed safe by this ADR.
+bars - safe, private (now via a confirmed OpenRouter zero-data-retention
+endpoint, `provider.zdr`, which every safe-mode request now sends and
+enforces - see "Zero-data-retention enforcement" under Decision - not just a
+"deny" data-collection tag), and JSON-structure enforceable - so safe mode has
+a working provider-backed path again. Adopting `zdr: true` narrows this search
+(a candidate's endpoint must appear on `openrouter.ai/api/v1/endpoints/zdr`,
+checkable before spending review effort on the other two bars) but does not
+by itself produce a reviewed entry; the registry remains empty until one is
+found and added.
 
 ## Verification
 
@@ -285,7 +347,9 @@ mode regardless (it selects the offline adapter, not a provider);
 `openrouter_allow_fallbacks` is `False` in safe mode even when
 `model_allow_fallback=true`, and follows the flag in custom mode; and
 `openrouter_deny_data_collection` is `True` in safe mode and `False` in
-custom mode unconditionally.
+custom mode unconditionally; `openrouter_require_zdr` is `True` in safe mode
+even when `TC_MODEL_REQUIRE_ZDR=false`, and follows `model_require_zdr` in
+custom mode, which defaults to `False`.
 
 `tests/unit/test_settings.py` additionally asserts `openrouter_only_providers`
 returns `ReviewedModel.providers` for a reviewed slug in safe mode, `None` for
@@ -295,15 +359,16 @@ slug that is also reviewed.
 `tests/unit/test_openrouter_provider.py` asserts the `provider` object
 actually sent (via `extra_body`, since `AsyncCompletions.create` has no typed
 `provider` parameter): the conservative defaults produce
-`{"allow_fallbacks": false, "data_collection": "deny", "require_parameters":
-true}` (the last because the test provider defaults to strict-schema);
-allowing fallback without denying data collection sends `allow_fallbacks:
-true` with no `data_collection` key at all, rather than an explicit
-`"allow"`; `require_parameters` is present for a strict-schema call and
-absent for a non-strict one; `only_providers` produces `provider.only` when
-given and is absent by default; the journaled `request_params["provider_routing"]`
-matches the object actually sent; and the separate served-model guard this
-ADR does not change is still covered.
+`{"allow_fallbacks": false, "data_collection": "deny", "zdr": true,
+"require_parameters": true}` (the last because the test provider defaults to
+strict-schema); allowing fallback without denying data collection sends
+`allow_fallbacks: true` with no `data_collection` key at all, rather than an
+explicit `"allow"`; `require_parameters` is present for a strict-schema call
+and absent for a non-strict one; `only_providers` produces `provider.only`
+when given and is absent by default; `zdr` is present (`true`) by default and
+absent - not sent as `false` - when `require_zdr=False`; the journaled
+`request_params["provider_routing"]` matches the object actually sent; and
+the separate served-model guard this ADR does not change is still covered.
 
 `tests/unit/test_reviewed_models.py` asserts every registry entry records at
 least one provider, that the registry is currently empty (documenting why,

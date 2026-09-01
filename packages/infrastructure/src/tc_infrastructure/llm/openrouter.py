@@ -53,6 +53,7 @@ class OpenRouterProvider:
         allow_fallbacks: bool = False,
         deny_data_collection: bool = True,
         only_providers: frozenset[str] | None = None,
+        require_zdr: bool = True,
     ) -> None:
         if not model_id:
             raise ValueError("a pinned model slug is required; refusing a floating default")
@@ -85,6 +86,17 @@ class OpenRouterProvider:
         # provider(s) actually recorded against the reviewed model, once
         # `ReviewedModel` carries that data.
         self._only_providers = only_providers
+        # `data_collection: "deny"` filters providers by their declared
+        # policy tag; `zdr: true` is a stricter, independent OpenRouter
+        # request-routing constraint that restricts to providers on
+        # OpenRouter's own verified zero-data-retention endpoint list
+        # (https://openrouter.ai/docs/guides/features/zdr) - the two are not
+        # equivalent, since a provider can retain requests operationally
+        # (abuse monitoring, say) without "training" on them, pass
+        # `data_collection: "deny"`, and still not be ZDR-listed
+        # (docs/adr/0006). Defaults to `True`, same fail-safe rationale as
+        # `deny_data_collection`.
+        self._require_zdr = require_zdr
         self._client = client or AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -139,6 +151,15 @@ class OpenRouterProvider:
         provider_routing: dict[str, Any] = {"allow_fallbacks": self._allow_fallbacks}
         if self._deny_data_collection:
             provider_routing["data_collection"] = "deny"
+        if self._require_zdr:
+            # Restricts routing to OpenRouter's confirmed zero-data-retention
+            # endpoints specifically - a live, per-request check, unlike
+            # `ReviewedModel.providers`/`only`, which is a claim recorded at
+            # review time. Omitted rather than sent as `false` when not
+            # required, matching `data_collection`'s omit-to-inherit
+            # behavior: OpenRouter has no documented "zdr: false", only the
+            # absence of the constraint.
+            provider_routing["zdr"] = True
         if self._strict:
             # OpenRouter defaults `require_parameters` to false, meaning a
             # provider that does not actually support every parameter we send

@@ -201,6 +201,27 @@ def test_fallback_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
     assert build(monkeypatch).model_allow_fallback is True
 
 
+def test_safe_mode_always_requires_zdr_even_if_the_flag_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/adr/0006: zdr is a stricter, independent check from data_collection - safe
+    mode requires both, unconditionally."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_REQUIRE_ZDR="false")
+    assert settings.openrouter_require_zdr is True
+
+
+def test_custom_mode_follows_the_zdr_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    require = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_REQUIRE_ZDR="true")
+    decline = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_REQUIRE_ZDR="false")
+    assert require.openrouter_require_zdr is True
+    assert decline.openrouter_require_zdr is False
+
+
+def test_zdr_requirement_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Matches OpenRouter's own default (no additional request-level restriction)."""
+    assert build(monkeypatch).model_require_zdr is False
+
+
 def test_safe_mode_restricts_a_reviewed_model_to_its_reviewed_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

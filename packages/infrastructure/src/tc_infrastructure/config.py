@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # Only consulted in custom mode - safe mode never allows provider
     # fallback, regardless of this value. See openrouter_allow_fallbacks.
     model_allow_fallback: bool = True
+    # Only consulted in custom mode - safe mode always restricts routing to
+    # OpenRouter's zero-data-retention endpoints, regardless of this value.
+    # Defaults to False, matching OpenRouter's own default (no additional
+    # request-level restriction). See openrouter_require_zdr.
+    model_require_zdr: bool = False
     monthly_budget_usd: float = Field(default=5.0, ge=0)
 
     # -- Attachments -------------------------------------------------------
@@ -185,6 +190,23 @@ class Settings(BaseSettings):
         free, training-opted-in tier the host has deliberately chosen.
         """
         return self.model_selection_mode == "safe"
+
+    @property
+    def openrouter_require_zdr(self) -> bool:
+        """Whether to restrict routing to OpenRouter's zero-data-retention endpoints.
+
+        `data_collection: "deny"` filters providers by their declared policy
+        tag; `zdr` is a stricter, independent constraint against OpenRouter's
+        own verified zero-data-retention endpoint list - a provider can
+        retain requests operationally without "training" on them, pass
+        `data_collection: "deny"`, and still not be ZDR-listed (docs/adr/0006).
+        Safe mode always requires it, unconditionally, same rationale as
+        `openrouter_deny_data_collection`. Custom mode follows
+        `model_require_zdr`, defaulting to OpenRouter's own default (unset).
+        """
+        if self.model_selection_mode == "safe":
+            return True
+        return self.model_require_zdr
 
     @property
     def timezone(self) -> ZoneInfo:

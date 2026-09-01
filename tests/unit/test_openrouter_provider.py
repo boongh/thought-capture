@@ -81,6 +81,7 @@ def a_provider(
     deny_data_collection: bool = True,
     only_providers: frozenset[str] | None = None,
     supports_strict_schema: bool = True,
+    require_zdr: bool = True,
 ) -> tuple[OpenRouterProvider, FakeCompletions]:
     completions = FakeCompletions(FakeCompletion(completion_payload(served_model=served_model)))
     client = FakeClient(completions)
@@ -94,6 +95,7 @@ def a_provider(
         allow_fallbacks=allow_fallbacks,
         deny_data_collection=deny_data_collection,
         only_providers=only_providers,
+        require_zdr=require_zdr,
     )
     return provider, completions
 
@@ -153,6 +155,7 @@ async def test_the_conservative_defaults_deny_fallback_and_retention() -> None:
     assert sent_provider_routing(completions) == {
         "allow_fallbacks": False,
         "data_collection": "deny",
+        "zdr": True,
         "require_parameters": True,
     }
 
@@ -182,6 +185,25 @@ async def test_declining_to_deny_data_collection_omits_the_key_rather_than_allow
     await provider.complete(a_request())
 
     assert "data_collection" not in sent_provider_routing(completions)
+
+
+async def test_zdr_is_required_by_default() -> None:
+    """Constructing this class directly must fail safe, same as fallback/retention."""
+    provider, completions = a_provider(served_model=MODEL_ID)
+
+    await provider.complete(a_request())
+
+    assert sent_provider_routing(completions)["zdr"] is True
+
+
+async def test_declining_to_require_zdr_omits_the_key_rather_than_sending_false() -> None:
+    """OpenRouter has no documented `zdr: false` - only the absence of the constraint,
+    same as `data_collection`'s omit-to-inherit-account-default behavior."""
+    provider, completions = a_provider(served_model=MODEL_ID, require_zdr=False)
+
+    await provider.complete(a_request())
+
+    assert "zdr" not in sent_provider_routing(completions)
 
 
 async def test_strict_schema_calls_require_the_provider_to_honor_it() -> None:
