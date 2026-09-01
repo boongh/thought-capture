@@ -1,0 +1,167 @@
+"""Deterministic offline provider.
+
+Selected whenever no model slug is pinned, so an unconfigured deployment runs
+the whole pipeline without silently calling a provider - and so the test suite
+never depends on a network, a key, or a free-tier rate limit.
+
+It has two modes, and the distinction is the point:
+
+- **Replay** - return the exact response a previous run recorded for the same
+  request. This is what makes ``rebuild --from-journal`` deterministic
+  (ADR-0008).
+- **Canned** - return a scripted response for a request never seen before.
+  Used by tests to drive specific behaviour.
+
+It is not a mock of a model. It never invents content, so a pipeline run
+against it proves orchestration, validation, persistence, and provenance -
+never generation quality.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from collections.abc import Callable
+
+from tc_domain.llm import LLMError, LLMRequest, LLMResponse
+
+logger = logging.getLogger(__name__)
+
+OFFLINE_MODEL_ID = "offline/deterministic"
+
+Responder = Callable[[LLMRequest], str]
+
+
+def request_fingerprint(request: LLMRequest) -> str:
+    """A stable key for one request.
+
+    Covers everything that could change the reply: the rendered messages, the
+    schema, and both versions. Two runs that fingerprint the same are asking
+    the same question, so replaying the recorded answer is honest.
+    """
+    material = json.dumps(
+        {
+            "step": str(request.step),
+            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+            "schema_name": request.schema_name,
+            "json_schema": request.json_schema,
+            "prompt_version": request.prompt_version,
+            "schema_version": request.schema_version,
+            "temperature": request.temperature,
+            # An output cap changes what comes back - a truncated reply is a
+            # different answer - so two requests differing only in their cap
+            # must not share a recorded response.
+            "max_output_tokens": request.max_output_tokens,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class OfflineLLMProvider:
+    """Serves recorded or scripted responses. Never reaches the network."""
+
+    def __init__(
+        self,
+        *,
+        recorded: dict[str, list[str]] | dict[str, str] | None = None,
+        responder: Responder | None = None,
+        model_id: str = OFFLINE_MODEL_ID,
+    ) -> None:
+        # Each fingerprint maps to the *sequence* of replies recorded for it.
+        # A run that asked the same question twice and got two different
+        # answers must replay both, in order, or it is not a reproduction.
+        self._recorded: dict[str, list[str]] = {}
+        for fingerprint, value in (recorded or {}).items():
+            self._recorded[fingerprint] = [value] if isinstance(value, str) else list(value)
+        self._consumed: dict[str, int] = {}
+        self._responder = responder
+        self._model_id = model_id
+        self.calls: list[LLMRequest] = []
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def supports_strict_schema(self) -> bool:
+        """False, deliberately.
+
+        The offline provider models the *weaker* contract, so a pipeline proven
+        against it also works against a provider with no server-side schema
+        enforcement. Claiming strict support here would let a validation bug
+        hide until it reached a real model.
+        """
+        return False
+
+    def record(self, request: LLMRequest, content: str) -> None:
+        """Append a reply for this request, preserving earlier ones."""
+        self._recorded.setdefault(request_fingerprint(request), []).append(content)
+
+    async def complete(self, request: LLMRequest) -> LLMResponse:
+        self.calls.append(request)
+        fingerprint = request_fingerprint(request)
+
+        content: str | None = None
+        source = "replay"
+        replies = self._recorded.get(fingerprint)
+        if replies:
+            # Consume in order. Asking more times than the original run did is
+            # not a case to paper over: a pipeline that drifted between the
+            # recorded run and this one must not silently receive an answer
+            # that was never actually produced for this call. Exhaustion fails
+            # the same way an unrecorded request does, further down.
+            index = self._consumed.get(fingerprint, 0)
+            if index < len(replies):
+                content = replies[index]
+                self._consumed[fingerprint] = index + 1
+            else:
+                raise LLMError(
+                    f"replay for {request.schema_name} asked fingerprint {fingerprint[:12]} "
+                    f"a {index + 1}th time, but only {len(replies)} occurrence(s) were recorded; "
+                    "the offline provider never fabricates a reply for a call that did not happen"
+                )
+
+        if content is None and self._responder is not None:
+            content = self._responder(request)
+            source = "scripted"
+
+        if content is None:
+            raise LLMError(
+                f"no recorded response for {request.schema_name} "
+                f"(fingerprint {fingerprint[:12]}); the offline provider never invents output"
+            )
+
+        logger.info(
+            "llm.offline",
+            extra={"step": str(request.step), "source": source, "fingerprint": fingerprint[:12]},
+        )
+
+        return LLMResponse(
+            content=content,
+            # `content` is stored flat as well as returned, so a journalled
+            # offline response can be replayed by the same reader that handles
+            # an OpenAI-compatible completion.
+            raw={
+                "offline": True,
+                "source": source,
+                "fingerprint": fingerprint,
+                "content": content,
+            },
+            latency_ms=0,
+            model_requested=self._model_id,
+            model_served=self._model_id,
+            provider="offline",
+            generation_id=f"offline-{fingerprint[:16]}",
+            input_tokens=_estimate_tokens(request),
+            output_tokens=max(1, len(content) // 4),
+            cost_usd=None,
+            request_params={"temperature": request.temperature},
+        )
+
+
+def _estimate_tokens(request: LLMRequest) -> int:
+    """Rough, and labelled as such: used only to keep budget plumbing exercised."""
+    return max(1, sum(len(m.content) for m in request.messages) // 4)

@@ -2,14 +2,48 @@
 #
 # Only loopback ports are published. Nothing here is reachable off-host.
 #
-#   docker compose --profile core up -d
+#   docker compose --env-file .env -f deploy/compose/docker-compose.yml \
+#     --profile core up -d --build
+#
+# `--env-file .env` is required: Compose resolves a bare `.env` relative to this
+# file, not the repository root.
 #
 # Profiles:
-#   core          postgres, and later api/bot/worker
+#   core          postgres, migrate, discord-bot (api and worker follow)
 #   ai            Khoj and its own database (Phase 2, not yet defined)
 #   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
 
 name: thought-capture
+
+# ---------------------------------------------------------------------------
+# Shared service definitions
+# ---------------------------------------------------------------------------
+
+x-service-image: &service-image
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: thought-capture:local
+  security_opt:
+    - no-new-privileges:true
+
+x-service-env: &service-env
+  # Inside the network the database is reachable as `postgres`, not as
+  # 127.0.0.1 - which from within a container means the container itself. The
+  # value in .env is for host tools such as pytest and psql, so it is
+  # deliberately overridden here rather than duplicated there.
+  TC_DATABASE_URL: >-
+    postgresql+psycopg://tc_app:${TC_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-thought_capture}
+  TC_APP_DB_PASSWORD: ${TC_APP_DB_PASSWORD}
+  TC_WORKSPACE_NAME: ${TC_WORKSPACE_NAME:-personal}
+  TC_WORKSPACE_TIMEZONE: ${TC_WORKSPACE_TIMEZONE:-Asia/Bangkok}
+  TC_DIGEST_LOCAL_TIME: ${TC_DIGEST_LOCAL_TIME:-20:00}
+  TC_DISCORD_BOT_TOKEN: ${TC_DISCORD_BOT_TOKEN}
+  TC_DISCORD_OWNER_USER_ID: ${TC_DISCORD_OWNER_USER_ID}
+  TC_DISCORD_GUILD_ID: ${TC_DISCORD_GUILD_ID:-}
+  TC_DISCORD_CHANNEL_ID: ${TC_DISCORD_CHANNEL_ID:-}
+  TC_ATTACHMENT_ROOT: /data/attachments
+  TC_ATTACHMENT_MAX_BYTES: ${TC_ATTACHMENT_MAX_BYTES:-26214400}
 
 services:
   postgres:
@@ -51,6 +85,75 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # One-shot: brings the schema to head and seeds the workspace, both
+  # idempotent. Runs with the migration role, before any service starts
+  # (docs/DESIGN.md 13). Services wait for it to exit successfully.
+  migrate:
+    <<: *service-image
+    profiles: ["core"]
+    command: ["python", "-m", "tc_worker.bootstrap"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *service-env
+      # The migration role owns the schema; the bot never gets this URL.
+      TC_MIGRATION_DATABASE_URL: >-
+        postgresql+psycopg://${POSTGRES_USER:-tc_migrator}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thought_capture}
+
+  api:
+    <<: *service-image
+    profiles: ["core"]
+    command: ["python", "-m", "tc_api"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *service-env
+      # Binds to all interfaces *inside* the container; the port below is
+      # published only on host loopback, so it is still not reachable off-host
+      # (docs/DESIGN.md 12.2).
+      TC_API_HOST: "0.0.0.0"
+      TC_API_PORT: "8080"
+      # Deliberately not `:?`. Compose interpolates every service in the file
+      # before starting any of them, so a required variable here would stop
+      # `up postgres` from working when only the API is unconfigured. The API
+      # entrypoint refuses to start without a token instead, which fails the
+      # service that actually needs it rather than the whole stack.
+      TC_API_BEARER_TOKEN: ${TC_API_BEARER_TOKEN:-}
+    ports:
+      - "127.0.0.1:${TC_API_PORT:-8080}:8080"
+    volumes:
+      - attachments:/data/attachments
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/live').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  discord-bot:
+    <<: *service-image
+    profiles: ["core"]
+    command: ["python", "-m", "tc_discord_bot"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *service-env
+    volumes:
+      - attachments:/data/attachments
+
 volumes:
   postgres-data:
+    driver: local
+  attachments:
     driver: local

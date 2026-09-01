@@ -80,9 +80,11 @@ known-first-party = [
 # Domain errors are named for the rule they describe ("CaptureRejected"), which
 # reads better at the call site than an Error suffix would.
 "packages/domain/src/tc_domain/errors.py" = ["N818"]
+"packages/domain/src/tc_domain/llm.py" = ["N818"]
 # Hypothesis requires *naive* datetimes as the bounds of `st.datetimes` when a
 # `timezones` strategy is supplied; DTZ001 cannot tell the two uses apart.
 "tests/unit/test_local_calendar_fields.py" = ["DTZ001"]
+"tests/unit/test_capture_windows.py" = ["DTZ001"]
 
 # ---------------------------------------------------------------------------
 # Types
@@ -116,6 +118,13 @@ files = [
 module = ["tc_infrastructure.*", "tc_api.*", "tc_discord_bot.*", "tc_worker.*"]
 disallow_untyped_calls = false
 disallow_subclassing_any = false
+
+# APScheduler 3.x ships neither inline types nor a py.typed marker, and there is
+# no maintained stub package. Scoped to the library itself so first-party code
+# stays strictly checked.
+[[tool.mypy.overrides]]
+module = ["apscheduler.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # Tests

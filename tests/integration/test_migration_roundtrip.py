@@ -19,6 +19,7 @@ from alembic.config import Config
 from sqlalchemy.engine import URL, make_url
 
 from tc_infrastructure.config import get_settings
+from tests.integration.support import CONNECT_ARGS
 
 pytestmark = pytest.mark.integration
 
@@ -49,7 +50,7 @@ def roundtrip_url() -> Iterator[URL]:
     maintenance = base.set(database="postgres")
     target = base.set(database=ROUNDTRIP_DATABASE_NAME)
 
-    admin = sa.create_engine(maintenance, isolation_level="AUTOCOMMIT")
+    admin = sa.create_engine(maintenance, isolation_level="AUTOCOMMIT", connect_args=CONNECT_ARGS)
     drop = sa.text(f'DROP DATABASE IF EXISTS "{ROUNDTRIP_DATABASE_NAME}" WITH (FORCE)')
     # A connection failure propagates as an error rather than a skip: an
     # unreachable database is a failed verification, not an absent one.
@@ -66,7 +67,7 @@ def roundtrip_url() -> Iterator[URL]:
 
 
 def _public_tables(url: URL) -> set[str]:
-    engine = sa.create_engine(url)
+    engine = sa.create_engine(url, connect_args=CONNECT_ARGS)
     try:
         with engine.connect() as connection:
             rows = connection.execute(

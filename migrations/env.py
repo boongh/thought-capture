@@ -17,8 +17,13 @@ from tc_infrastructure.config import get_settings
 
 config = context.config
 
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# When Alembic is driven from the command line it owns logging. When it is
+# embedded - the bootstrap step, the test harness - the caller has already
+# configured logging, and letting alembic.ini reset the root logger to WARNING
+# would silence the caller's own progress output. Callers opt out by setting
+# `configure_logger` on the config's attributes.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Migrations are hand-written against the DDL in docs/DESIGN.md 6, which uses
 # generated columns, triggers, and role grants that autogenerate does not model

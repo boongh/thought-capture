@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections.abc import Iterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,11 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import URL, Engine, make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from tc_infrastructure.config import get_settings
+from tests.integration.support import CONNECT_ARGS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_DATABASE_NAME = "thought_capture_test"
@@ -72,7 +76,7 @@ def test_database_url() -> Iterator[URL]:
     target = base.set(database=TEST_DATABASE_NAME)
 
     # AUTOCOMMIT: CREATE/DROP DATABASE cannot run inside a transaction block.
-    admin = sa.create_engine(maintenance, isolation_level="AUTOCOMMIT")
+    admin = sa.create_engine(maintenance, isolation_level="AUTOCOMMIT", connect_args=CONNECT_ARGS)
     with admin.connect() as connection:
         _drop_database(connection)
         connection.execute(sa.text(f'CREATE DATABASE "{TEST_DATABASE_NAME}"'))
@@ -119,7 +123,7 @@ def migrated_database(test_database_url: URL) -> URL:
 @pytest.fixture(scope="session")
 def engine(migrated_database: URL) -> Iterator[Engine]:
     """Session-scoped engine connected as the schema-owning migration role."""
-    created = sa.create_engine(migrated_database)
+    created = sa.create_engine(migrated_database, connect_args=CONNECT_ARGS)
     try:
         yield created
     finally:
@@ -135,3 +139,77 @@ def connection(engine: Engine) -> Iterator[sa.Connection]:
             yield conn
         finally:
             transaction.rollback()
+
+
+@pytest.fixture
+async def app_session_factory(
+    app_database_url: URL,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Async session factory connected as the least-privilege application role.
+
+    The repository commits its own transactions, so tests using this cannot rely
+    on rollback isolation; they use unique source_message_id values instead and
+    clean up nothing, because the log is append-only by design.
+    """
+    async_url = app_database_url.set(drivername="postgresql+psycopg")
+    engine = create_async_engine(async_url, poolclass=NullPool, connect_args=CONNECT_ARGS)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def seeded_identity(engine: Engine) -> tuple[uuid.UUID, uuid.UUID]:
+    """A committed workspace and owner, created with the migration role.
+
+    Committed rather than rolled back, because the application role connects on
+    a different connection and must be able to see it. Since migration 0003 the
+    application role may only read these tables.
+    """
+    workspace_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("INSERT INTO users (id, display_name) VALUES (:id, :name)"),
+            {"id": user_id, "name": "synthetic owner"},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO workspaces (id, name, mode, timezone)"
+                " VALUES (:id, :name, 'personal', 'Asia/Bangkok')"
+            ),
+            {"id": workspace_id, "name": "synthetic workspace"},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO workspace_memberships (workspace_id, user_id, role)"
+                " VALUES (:workspace_id, :user_id, 'owner')"
+            ),
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+    return workspace_id, user_id
+
+
+@pytest.fixture
+async def admin_session_factory(
+    migrated_database: URL,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Async session factory as the schema-owning migration role.
+
+    Bootstrap work - seeding the owner, workspace, and membership - runs with
+    this role, not the application role. Creating identities is administrative
+    (migration 0003).
+    """
+    async_url = migrated_database.set(drivername="postgresql+psycopg")
+    engine = create_async_engine(async_url, poolclass=NullPool, connect_args=CONNECT_ARGS)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+def unique_message_id() -> str:
+    """A source_message_id no other test will collide with."""
+    return f"test-{uuid.uuid4()}"
