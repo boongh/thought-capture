@@ -135,6 +135,32 @@ async def test_claiming_increments_attempts(
     assert claimed[0].attempts == 1
 
 
+async def test_claim_restricted_to_event_types_ignores_other_types(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """A digest consumer must never lease a thought.captured acknowledgement."""
+    workspace_id, _ = seeded_identity
+    captured_id = await enqueue(
+        app_session_factory,
+        workspace_id,
+        aggregate_id=f"agg-{uuid.uuid4()}",
+        event_type="thought.captured",
+    )
+    digest_id = await enqueue(
+        app_session_factory,
+        workspace_id,
+        aggregate_id=f"agg-{uuid.uuid4()}",
+        event_type="digest.ready",
+    )
+
+    outbox = PostgresOutbox(app_session_factory, lease_owner="test")
+    claimed = {event.id for event in await outbox.claim(limit=50, event_types=("digest.ready",))}
+
+    assert digest_id in claimed
+    assert captured_id not in claimed
+
+
 async def test_an_exhausted_event_is_no_longer_claimed(
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],

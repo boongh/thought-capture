@@ -15,9 +15,14 @@ import sys
 import httpx
 
 from tc_application.capture import CaptureThought
+from tc_application.digest_delivery import DeliverDigests
 from tc_discord_bot.client import CaptureClient
+from tc_discord_bot.digest_loop import DigestDeliveryLoop
+from tc_discord_bot.digest_sender import DiscordDigestSender
 from tc_domain.policy import AttachmentPolicy, CaptureAllowlist
 from tc_infrastructure.config import Settings, get_settings
+from tc_infrastructure.db.digest_outbox import PostgresDigestOutbox
+from tc_infrastructure.db.digest_reader import PostgresDigestReader
 from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.identity import resolve_identity
 from tc_infrastructure.db.outbox import PostgresOutbox
@@ -86,6 +91,18 @@ async def serve(settings: Settings) -> None:
             user_id=identity.user_id,
             workspace_timezone=settings.workspace_timezone,
         )
+
+        assert settings.discord_owner_user_id is not None  # enforced by build_allowlist above
+        deliver_digests = DeliverDigests(
+            outbox=PostgresDigestOutbox(sessions, lease_owner="discord-bot"),
+            source=PostgresDigestReader(sessions),
+            sender=DiscordDigestSender(
+                client,
+                channel_id=settings.discord_channel_id,
+                owner_user_id=settings.discord_owner_user_id,
+            ),
+        )
+        client.attach_digest_loop(DigestDeliveryLoop(deliver_digests))
 
         # discord.py installs its own logging; keep it at INFO so a Gateway
         # disconnect is visible without dumping message content.

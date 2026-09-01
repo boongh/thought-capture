@@ -22,7 +22,9 @@ from tc_domain.capture import (
     WorkspaceId,
 )
 from tc_domain.context import Tier1Row
-from tc_domain.errors import AttachmentArchiveFailed
+from tc_domain.digest import DigestContent
+from tc_domain.digest_ports import PendingDigest
+from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, WindowThought
 
 
@@ -185,3 +187,54 @@ class FakeRunLedger:
         self.failed.append(
             {"run_id": run_id, "error_code": error_code, "error_detail": error_detail}
         )
+
+
+class FakeDigestOutbox:
+    """Records claims and settlements rather than touching a real outbox."""
+
+    def __init__(self, pending: list[PendingDigest] | None = None) -> None:
+        self._pending = pending or []
+        self.delivered: list[uuid.UUID] = []
+        self.failed: list[dict[str, object]] = []
+
+    async def claim(self, limit: int) -> tuple[PendingDigest, ...]:
+        claimed = tuple(self._pending[:limit])
+        self._pending = self._pending[limit:]
+        return claimed
+
+    async def mark_delivered(self, event_id: uuid.UUID) -> None:
+        self.delivered.append(event_id)
+
+    async def mark_failed(self, event_id: uuid.UUID, *, attempts: int, error: str) -> None:
+        self.failed.append({"event_id": event_id, "attempts": attempts, "error": error})
+
+
+class FakeDigestSource:
+    """Returns a fixed body for any document/revision, unless told to fail."""
+
+    def __init__(
+        self, content: DigestContent | None = None, *, missing: set[uuid.UUID] | None = None
+    ) -> None:
+        self.content = content
+        self.missing = missing or set()
+
+    async def get(self, document_id: uuid.UUID, revision_id: uuid.UUID) -> DigestContent:
+        if revision_id in self.missing:
+            raise DigestNotFound(f"no such revision: {revision_id}")
+        assert self.content is not None
+        return self.content
+
+
+class FakeDigestSender:
+    """Records every send; can be told to fail or raise on demand."""
+
+    def __init__(self, *, succeed: bool = True, raises: Exception | None = None) -> None:
+        self.succeed = succeed
+        self.raises = raises
+        self.sent: list[tuple[str, ...]] = []
+
+    async def send(self, chunks: tuple[str, ...]) -> bool:
+        if self.raises is not None:
+            raise self.raises
+        self.sent.append(chunks)
+        return self.succeed
