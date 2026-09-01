@@ -140,37 +140,44 @@ class FilesystemBlobStore:
         in this store's lifetime it is one boolean check and a return - see
         ``self._root_confirmed_durable``.
 
-        This deliberately does **not** use ``self._root.exists()`` as the
-        "already done" signal, even though that would make the common case
-        just as cheap. A prior call in this same process, or in a process that
-        crashed before this one, can have already run ``mkdir`` successfully
-        and then had the following fsync raise or never run (process killed,
-        power loss). The directory is then present on disk but its entry in
-        *its* parent was never confirmed durable - exactly the bug already
-        fixed for the fan-out levels one layer down, in
-        ``_fsync_fanout_directories``. Checking ``exists()`` here would let
-        that unconfirmed state look identical to a confirmed one and be
-        silently accepted as success on the very next write, in the same
-        process or a fresh one after a restart. A boolean set only once the
-        full fsync chain has actually completed without raising cannot be
-        fooled that way: if it is ever left ``False``, the next ``put`` call
-        redoes the whole check rather than trusting what's on disk.
+        Every level from ``root`` up to ``anchor`` is fsynced *unconditionally*
+        - never stopped early at the first ancestor that merely ``.exists()``.
+        An earlier version did stop there, which is exactly what let a crash
+        slip through: a prior attempt (in this process, or one that crashed
+        before this one) can have already run ``mkdir`` for *several* levels
+        and then had the fsync loop fail partway up - say, the innermost level
+        got confirmed but a level above it did not. The directories are then
+        all present on disk, but nothing distinguishes "present because a
+        confirmed prior run put it there" from "present because an
+        unconfirmed one did." A fresh instance probing with ``.exists()``
+        cannot tell those apart, so it must not use existence to decide where
+        confirmation can stop - only genuine independence from anything this
+        store could have created does that, which is exactly what ``anchor``
+        is: the current working directory for a relative root (already
+        durable by construction - the process is running from it), or the
+        drive/filesystem root for an absolute one. Nothing above ``anchor`` is
+        this store's responsibility.
 
-        ``mkdir(parents=True)`` can create more than one level in one call (a
-        root nested under a parent that also doesn't exist yet), so every
-        level actually created is walked and synced, not just the leaf.
+        This costs more than stopping early would on a fresh instance's first
+        write - for a relative root, bounded by how many levels the
+        configured path actually has below the working directory; for an
+        absolute root, potentially every real ancestor down to the drive
+        root. It happens at most once per store instance, not per write, and
+        only reads directory entries to fsync them - it never writes into an
+        ancestor it doesn't own.
         """
         if self._root_confirmed_durable:
             return
         root = self._root
-        existing_ancestor = root.parent
-        while not existing_ancestor.exists():
-            existing_ancestor = existing_ancestor.parent
+        anchor = Path(root.anchor) if root.is_absolute() else Path()
         root.mkdir(parents=True, exist_ok=True)
         directory = root
-        while directory != existing_ancestor:
-            _fsync_directory(directory.parent)
-            directory = directory.parent
+        while directory != anchor:
+            parent = directory.parent
+            if parent == directory:
+                break  # reached the filesystem root; nothing further to sync
+            _fsync_directory(parent)
+            directory = parent
         self._root_confirmed_durable = True
 
 

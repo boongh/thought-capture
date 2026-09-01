@@ -133,21 +133,29 @@ async def test_every_fanout_directory_level_is_synced(
     leaf's entry are durable, but not that the leaf's parent's entry is
     durable *inside root* - so root must be synced too, not just the two
     fan-out levels below it.
+
+    Uses a relative root (via ``monkeypatch.chdir``) specifically so the
+    exact-equality assertion below stays bounded at the working directory -
+    an absolute root's root-confirmation walk is bounded at the drive root
+    instead (see ``_ensure_durable_root``), which for a real filesystem path
+    like ``tmp_path`` would make an exact list fragile and environment-sized.
     """
+    monkeypatch.chdir(tmp_path)
     payload = b"a payload under a brand-new fan-out prefix"
     expected_key = storage_key_for(hashlib.sha256(payload).hexdigest())
     synced: list[Path] = []
     monkeypatch.setattr(blob_store, "_fsync_directory", lambda directory: synced.append(directory))
-    store = FilesystemBlobStore(tmp_path)
+    root = Path("attachments")
+    store = FilesystemBlobStore(root)
 
     stored = await store.put(chunks_of(payload))
 
     assert stored.storage_key == expected_key
-    leaf = tmp_path / Path(expected_key).parent
+    leaf = root / Path(expected_key).parent
     # The leading entry is the once-per-lifetime root-durability confirmation
     # (see test_an_existing_root_is_confirmed_once_per_store_lifetime_not_every_write),
     # which runs before any fan-out directory is touched.
-    assert synced == [tmp_path.parent, leaf, leaf.parent, tmp_path]
+    assert synced == [Path(), leaf, leaf.parent, root]
 
 
 async def test_a_nonexistent_root_is_created_durably(
@@ -253,6 +261,59 @@ async def test_a_failed_root_confirmation_is_retried_not_trusted_from_disk(
         "the retry must redo the confirming fsync, not skip it because root exists"
     )
     assert store._root_confirmed_durable is True
+    assert stored.deduplicated is False
+
+
+async def test_a_restart_after_a_partial_multi_level_confirmation_resyncs_the_whole_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scenario the single-level retry test above does not cover: two new
+    levels get created in one ``mkdir(parents=True)`` call, the *inner* one's
+    confirmation succeeds, and only the *outer* one's - the deeper directory's
+    entry inside its own parent - fails. Both directories are now present on
+    disk; only a boolean this store instance holds knows the outer one was
+    never actually confirmed. A fresh instance (standing in for a process
+    restart, since a real crash can't be simulated in-process) starts with
+    that boolean back at ``False`` - it must not see the outer directory
+    merely ``.exists()`` and skip redoing its confirmation, or the crash this
+    whole mechanism exists to survive would go undetected.
+    """
+    monkeypatch.chdir(tmp_path)
+    root = Path("data") / "attachments"
+    payload = b"a payload under a root nested two levels deep, confirmed after a restart"
+    real_fsync_directory = blob_store._fsync_directory
+    synced: list[Path] = []
+    fail_next_cwd_sync = [True]
+
+    def flaky_fsync_directory(directory: Path) -> None:
+        synced.append(directory)
+        # The outer level's confirmation is the fsync of *its* parent, cwd -
+        # `data`'s own entry, one level short of the inner one already fixed.
+        if directory == Path() and fail_next_cwd_sync[0]:
+            fail_next_cwd_sync[0] = False
+            raise OSError("synthetic failure confirming the outer level's entry in its parent")
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(blob_store, "_fsync_directory", flaky_fsync_directory)
+
+    first_attempt = FilesystemBlobStore(root)
+    with pytest.raises(OSError, match="synthetic failure confirming the outer level"):
+        await first_attempt.put(chunks_of(payload))
+
+    assert root.is_dir()
+    assert Path("data").is_dir(), (
+        "mkdir(parents=True) already created both levels before the sync failed"
+    )
+
+    # A fresh instance, not the one that failed - simulating a process
+    # restart, where nothing in memory survives to remember what was and
+    # wasn't confirmed.
+    synced.clear()
+    restarted = FilesystemBlobStore(root)
+    stored = await restarted.put(chunks_of(payload))
+
+    assert Path() in synced, "the restart must redo the outer level's confirmation, not skip it"
+    assert restarted._root_confirmed_durable is True
     assert stored.deduplicated is False
 
 
