@@ -26,21 +26,32 @@ prompt (docs/DESIGN.md 7.3.1) does not yet need them to avoid fragmentation,
 and adding an unproven signal before ``context_recall`` has a baseline is
 exactly what docs/DESIGN.md 7.3.6 warns against ("Enabling every signal at
 once makes an underperforming or redundant signal impossible to identify").
-Likewise inclusion is binary here (``full`` or ``index_only``) rather than
-the design's three-way grade - the ``partial`` truncation mode
-(docs/DESIGN.md 7.3.3) is deferred; ``context_recall`` (7.3.5) is unaffected,
-since it only distinguishes ``index_only`` from everything else.
+
+Inclusion is the design's full three-way grade (docs/DESIGN.md 7.3.3):
+``full``, ``partial``, or ``index_only``. ``assemble`` decides the grade from
+each document's ``body_tokens`` (an approximate count the index-building
+caller supplies, since counting real tokens needs the whole body, which this
+module never sees) against two budgets from docs/DESIGN.md 7.3.6: a per-
+document ``max_body_tokens`` ceiling, and an aggregate
+``max_selected_body_tokens`` (<= 8k tokens) across everything selected. What
+this module does *not* do is the actual text truncation a ``partial`` grade
+implies (Summary/Current state/Open threads/timeline-tail, per 7.3.3) -
+that needs the real Markdown body and the fixed section contract, which only
+exist once a document is actually fetched, downstream in
+``tc_infrastructure``/``tc_application``. This module only ever decides
+*how much* of a document is worth fetching.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 from typing import Literal
 
 from tc_domain.entities import normalize_entity_name
 
-Inclusion = Literal["full", "index_only"]
+Inclusion = Literal["full", "partial", "index_only"]
 
 # Every signal that can add a document to the selected set. Mirrors the
 # `signals text[]` column on `run_context_selections` (docs/DESIGN.md 7.3.5).
@@ -53,6 +64,13 @@ class ContextAssemblyConfig:
 
     max_selected_documents: int = 12
     recency_days: float = 3.0
+    # docs/DESIGN.md 7.3.3: a document over this size is never sent `full`,
+    # only `partial`. docs/DESIGN.md 7.3.6: the cost/privacy envelope caps
+    # everything sent as `full` or `partial` combined at 8k tokens - an
+    # immutable, ever-growing document set can otherwise blow both budgets
+    # even while staying within `max_selected_documents`.
+    max_body_tokens: int = 2000
+    max_selected_body_tokens: int = 8000
 
 
 DEFAULT_CONTEXT_ASSEMBLY_CONFIG = ContextAssemblyConfig()
@@ -69,6 +87,11 @@ class Tier1Row:
     summary: str
     last_mentioned_at: dt.datetime | None
     open_thread_count: int
+    # Approximate token count of the document's *full* current body (not just
+    # `summary`) - the budgeting input `assemble` needs to decide `full` vs
+    # `partial` vs `index_only`. The index-building caller computes this from
+    # the real body, since this module never receives body text itself.
+    body_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,17 +106,28 @@ class Selection:
 def alias_signal(window_text: str, index: tuple[Tier1Row, ...]) -> frozenset[str]:
     """Entities named or misspelled-but-recognizable in the window text.
 
-    A plain normalized-substring check rather than a second trigram query:
-    the index is already in memory by the time this runs, and this signal
-    exists to catch exact or near-exact naming, not fuzzy recall - fuzzy
-    recall is what ``selector`` and, later, the embedding signal are for.
+    A word-boundary check against the normalized window rather than a second
+    trigram query: the index is already in memory by the time this runs, and
+    this signal exists to catch exact or near-exact naming, not fuzzy recall
+    - fuzzy recall is what ``selector`` and, later, the embedding signal are
+    for. Matching is anchored to word boundaries (not a bare substring test)
+    so a short name like "Ann" does not match inside an unrelated word like
+    "annual" and pull an unrelated private document into the prompt.
     """
     haystack = normalize_entity_name(window_text)
     matched = set()
     for row in index:
         names = (row.canonical_name, *row.aliases)
-        if any(normalize_entity_name(name) in haystack for name in names if name.strip()):
-            matched.add(row.stable_key)
+        for name in names:
+            if not name.strip():
+                continue
+            normalized_name = normalize_entity_name(name)
+            if not normalized_name:
+                continue
+            pattern = rf"(?<!\w){re.escape(normalized_name)}(?!\w)"
+            if re.search(pattern, haystack):
+                matched.add(row.stable_key)
+                break
     return frozenset(matched)
 
 
@@ -134,18 +168,34 @@ def assemble(
     selector_degraded: bool = False,
     config: ContextAssemblyConfig = DEFAULT_CONTEXT_ASSEMBLY_CONFIG,
 ) -> tuple[tuple[Selection, ...], bool]:
-    """Combine every signal, apply the budget, and record why each document was included.
+    """Combine every signal, apply both budgets, and record why each document was included.
 
     Returns the per-document selection (covering the *entire* index, so a
     caller can persist ``run_context_selections`` for every document in one
     pass - invariant 6) and whether the run should be marked degraded.
 
-    Budget: at most ``config.max_selected_documents`` get ``full`` inclusion.
-    Over budget, the *deterministic* signals win first - alias, recency, and
-    open-thread hits are precisely what invariant 2 says the selector can
-    never override - and the excess (deterministic overflow or any
-    selector-only pick beyond the cap) falls back to ``index_only`` rather
-    than being dropped from the index entirely.
+    Two budgets apply, in order, to the documents any signal picked:
+
+    1. **Count**: at most ``config.max_selected_documents`` are considered at
+       all. The *deterministic* signals win first - alias, recency, and
+       open-thread hits are precisely what invariant 2 says the selector can
+       never override - and any excess (deterministic overflow, or a
+       selector-only pick beyond the cap) falls back to ``index_only``.
+    2. **Tokens**: within that set, a document over ``config.max_body_tokens``
+       can never be ``full`` - only ``partial`` (docs/DESIGN.md 7.3.3). Then,
+       walked in the same deterministic-first, stable order, each document's
+       token cost accumulates against ``config.max_selected_body_tokens``
+       (docs/DESIGN.md 7.3.6's <= 8k-token cap on everything sent as body
+       content); once a document would push the running total over that cap
+       it is downgraded - ``full`` to ``partial``, and ``partial`` (or a
+       ``full`` that is still too large even alone) to ``index_only`` -
+       rather than the budget being silently exceeded. An immutable,
+       ever-growing document set is what makes this necessary: staying under
+       ``max_selected_documents`` does not bound token cost.
+
+    This module never truncates a body's actual text - it only decides how
+    much of a document is worth fetching. The real Markdown truncation a
+    ``partial`` grade implies happens downstream, where the body exists.
     """
     signals_by_key: dict[str, set[Signal]] = {}
     for signal_name, keys in deterministic.items():
@@ -160,12 +210,29 @@ def assemble(
     # budget reproducible across two runs of the same window, which matters
     # for docs/DESIGN.md 15.3's regression diffs.
     ordered = sorted(signals_by_key, key=lambda key: (key not in deterministic_keys, key))
-    full = set(ordered[: config.max_selected_documents])
+    candidates = ordered[: config.max_selected_documents]
+
+    body_tokens = {row.stable_key: row.body_tokens for row in index}
+    inclusion_by_key: dict[str, Inclusion] = {}
+    spent_tokens = 0
+    for key in candidates:
+        tokens = body_tokens.get(key, 0)
+        if (
+            tokens <= config.max_body_tokens
+            and spent_tokens + tokens <= config.max_selected_body_tokens
+        ):
+            inclusion_by_key[key] = "full"
+            spent_tokens += tokens
+        elif spent_tokens + min(tokens, config.max_body_tokens) <= config.max_selected_body_tokens:
+            inclusion_by_key[key] = "partial"
+            spent_tokens += min(tokens, config.max_body_tokens)
+        else:
+            inclusion_by_key[key] = "index_only"
 
     selections = tuple(
         Selection(
             stable_key=row.stable_key,
-            inclusion="full" if row.stable_key in full else "index_only",
+            inclusion=inclusion_by_key.get(row.stable_key, "index_only"),
             signals=tuple(sorted(signals_by_key.get(row.stable_key, ()))),
         )
         for row in index
