@@ -50,3 +50,24 @@ async def test_index_is_a_no_op_for_an_empty_tuple(client: HttpKhojClient) -> No
 
 async def test_delete_is_a_no_op_for_an_empty_tuple(client: HttpKhojClient) -> None:
     await client.delete(())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"score": 0.5}],  # missing "entry"
+        [{"entry": "text", "score": "not-a-number"}],  # score is not numeric
+        {"entry": "text", "score": 0.5},  # a dict, not a list of results
+    ],
+    ids=["missing_entry", "non_numeric_score", "non_list_payload"],
+)
+async def test_search_raises_khoj_unavailable_on_a_malformed_response(payload: object) -> None:
+    """A shape Khoj's own documented API would never return is exactly as
+    unusable to a caller as an unreachable server (docs/DESIGN.md 7.5) - it
+    must not surface as a bare KeyError/TypeError a caller's
+    ``except KhojUnavailableError`` would miss."""
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as http:
+        malformed_client = HttpKhojClient(http, "http://khoj.invalid")
+        with pytest.raises(KhojUnavailableError):
+            await malformed_client.search("anything")

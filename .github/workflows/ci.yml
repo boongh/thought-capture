@@ -26,6 +26,12 @@ env:
   POSTGRES_USER: tc_migrator
   POSTGRES_PASSWORD: tc_migrator
   TC_APP_DB_PASSWORD: tc_app
+  # Khoj's own database/admin credentials (docs/adr/0003, 'ai' compose
+  # profile). Also throwaway: Khoj is loopback-only and torn down at the end
+  # of this job.
+  TC_KHOJ_DB_PASSWORD: tc_khoj_db
+  TC_KHOJ_DJANGO_SECRET_KEY: ci-only-not-a-real-secret
+  TC_KHOJ_ADMIN_PASSWORD: tc_khoj_admin
 
 jobs:
   check:
@@ -93,6 +99,46 @@ jobs:
         env:
           TC_REQUIRE_INTEGRATION: "1"
         run: uv run pytest -m integration
+
+      # -----------------------------------------------------------------
+      # Khoj contract tests (docs/DESIGN.md 16 step 6, docs/adr/0003).
+      #
+      # Unlike postgres above (a GitHub Actions `services:` container, up
+      # for the whole job), Khoj is started here via the real 'ai' compose
+      # profile so CI exercises the same topology (khoj + its own khoj-db)
+      # a developer runs locally - not a hand-rolled substitute. This was
+      # previously entirely missing: scripts/check.ps1 and check.sh treat an
+      # unreachable Khoj as a skip for local developer convenience, but nothing
+      # started Khoj in CI, so that skip was silently absorbing every commit
+      # instead of the "pinned Khoj contract smoke test" the design requires.
+      # TC_REQUIRE_CONTRACT makes the same skip a hard failure here, matching
+      # how TC_REQUIRE_INTEGRATION already does for the database above.
+      # -----------------------------------------------------------------
+      - name: Start Khoj ('ai' compose profile)
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml --profile ai up -d khoj-db khoj-init khoj
+
+      - name: Wait for Khoj to become ready
+        run: |
+          for _ in $(seq 1 40); do
+            if curl --silent --fail --max-time 3 "http://127.0.0.1:42110/api/search?q=check" >/dev/null 2>&1; then
+              echo "Khoj is ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Khoj did not become ready in time" >&2
+          docker compose -f deploy/compose/docker-compose.yml --profile ai logs khoj
+          exit 1
+
+      - name: Contract tests
+        env:
+          TC_REQUIRE_CONTRACT: "1"
+        run: uv run pytest -m contract
+
+      - name: Stop Khoj
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.yml --profile ai down -v
 
       - name: Reject tracked environment files
         # A committed .env would leak credentials; fail loudly rather than warn.

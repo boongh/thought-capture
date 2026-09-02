@@ -175,7 +175,7 @@ services:
   # server's base image to an internal detail of a system this project
   # declares replaceable (docs/DESIGN.md 5 invariant 7).
   khoj-db:
-    image: docker.io/pgvector/pgvector:pg15
+    image: docker.io/pgvector/pgvector:pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da
     profiles: ["ai"]
     restart: unless-stopped
     environment:
@@ -193,19 +193,62 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # The pinned image ships no non-root user and no config-directory override
+  # (khoj/utils/constants.py hardcodes "~/.khoj/..."), so it defaults to root
+  # with HOME=/root - review remediation for PR #17. This one-shot step fixes
+  # ownership of a fresh volume to the UID the `khoj` service below actually
+  # runs as, since a bare-created named volume is root-owned and would
+  # otherwise be unwritable to it. It reuses the already-pinned khoj image
+  # (rather than adding a second image to pin/track) purely for its coreutils
+  # and runs as the image's own default root, deliberately, to be able to
+  # chown in the first place; it holds no network access and does nothing
+  # else.
+  khoj-init:
+    image: ghcr.io/khoj-ai/khoj:2.0.0-beta.28@sha256:eb2e44669df44b51cb206b394dc0a00c782ac152dda02c97c9e3dac3d643dbb4
+    profiles: ["ai"]
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["mkdir -p /khoj-home/.khoj /khoj-home/.cache && chown -R 1000:1000 /khoj-home"]
+    volumes:
+      - khoj-home:/khoj-home
+    security_opt:
+      - no-new-privileges:true
+
   # docs/adr/0003. Pinned by digest; --anonymous-mode means every request
   # gets Khoj's built-in anonymous user, so this project's own gateway
   # remains the only real authorization boundary - the port is bound to
   # loopback only, matching postgres and the debug UI (docs/adr/0009).
+  # Runs as a fixed non-root UID (review remediation for PR #17): the image
+  # provides no named non-root user, so an arbitrary UID/GID is used and
+  # HOME is redirected to a volume khoj-init has already chowned to match.
   khoj:
     image: ghcr.io/khoj-ai/khoj:2.0.0-beta.28@sha256:eb2e44669df44b51cb206b394dc0a00c782ac152dda02c97c9e3dac3d643dbb4
     profiles: ["ai"]
     restart: unless-stopped
+    user: "1000:1000"
     depends_on:
       khoj-db:
         condition: service_healthy
-    command: ["--host=0.0.0.0", "--port=42110", "--anonymous-mode", "--non-interactive"]
+      khoj-init:
+        condition: service_completed_successfully
+    # --log-file is passed explicitly and absolute: khoj/utils/cli.py declares
+    # it as `type=pathlib.Path, default="~/.khoj/khoj.log"` and never calls
+    # `.expanduser()` on it (unlike khoj's other khoj_dir-derived paths, which
+    # do), so the literal default resolves "~" as a directory name, not $HOME.
+    # Running as root that accidentally succeeded (root could write it anywhere,
+    # including a stray literal "~" folder under the working directory);
+    # running as a non-root UID under a read-only /app it fails outright.
+    # Confirmed directly against this pinned image, not assumed.
+    command:
+      [
+        "--host=0.0.0.0",
+        "--port=42110",
+        "--anonymous-mode",
+        "--non-interactive",
+        "--log-file=/khoj-home/.khoj/khoj.log",
+      ]
     environment:
+      HOME: /khoj-home
       POSTGRES_DB: khoj
       POSTGRES_USER: khoj
       POSTGRES_PASSWORD: ${TC_KHOJ_DB_PASSWORD:?TC_KHOJ_DB_PASSWORD must be set in .env}
@@ -223,9 +266,7 @@ services:
     ports:
       - "127.0.0.1:${TC_KHOJ_PORT:-42110}:42110"
     volumes:
-      - khoj-config:/root/.khoj/
-      - khoj-models:/root/.cache/torch/sentence_transformers
-      - khoj-models:/root/.cache/huggingface
+      - khoj-home:/khoj-home
     security_opt:
       - no-new-privileges:true
 
@@ -236,7 +277,5 @@ volumes:
     driver: local
   khoj-db-data:
     driver: local
-  khoj-config:
-    driver: local
-  khoj-models:
+  khoj-home:
     driver: local

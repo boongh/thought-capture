@@ -71,11 +71,19 @@ class HttpKhojClient:
         except ValueError as exc:
             raise KhojUnavailableError(f"Khoj search returned a non-JSON response: {exc}") from exc
 
-        return tuple(
-            KhojSearchResult(
-                entry=item["entry"],
-                score=float(item["score"]),
-                filename=item.get("additional", {}).get("file", ""),
+        try:
+            return tuple(
+                KhojSearchResult(
+                    entry=item["entry"],
+                    score=float(item["score"]),
+                    filename=item.get("additional", {}).get("file", ""),
+                )
+                for item in payload
             )
-            for item in payload
-        )
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed shape (missing "entry"/"score", a non-list body, a
+            # non-numeric score) is exactly as unusable to the caller as an
+            # unreachable Khoj - both must degrade the same way (docs/DESIGN.md
+            # 7.5), so this is not allowed to surface as a bare KeyError/
+            # TypeError that a caller's `except KhojUnavailableError` would miss.
+            raise KhojUnavailableError(f"Khoj search returned an unexpected shape: {exc}") from exc

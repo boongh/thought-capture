@@ -214,3 +214,59 @@ were torn down afterward; nothing from this spike is deployed.
 Automated: `tests/contract/khoj` (slice 17) pins the same digest and asserts
 the behaviors named in findings 1-2 above against a real container started
 for the test run.
+
+## Review remediation (2026-09-02)
+
+Independent review of PR #17 held merge pending four fixes, all applied on
+this same branch per `docs/git-branching-policy.md` (findings on the
+introducing, not-yet-merged branch land there, not deferred):
+
+1. **CI never started Khoj.** `.github/workflows/ci.yml` had no Khoj step at
+   all, so `docs/DESIGN.md` 16's required "Khoj API contract smoke test
+   against the pinned digest" was not actually running anywhere - only
+   `scripts/check.ps1`/`check.sh`'s local, developer-convenience skip-if-
+   unreachable path existed, and CI never made that instance reachable. CI now
+   starts `khoj-db`/`khoj-init`/`khoj` via the real `ai` compose profile,
+   polls `/api/search` for readiness, then runs `pytest -m contract` with
+   `TC_REQUIRE_CONTRACT=1` (a skip is a hard failure, matching how
+   `TC_REQUIRE_INTEGRATION` already treats PostgreSQL), and tears the profile
+   down unconditionally afterward. The local scripts' skip-if-unreachable
+   behavior is intentionally unchanged - it is a developer convenience, not
+   the design's CI requirement, and is documented as such in both scripts.
+
+2. **Khoj ran as root with writable mounts under `/root`,** contrary to
+   `docs/DESIGN.md` 13 ("non-root containers"). The pinned image ships no
+   built-in non-root user and no config-directory override - confirmed
+   directly by inspecting the image (`khoj/utils/constants.py` hardcodes
+   `~/.khoj/...`) - so a new one-shot `khoj-init` service (reusing the same
+   pinned image purely for coreutils, run once as its own default root only
+   to `chown` a fresh volume) prepares a `khoj-home` volume for a fixed
+   non-root UID/GID (`1000:1000`), and the `khoj` service now runs as that
+   UID with `HOME=/khoj-home`. Verified live against the pinned container,
+   not assumed: index/search/delete all round-trip correctly running non-root
+   (same behavior as the original root-mode spike). One additional bug
+   surfaced only by this change and confirmed against the image's own source:
+   `khoj/utils/cli.py`'s `--log-file` default (`~/.khoj/khoj.log`) is typed as
+   a bare `pathlib.Path` and is never expanded, so root's accidental
+   ability to write anywhere (including a stray literal `~` directory) had
+   been masking it; `--log-file=/khoj-home/.khoj/khoj.log` is now passed
+   explicitly, absolute, working around Khoj's own unexpanded default rather
+   than depending on it.
+
+3. **The `khoj-db` image (`pgvector/pgvector:pg15`) was pinned by tag only,**
+   unlike every other image in this compose file. Resolved by the same
+   `docker pull` + `docker inspect --format='{{index .RepoDigests 0}}'`
+   method used for the `khoj` image above:
+   `sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da`.
+
+4. **A malformed Khoj search response (missing `entry`/`score`, a non-numeric
+   score, a non-list body) surfaced as a bare `KeyError`/`TypeError`/
+   `ValueError` from `HttpKhojClient.search`,** not `KhojUnavailableError` -
+   a caller that only catches the latter (as `docs/DESIGN.md` 7.5's degrade-
+   explicitly contract requires) would miss it. `HttpKhojClient.search` now
+   catches those three exception types around result construction and
+   re-raises as `KhojUnavailableError`, covered by
+   `tests/unit/test_khoj_client_errors.py`.
+
+None of these change the Decision or Consequences sections above; they
+correct the implementation to actually match them.
