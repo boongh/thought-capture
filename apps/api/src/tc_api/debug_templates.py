@@ -14,6 +14,7 @@ from html import escape as esc
 
 from tc_infrastructure.db.document_reader import DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
+from tc_infrastructure.db.llm_call_reader import LlmCallRecord
 from tc_infrastructure.db.thought_reader import ThoughtRecord
 
 _STYLE = """
@@ -38,7 +39,8 @@ def _page(title: str, active: str, body: str) -> str:
     nav = (
         f"<nav>{link('thoughts', 'Thoughts')}"
         f"{link('entities', 'Entities')}"
-        f"{link('digests', 'Digests')}</nav>"
+        f"{link('digests', 'Digests')}"
+        f"{link('runs', 'Runs')}</nav>"
     )
     return (
         f"<!doctype html><html><head><meta charset='utf-8'>"
@@ -95,3 +97,38 @@ def digests_page(records: list[DocumentSummary], bodies: dict[uuid.UUID, str]) -
     if not records:
         cards = "<p>No digests yet.</p>"
     return _page("Daily digests", "digests", cards)
+
+
+def runs_page(records: list[LlmCallRecord], *, next_cursor: str | None) -> str:
+    """Recent journaled LLM calls (docs/adr/0008), read-only.
+
+    Shows request-shape metadata used to evaluate a candidate model
+    (docs/model-evaluation-organize-select.md) - which model was asked, the
+    reasoning-effort control sent (if any), cost and latency - never
+    ``request_messages``/``response_raw`` (raw prompt/completion content;
+    see ``LlmCallRecord``'s own docstring for why those are excluded).
+    """
+    rows = "".join(
+        f"<tr><td>{_fmt(r.created_at)}</td><td>{esc(r.step)}</td>"
+        f"<td>{esc(r.model_requested)}</td><td>{esc(r.model_served or '')}</td>"
+        f"<td>{esc(r.provider or '')}</td>"
+        f"<td>{esc(str(r.request_params.get('reasoning_effort') or ''))}</td>"
+        f"<td>{r.input_tokens if r.input_tokens is not None else ''}</td>"
+        f"<td>{r.output_tokens if r.output_tokens is not None else ''}</td>"
+        f"<td>{esc(str(r.estimated_cost_usd)) if r.estimated_cost_usd is not None else ''}</td>"
+        f"<td>{r.latency_ms if r.latency_ms is not None else ''}</td>"
+        f"<td>{esc(r.error_code or '')}</td></tr>"
+        for r in records
+    )
+    table = (
+        "<table><thead><tr><th>Created</th><th>Step</th><th>Model requested</th>"
+        "<th>Model served</th><th>Provider</th><th>Reasoning effort</th>"
+        "<th>Input tok</th><th>Output tok</th><th>Cost (USD)</th>"
+        f"<th>Latency (ms)</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+    if not records:
+        table = "<p>No LLM calls journaled yet.</p>"
+    elif next_cursor:
+        href = f"/debug/runs?cursor={esc(next_cursor)}"
+        table += f'<p><a href="{href}">Next page &rarr;</a></p>'
+    return _page("LLM calls", "runs", table)

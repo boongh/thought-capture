@@ -9,7 +9,7 @@ unapproved model is exactly the silent fallback the design forbids.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import pytest
@@ -257,3 +257,47 @@ async def test_the_effective_routing_policy_is_journaled_with_the_response() -> 
     response = await provider.complete(a_request())
 
     assert response.request_params["provider_routing"] == sent_provider_routing(completions)
+
+
+# ---------------------------------------------------------------------------
+# Reasoning control - a model with hidden reasoning tokens can otherwise
+# spend its entire output budget on reasoning and return no visible content
+# at all (docs/model-evaluation-organize-select.md)
+# ---------------------------------------------------------------------------
+
+
+async def test_reasoning_effort_is_not_sent_by_default() -> None:
+    """Unset by default - a model with no notion of reasoning must not be asked about it."""
+    provider, completions = a_provider(served_model=MODEL_ID)
+
+    await provider.complete(a_request())
+
+    assert "reasoning" not in completions.calls[0]["extra_body"]
+
+
+async def test_reasoning_effort_is_sent_when_set() -> None:
+    provider, completions = a_provider(served_model=MODEL_ID)
+    request = replace(a_request(), reasoning_effort="none")
+
+    await provider.complete(request)
+
+    assert completions.calls[0]["extra_body"]["reasoning"] == {"effort": "none"}
+
+
+async def test_reasoning_effort_is_journaled_with_the_response() -> None:
+    """A historical run must be able to tell whether reasoning was controlled,
+    same rationale as `provider_routing` above."""
+    provider, _ = a_provider(served_model=MODEL_ID)
+    request = replace(a_request(), reasoning_effort="none")
+
+    response = await provider.complete(request)
+
+    assert response.request_params["reasoning_effort"] == "none"
+
+
+async def test_reasoning_effort_journals_as_none_when_unset() -> None:
+    provider, _ = a_provider(served_model=MODEL_ID)
+
+    response = await provider.complete(a_request())
+
+    assert response.request_params["reasoning_effort"] is None

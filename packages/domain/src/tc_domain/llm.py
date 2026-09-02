@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from tc_domain.errors import DomainError
 
@@ -51,6 +51,14 @@ class LLMRequest:
     # Determinism is requested, never assumed: output is not reproducible across
     # providers even at zero. Reproduction comes from the journal (ADR-0008).
     temperature: float = 0.0
+    # Unset by default. A model with hidden reasoning tokens can otherwise
+    # spend its entire output budget on reasoning and return no visible
+    # content at all (observed live during organize model evaluation -
+    # docs/model-evaluation-organize-select.md). "none" asks the provider to
+    # skip reasoning; other values are accepted for future evaluation use but
+    # no caller sets them yet. Provider-agnostic by design - `OpenRouterProvider`
+    # is the only adapter that currently acts on it.
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
 
 
 @dataclass(frozen=True, slots=True)

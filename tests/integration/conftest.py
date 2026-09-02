@@ -34,6 +34,7 @@ from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
+from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
@@ -296,6 +297,7 @@ async def _api_client(
         reader=PostgresThoughtReader(app_session_factory),
         documents=PostgresDocumentReader(app_session_factory),
         entities=PostgresEntityReader(app_session_factory),
+        llm_calls=PostgresLlmCallReader(app_session_factory),
         outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
         session_factory=app_session_factory,
         workspace_id=WorkspaceId(workspace_id),

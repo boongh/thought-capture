@@ -27,6 +27,7 @@ from tc_infrastructure.db.document_reader import PostgresDocumentReader
 from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
 from tc_infrastructure.db.identity import resolve_identity
+from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
@@ -65,6 +66,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         reader=PostgresThoughtReader(sessions),
         documents=PostgresDocumentReader(sessions),
         entities=PostgresEntityReader(sessions),
+        llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         session_factory=sessions,
         workspace_id=identity.workspace_id,

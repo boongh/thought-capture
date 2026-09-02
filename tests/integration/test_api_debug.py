@@ -12,7 +12,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
+from tc_domain.llm import LLMRequest, LLMResponse, LLMStep, Message
 from tc_domain.organize import DocumentWrite, OrganizeWriteRequest, RunOutcome
+from tc_infrastructure.db.llm_journal import PostgresLLMJournal
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.tables import thoughts
@@ -177,6 +179,64 @@ async def test_entities_page_renders(api: httpx.AsyncClient) -> None:
     response = await api.get("/debug/entities", headers=BASIC_AUTH)
     assert response.status_code == 200
     assert "Entities" in response.text
+
+
+async def test_runs_page_renders_a_journaled_call_with_its_reasoning_effort(
+    api_fresh: httpx.AsyncClient,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+    unique_message_id: str,
+) -> None:
+    workspace_id, _user_id = fresh_identity
+    ledger = PostgresRunLedger(app_session_factory)
+    run_id = await ledger.start(
+        WorkspaceId(workspace_id),
+        window_start=dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC),
+        window_end=dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC),
+    )
+    model_id = f"vendor/{unique_message_id}"
+    request = LLMRequest(
+        step=LLMStep.ORGANIZE,
+        messages=(Message(role="user", content="organize these"),),
+        schema_name="OrganizationResult",
+        json_schema={"type": "object"},
+        prompt_version="organize-v1",
+        schema_version="organize-v1",
+        reasoning_effort="none",
+    )
+    response = LLMResponse(
+        content='{"documents": []}',
+        raw={"id": "gen-1", "model": model_id, "choices": [{"message": {"content": "{}"}}]},
+        latency_ms=250,
+        model_requested=model_id,
+        model_served=model_id,
+        provider="synthetic-provider",
+        input_tokens=10,
+        output_tokens=5,
+        request_params={"reasoning_effort": "none"},
+    )
+    journal = PostgresLLMJournal(app_session_factory)
+    await journal.record(
+        workspace_id=WorkspaceId(workspace_id),
+        run_id=run_id,
+        request=request,
+        response=response,
+        sequence=1,
+    )
+
+    page_response = await api_fresh.get("/debug/runs", headers=BASIC_AUTH)
+
+    assert page_response.status_code == 200
+    assert model_id in page_response.text
+    assert "<td>none</td>" in page_response.text
+
+
+async def test_runs_page_shows_a_placeholder_when_there_are_no_calls(
+    api_fresh: httpx.AsyncClient,
+) -> None:
+    response = await api_fresh.get("/debug/runs", headers=BASIC_AUTH)
+    assert response.status_code == 200
+    assert "No LLM calls journaled yet." in response.text
 
 
 async def test_digests_page_renders_a_written_digest(
