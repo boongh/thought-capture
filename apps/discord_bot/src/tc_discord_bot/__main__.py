@@ -42,7 +42,7 @@ from tc_infrastructure.db.run_reader import PostgresRunReader
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
 from tc_infrastructure.db.windows import PostgresCaptureWindows
-from tc_infrastructure.llm.factory import build_organize_provider
+from tc_infrastructure.llm.factory import build_organize_provider, build_select_provider
 from tc_infrastructure.runtime import run
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
@@ -145,6 +145,14 @@ async def serve(settings: Settings) -> None:
             thoughts=thoughts_for_organize,
             context_index=PostgresContextIndex(sessions),
             provider=build_organize_provider(settings),
+            # Matches tc_worker.__main__'s wiring exactly: without this, a
+            # manual /organize run would silently fall back to the organize
+            # provider for context-assembly's "select" call (OrganizeWindow's
+            # own `select_provider or provider` default), not the separately
+            # reviewed select-stage model docs/adr/0006 and PR #16 wire in -
+            # a real behavioral gap the review caught, not an intentional
+            # difference between a manual and a scheduled run.
+            select_provider=build_select_provider(settings),
             journal_factory=_journal_factory(journal),
             writer=PostgresOrganizeWriter(sessions, entities=PostgresEntityRepository()),
             run_ledger=PostgresRunLedger(sessions),
