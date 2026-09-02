@@ -123,6 +123,72 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # Compose config sanity: the 'ai' profile's required TC_KHOJ_* variables
+    # must never block a core-only deployment (review remediation, PR #17 -
+    # Compose interpolates every service in every `-f` file before applying
+    # `--profile` filtering, so a required Khoj variable living in the same
+    # file as 'core' silently made 'ai' a hard dependency of 'core'). 'ai'
+    # must still fail clearly, not silently, when its own secrets are absent.
+    #
+    # Uses a synthetic env file with only the 'core'-required variables,
+    # deliberately not the real `.env` and deliberately not a process-level
+    # override: `$env:VAR = ""` in PowerShell *deletes* the variable rather
+    # than setting it empty, so it would fall straight through to whatever
+    # a real `.env` already has - silently testing nothing. A from-scratch
+    # env file has no such ambiguity and needs no real `.env` to exist.
+    #
+    # Client-side only (no running daemon needed for `config`), gated on
+    # Docker being installed at all, matching the stages below.
+    # -----------------------------------------------------------------------
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        Write-Host ""
+        Write-Host "--- compose config sanity" -ForegroundColor Cyan
+        $coreOnlyEnv = Join-Path ([System.IO.Path]::GetTempPath()) "tc-compose-sanity-core-only.env"
+        $aiErrorFile = Join-Path ([System.IO.Path]::GetTempPath()) "tc-ai-compose-config-error.txt"
+        "POSTGRES_PASSWORD=sanity-check-only`nTC_APP_DB_PASSWORD=sanity-check-only`n" |
+            Set-Content -LiteralPath $coreOnlyEnv -Encoding utf8 -NoNewline
+        # `docker compose ... config` writes routine warnings to stderr (e.g.
+        # "TC_DISCORD_BOT_TOKEN not set, defaulting to blank string") on
+        # every call. Under this script's `$ErrorActionPreference = "Stop"`,
+        # PowerShell 5.1 wraps *any* redirected stderr line from a native
+        # command into a NativeCommandError and - because of Stop - that
+        # becomes a terminating exception the instant the first warning
+        # line appears, aborting the script before $LASTEXITCODE is ever
+        # checked. This is the same failure mode that made this script once
+        # misreport `uv lock --check`. Redirection is still needed here (the
+        # 'ai' case must inspect the *text* of the failure), so the fix is
+        # to relax to Continue for exactly these two calls, not to avoid
+        # redirection - `$LASTEXITCODE` is checked explicitly regardless.
+        $previousEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml --profile core config --quiet 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                throw "FAIL: compose config sanity ('core' must validate without any TC_KHOJ_* set)"
+            }
+            & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai config --quiet 2>$aiErrorFile
+            if ($LASTEXITCODE -eq 0) {
+                throw "FAIL: compose config sanity (expected 'ai' config to fail without TC_KHOJ_* set, but it succeeded)"
+            }
+            $aiError = Get-Content -Raw -LiteralPath $aiErrorFile -ErrorAction SilentlyContinue
+            if ($aiError -notmatch "TC_KHOJ_") {
+                throw "FAIL: compose config sanity ('ai' failed, but not for a missing TC_KHOJ_* variable: $aiError)"
+            }
+        }
+        finally {
+            $ErrorActionPreference = $previousEap
+            Remove-Item -LiteralPath $coreOnlyEnv -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $aiErrorFile -ErrorAction SilentlyContinue
+        }
+        Write-Host "OK: compose config sanity"
+    }
+    else {
+        $Script:Skipped += "compose config sanity (Docker engine unavailable)"
+        Write-Host ""
+        Write-Host "SKIPPED: compose config sanity (Docker engine unavailable)" -ForegroundColor Yellow
+    }
+
+    # -----------------------------------------------------------------------
     # Contract tests: require the pinned Khoj instance from the 'ai' compose
     # profile (docs/adr/0003). Unlike PostgreSQL/'core' above, 'ai' is a new,
     # heavy, optional-so-far dependency - reachability is probed explicitly
@@ -154,7 +220,7 @@ try {
         Write-Host "OK: contract tests"
     }
     else {
-        $Script:Skipped += "contract tests (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile ai up -d)"
+        $Script:Skipped += "contract tests (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)"
         Write-Host "SKIPPED: Khoj unreachable at $KhojUrl" -ForegroundColor Yellow
     }
 

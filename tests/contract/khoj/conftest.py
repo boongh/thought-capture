@@ -3,7 +3,7 @@
 Start the server with:
 
     docker compose --env-file .env -f deploy/compose/docker-compose.yml \
-      --profile ai up -d
+      -f deploy/compose/khoj.docker-compose.yml --profile ai up -d
 
 A connection failure is deliberately allowed to propagate as an error, the
 same choice `tests/integration/conftest.py` makes for PostgreSQL: a skip

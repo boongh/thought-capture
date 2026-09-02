@@ -116,6 +116,50 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Compose config sanity: the 'ai' profile's required TC_KHOJ_* variables must
+# never block a core-only deployment (review remediation, PR #17 - Compose
+# interpolates every service in every `-f` file before applying `--profile`
+# filtering, so a required Khoj variable living in the same file as 'core'
+# silently made 'ai' a hard dependency of 'core'). 'ai' must still fail
+# clearly, not silently, when its own secrets are absent.
+#
+# Uses a synthetic env file with only the 'core'-required variables, not the
+# real `.env` - a real `.env` may already define TC_KHOJ_*, and this needs to
+# prove the failure happens when they are genuinely absent, not rely on
+# every developer's `.env` happening to lack them. Client-side only (no
+# running daemon needed for `config`), gated on docker being installed.
+# ---------------------------------------------------------------------------
+if command -v docker >/dev/null 2>&1; then
+  printf '\n--- compose config sanity\n'
+  core_only_env="$(mktemp)"
+  ai_error_file="$(mktemp)"
+  printf 'POSTGRES_PASSWORD=sanity-check-only\nTC_APP_DB_PASSWORD=sanity-check-only\n' >"$core_only_env"
+  if ! docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
+    --profile core config --quiet 2>/dev/null; then
+    printf "FAIL: compose config sanity ('core' must validate without any TC_KHOJ_* set)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  if docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
+    -f deploy/compose/khoj.docker-compose.yml --profile ai config --quiet 2>"$ai_error_file"; then
+    printf "FAIL: compose config sanity (expected 'ai' config to fail without TC_KHOJ_* set, but it succeeded)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  if ! grep -q "TC_KHOJ_" "$ai_error_file"; then
+    printf "FAIL: compose config sanity ('ai' failed, but not for a missing TC_KHOJ_* variable):\n" >&2
+    cat "$ai_error_file" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  rm -f "$core_only_env" "$ai_error_file"
+  printf '%s\n' "OK: compose config sanity"
+else
+  skipped+=("compose config sanity (Docker engine unavailable)")
+  printf '\n%s\n' "SKIPPED: compose config sanity (Docker engine unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
 # Contract tests: require the pinned Khoj instance from the 'ai' compose
 # profile (docs/adr/0003). Unlike PostgreSQL/'core' above, 'ai' is a new,
 # heavy, optional-so-far dependency - reachability is probed explicitly
@@ -132,7 +176,7 @@ if curl --silent --fail --max-time 3 "$khoj_url/api/search?q=check" >/dev/null 2
   fi
   printf '%s\n' "OK: contract tests"
 else
-  skipped+=("contract tests (Khoj unreachable at $khoj_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile ai up -d)")
+  skipped+=("contract tests (Khoj unreachable at $khoj_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)")
   printf '%s\n' "SKIPPED: Khoj unreachable at $khoj_url"
 fi
 

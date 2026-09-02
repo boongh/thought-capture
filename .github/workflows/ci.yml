@@ -116,7 +116,8 @@ jobs:
       # -----------------------------------------------------------------
       - name: Start Khoj ('ai' compose profile)
         run: |
-          docker compose -f deploy/compose/docker-compose.yml --profile ai up -d khoj-db khoj-init khoj
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
+            --profile ai up -d khoj-db khoj-init khoj
 
       - name: Wait for Khoj to become ready
         run: |
@@ -128,7 +129,8 @@ jobs:
             sleep 3
           done
           echo "Khoj did not become ready in time" >&2
-          docker compose -f deploy/compose/docker-compose.yml --profile ai logs khoj
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
+            --profile ai logs khoj
           exit 1
 
       - name: Contract tests
@@ -138,7 +140,41 @@ jobs:
 
       - name: Stop Khoj
         if: always()
-        run: docker compose -f deploy/compose/docker-compose.yml --profile ai down -v
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
+            --profile ai down -v
+
+      # Regression check for the review finding that the 'ai' profile's
+      # required TC_KHOJ_* variables were breaking a Khoj-less 'core'
+      # deployment (review remediation, PR #17): 'core' must validate with
+      # zero TC_KHOJ_* configuration, and 'ai' must still fail clearly - not
+      # silently - when its own secrets are absent.
+      - name: Compose config sanity - core is independent of Khoj secrets
+        env:
+          TC_KHOJ_DB_PASSWORD: ""
+          TC_KHOJ_DJANGO_SECRET_KEY: ""
+          TC_KHOJ_ADMIN_PASSWORD: ""
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml --profile core config --quiet
+
+      - name: Compose config sanity - ai fails clearly without its secrets
+        env:
+          TC_KHOJ_DB_PASSWORD: ""
+          TC_KHOJ_DJANGO_SECRET_KEY: ""
+          TC_KHOJ_ADMIN_PASSWORD: ""
+        run: |
+          if docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
+            --profile ai config --quiet 2>/tmp/ai-config-error; then
+            echo "expected 'ai' config to fail without TC_KHOJ_* set, but it succeeded" >&2
+            exit 1
+          fi
+          if ! grep -q "TC_KHOJ_" /tmp/ai-config-error; then
+            echo "'ai' config failed, but not for a missing TC_KHOJ_* variable:" >&2
+            cat /tmp/ai-config-error >&2
+            exit 1
+          fi
+          echo "OK: ai profile fails clearly without Khoj secrets:"
+          cat /tmp/ai-config-error
 
       - name: Reject tracked environment files
         # A committed .env would leak credentials; fail loudly rather than warn.

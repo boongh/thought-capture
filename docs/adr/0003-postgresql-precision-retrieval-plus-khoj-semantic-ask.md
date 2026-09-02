@@ -270,3 +270,37 @@ introducing, not-yet-merged branch land there, not deferred):
 
 None of these change the Decision or Consequences sections above; they
 correct the implementation to actually match them.
+
+## Review remediation, round 2 (2026-09-02)
+
+A second independent review of PR #17 (against the round-1 fixes above)
+confirmed all four of those and raised one new **P1, blocking merge**:
+
+5. **A core-only deployment could not even parse its own Compose stack.**
+   `khoj-db`, `khoj-init`, and `khoj` used Compose's required-variable form
+   (`${TC_KHOJ_DB_PASSWORD:?...}` etc.) while living in the *same* file as
+   the `core` profile's services. Compose interpolates every service in
+   every file passed to it - required-variable references included - before
+   `--profile` filtering ever decides which services actually start
+   (confirmed by reproduction: `docker compose -f docker-compose.yml
+   --profile core config --quiet` with no `TC_KHOJ_*` set failed on a
+   *Khoj* variable). This silently made the supposedly opt-in `ai` profile
+   a hard dependency of `core`, contrary to this ADR's own "one more
+   container locally, zero coupling" framing and to the PR's stated
+   topology.
+
+   Fixed by moving `khoj-db`/`khoj-init`/`khoj` and the `khoj-db-data`/
+   `khoj-home` volumes into a new, separate file,
+   `deploy/compose/khoj.docker-compose.yml`, loaded only with an explicit
+   second `-f` when the `ai` profile is actually wanted. `core` now parses
+   with zero `TC_KHOJ_*` configuration; `ai` still fails clearly (naming the
+   specific missing variable) when its own secrets are absent. A regression
+   check proving both halves - `docker compose --profile core config`
+   succeeds with no Khoj variables set, and the two-file `--profile ai
+   config` fails clearly without them - now runs in `.github/workflows/ci.yml`
+   and both `scripts/check.ps1`/`check.sh` (gated on Docker being installed,
+   matching the other Docker-dependent stages).
+
+   Every doc/script/test that referenced the old single-file `--profile ai`
+   invocation (`env.example`, `tests/contract/khoj/conftest.py`, the CI
+   workflow, both check scripts) was updated to the two-file form.
