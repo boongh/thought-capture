@@ -52,12 +52,17 @@ higher-N rerun of its fabrication-B probe found a reproducible (3/3) defect
 - generated document bodies containing only the ``## Summary`` heading, with
 no content and none of the other three required sections - that left the
 probe's actual question (does it invent an unstated connection) unanswered.
-That candidate is not added here pending further evidence or an owner
-decision; see "What this does not settle" in the evaluation document.
-Organize therefore still runs on the deterministic offline adapter
-(``Settings.uses_offline_model_adapter``). Custom mode exists precisely for
-operating with a model that has not been through this review, at the host's
-own risk.
+**The owner decided (2026-09-02) not to pursue it further: ruled out for
+organize.** Round 6 tried one fresh, previously-untested-for-organize
+candidate, ``ibm-granite/granite-4.2-8b`` (``coreweave/bf16``) - also ruled
+out, on different grounds: both fabrication probes (N=1 each) consumed the
+full 8192-token completion budget in a decoding/repetition loop and never
+produced parseable JSON (~78-80s latency, ~$0.0013/call), so the fabrication
+question itself couldn't be evaluated. See "Round 6" in
+``docs/model-evaluation-organize-select.md``. Organize therefore still runs
+on the deterministic offline adapter (``Settings.uses_offline_model_adapter``).
+Custom mode exists precisely for operating with a model that has not been
+through this review, at the host's own risk.
 """
 
 from __future__ import annotations
