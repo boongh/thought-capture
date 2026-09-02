@@ -81,6 +81,18 @@ async def test_thoughts_page_requires_credentials(api: httpx.AsyncClient) -> Non
     assert response.status_code == 401
 
 
+async def test_debug_index_requires_credentials(api: httpx.AsyncClient) -> None:
+    response = await api.get("/debug")
+    assert response.status_code == 401
+
+
+async def test_debug_index_redirects_to_the_default_page(api: httpx.AsyncClient) -> None:
+    response = await api.get("/debug", headers=BASIC_AUTH)
+    assert response.status_code == 302
+    assert response.headers["location"] == "/debug/thoughts"
+    assert response.headers["cache-control"] == "no-store"
+
+
 async def test_a_missing_credential_prompts_the_browser_for_basic_auth(
     api: httpx.AsyncClient,
 ) -> None:
