@@ -30,11 +30,10 @@ pre { background: #f7f7f7; padding: 1rem; overflow-x: auto; white-space: pre-wra
 """
 
 
-def _page(title: str, active: str, body: str, *, token: str | None) -> str:
+def _page(title: str, active: str, body: str) -> str:
     def link(path: str, label: str) -> str:
         cls = ' class="active"' if active == path else ""
-        href = f"/debug/{path}" + (f"?token={esc(token)}" if token else "")
-        return f'<a href="{href}"{cls}>{label}</a>'
+        return f'<a href="/debug/{path}"{cls}>{label}</a>'
 
     nav = (
         f"<nav>{link('thoughts', 'Thoughts')}"
@@ -52,9 +51,7 @@ def _fmt(value: dt.datetime | dt.date | dt.time | None) -> str:
     return esc(value.isoformat()) if value is not None else ""
 
 
-def thoughts_page(
-    records: list[ThoughtRecord], *, next_cursor: str | None, token: str | None
-) -> str:
+def thoughts_page(records: list[ThoughtRecord], *, next_cursor: str | None) -> str:
     rows = "".join(
         f"<tr><td>{r.id}</td><td>{_fmt(r.client_local_date)} {_fmt(r.client_local_time)}</td>"
         f"<td>{esc(r.source)}</td><td class='body'>{esc(r.body)}</td>"
@@ -67,13 +64,11 @@ def thoughts_page(
     )
     if next_cursor:
         href = f"/debug/thoughts?cursor={esc(next_cursor)}"
-        if token:
-            href += f"&token={esc(token)}"
         table += f'<p><a href="{href}">Next page &rarr;</a></p>'
-    return _page("Raw thoughts", "thoughts", table, token=token)
+    return _page("Raw thoughts", "thoughts", table)
 
 
-def entities_page(records: list[EntityRecord], *, token: str | None) -> str:
+def entities_page(records: list[EntityRecord]) -> str:
     rows = "".join(
         f"<tr><td>{esc(r.canonical_name)}</td><td>{esc(r.entity_type)}</td>"
         f"<td>{esc(', '.join(r.aliases))}</td><td>{r.mention_count}</td>"
@@ -85,12 +80,10 @@ def entities_page(records: list[EntityRecord], *, token: str | None) -> str:
         f"<th>Mentions</th><th>Last mentioned</th><th>Created</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>"
     )
-    return _page("Entities", "entities", table, token=token)
+    return _page("Entities", "entities", table)
 
 
-def digests_page(
-    records: list[DocumentSummary], bodies: dict[uuid.UUID, str], *, token: str | None
-) -> str:
+def digests_page(records: list[DocumentSummary], bodies: dict[uuid.UUID, str]) -> str:
     cards = "".join(
         f"<div class='card'><h2>{esc(r.title)}</h2>"
         f"<p class='meta'>{esc(r.stable_key)} &middot; revision {r.revision_number} "
@@ -101,4 +94,4 @@ def digests_page(
     )
     if not records:
         cards = "<p>No digests yet.</p>"
-    return _page("Daily digests", "digests", cards, token=token)
+    return _page("Daily digests", "digests", cards)

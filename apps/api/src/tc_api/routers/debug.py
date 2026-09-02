@@ -19,33 +19,39 @@ router = APIRouter(prefix="/debug", tags=["debug"], dependencies=[DebugAuthentic
 
 DIGEST_KIND = "daily_digest"
 
+# These pages render raw thoughts and generated documents - personal memory
+# content. A shared or corporate proxy caching that content on disk would be
+# as much a disclosure as logging it; `no-store` forbids any cache (browser
+# or intermediary) from retaining the response at all.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _html(content: str) -> HTMLResponse:
+    return HTMLResponse(content=content, headers=_NO_STORE)
+
 
 @router.get("/thoughts", response_class=HTMLResponse, summary="Raw capture log, with metadata")
 async def debug_thoughts(
-    context: Context,
-    cursor: Annotated[str | None, Query()] = None,
-    token: Annotated[str | None, Query()] = None,
-) -> str:
+    context: Context, cursor: Annotated[str | None, Query()] = None
+) -> HTMLResponse:
     page = await context.reader.list_thoughts(
         context.workspace_id, limit=DEFAULT_PAGE_SIZE, cursor=cursor
     )
-    return debug_templates.thoughts_page(
-        list(page.items), next_cursor=page.next_cursor, token=token
-    )
+    return _html(debug_templates.thoughts_page(list(page.items), next_cursor=page.next_cursor))
 
 
 @router.get("/entities", response_class=HTMLResponse, summary="Resolved entities and aliases")
-async def debug_entities(context: Context, token: Annotated[str | None, Query()] = None) -> str:
+async def debug_entities(context: Context) -> HTMLResponse:
     records = await context.entities.list_entities(context.workspace_id)
-    return debug_templates.entities_page(records, token=token)
+    return _html(debug_templates.entities_page(records))
 
 
 @router.get("/digests", response_class=HTMLResponse, summary="Generated daily digests")
-async def debug_digests(context: Context, token: Annotated[str | None, Query()] = None) -> str:
+async def debug_digests(context: Context) -> HTMLResponse:
     summaries = await context.documents.list_documents(context.workspace_id, kind=DIGEST_KIND)
     bodies = {}
     for summary in summaries:
         detail = await context.documents.get_document(context.workspace_id, summary.id)
         if detail is not None:
             bodies[summary.id] = detail.body_markdown
-    return debug_templates.digests_page(summaries, bodies, token=token)
+    return _html(debug_templates.digests_page(summaries, bodies))

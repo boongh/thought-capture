@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
-from tc_domain.organize import DocumentWrite, OrganizeWriteRequest
+from tc_domain.organize import DocumentWrite, OrganizeWriteRequest, RunOutcome
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.tables import thoughts
@@ -21,6 +21,18 @@ pytestmark = pytest.mark.integration
 
 AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 BODY = "## Summary\n\nsomething"
+
+
+def _outcome() -> RunOutcome:
+    return RunOutcome(
+        model_provider="offline",
+        model_id="offline-model",
+        prompt_version="organize-v1",
+        input_tokens=0,
+        output_tokens=0,
+        context_recall=None,
+        context_degraded=False,
+    )
 
 
 async def _seed_document(
@@ -74,7 +86,10 @@ async def _seed_document(
     )
     writer = PostgresOrganizeWriter(app_session_factory)
     result = await writer.write(
-        workspace_id=WorkspaceId(workspace_id), run_id=run_id, request=request
+        workspace_id=WorkspaceId(workspace_id),
+        run_id=run_id,
+        request=request,
+        outcome=_outcome(),
     )
     return result.document_ids[stable_key]
 

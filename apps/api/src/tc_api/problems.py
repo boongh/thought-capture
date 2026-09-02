@@ -29,6 +29,7 @@ class ProblemError(Exception):
         code: str,
         detail: str | None = None,
         extra: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(detail or title)
         self.status = status
@@ -36,6 +37,9 @@ class ProblemError(Exception):
         self.code = code
         self.detail = detail
         self.extra = extra or {}
+        # e.g. `WWW-Authenticate`, so a 401 can trigger a browser's native
+        # credential prompt rather than only being machine-readable.
+        self.headers = headers
 
 
 def problem_response(request: Request, error: ProblemError) -> JSONResponse:
@@ -49,7 +53,12 @@ def problem_response(request: Request, error: ProblemError) -> JSONResponse:
         body["detail"] = error.detail
     body.update(error.extra)
 
-    return JSONResponse(status_code=error.status, content=body, media_type=PROBLEM_CONTENT_TYPE)
+    return JSONResponse(
+        status_code=error.status,
+        content=body,
+        media_type=PROBLEM_CONTENT_TYPE,
+        headers=error.headers,
+    )
 
 
 def unauthorized(detail: str) -> ProblemError:

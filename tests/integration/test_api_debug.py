@@ -1,7 +1,8 @@
-"""The ``/debug/*`` HTML pages: dual auth (header or ``?token=``) and content."""
+"""The ``/debug/*`` HTML pages: Basic Auth, no-store caching, and content."""
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import uuid
 
@@ -11,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
-from tc_domain.organize import DocumentWrite, OrganizeWriteRequest
+from tc_domain.organize import DocumentWrite, OrganizeWriteRequest, RunOutcome
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.tables import thoughts
@@ -21,6 +22,26 @@ pytestmark = pytest.mark.integration
 
 AUTH = {"Authorization": f"Bearer {API_TOKEN}"}
 BODY = "## Summary\n\nsomething"
+
+
+def _basic_auth(password: str, *, username: str = "operator") -> dict[str, str]:
+    encoded = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return {"Authorization": f"Basic {encoded}"}
+
+
+BASIC_AUTH = _basic_auth(API_TOKEN)
+
+
+def _outcome() -> RunOutcome:
+    return RunOutcome(
+        model_provider="offline",
+        model_id="offline-model",
+        prompt_version="organize-v1",
+        input_tokens=0,
+        output_tokens=0,
+        context_recall=None,
+        context_degraded=False,
+    )
 
 
 async def _thought_row(
@@ -53,12 +74,23 @@ async def _thought_row(
     return ThoughtId(thought_id)
 
 
-async def test_thoughts_page_requires_a_token(api: httpx.AsyncClient) -> None:
+async def test_thoughts_page_requires_credentials(api: httpx.AsyncClient) -> None:
     response = await api.get("/debug/thoughts")
     assert response.status_code == 401
 
 
-async def test_thoughts_page_accepts_the_header_token(
+async def test_a_missing_credential_prompts_the_browser_for_basic_auth(
+    api: httpx.AsyncClient,
+) -> None:
+    """The whole point of Basic Auth here: a browser only shows its native
+    login prompt when it sees ``WWW-Authenticate: Basic`` on a 401.
+    """
+    response = await api.get("/debug/thoughts")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"].lower().startswith("basic")
+
+
+async def test_thoughts_page_accepts_basic_auth_credentials(
     api: httpx.AsyncClient,
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],
@@ -73,21 +105,50 @@ async def test_thoughts_page_accepts_the_header_token(
         source_message_id=unique_message_id,
     )
 
-    response = await api.get("/debug/thoughts", headers=AUTH)
+    response = await api.get("/debug/thoughts", headers=BASIC_AUTH)
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert f"synthetic {unique_message_id}" in response.text
 
 
-async def test_thoughts_page_accepts_the_query_token(api: httpx.AsyncClient) -> None:
-    response = await api.get("/debug/thoughts", params={"token": API_TOKEN})
+async def test_the_username_is_ignored_only_the_password_is_checked(
+    api: httpx.AsyncClient,
+) -> None:
+    response = await api.get(
+        "/debug/thoughts", headers=_basic_auth(API_TOKEN, username="anything-at-all")
+    )
     assert response.status_code == 200
 
 
-async def test_thoughts_page_rejects_a_wrong_token(api: httpx.AsyncClient) -> None:
-    response = await api.get("/debug/thoughts", params={"token": "wrong"})
+async def test_a_bearer_header_alone_is_no_longer_accepted(api: httpx.AsyncClient) -> None:
+    """/v1's Bearer scheme and /debug's Basic Auth are deliberately distinct
+    (docs/adr/0009) - a Bearer header must not satisfy the debug pages.
+    """
+    response = await api.get("/debug/thoughts", headers=AUTH)
     assert response.status_code == 401
+
+
+async def test_the_query_token_scheme_no_longer_authenticates(api: httpx.AsyncClient) -> None:
+    """Superseded (docs/adr/0009): a query-param token was written into
+    uvicorn's access log on every request, which no loopback-only bind
+    prevents. It must not still be a valid way in.
+    """
+    response = await api.get("/debug/thoughts", params={"token": API_TOKEN})
+    assert response.status_code == 401
+
+
+async def test_thoughts_page_rejects_a_wrong_password(api: httpx.AsyncClient) -> None:
+    response = await api.get("/debug/thoughts", headers=_basic_auth("wrong"))
+    assert response.status_code == 401
+
+
+async def test_debug_pages_are_never_cached(api: httpx.AsyncClient) -> None:
+    """Personal memory content must not be retained by a browser or
+    intermediary cache, the same way it must not be logged.
+    """
+    response = await api.get("/debug/thoughts", headers=BASIC_AUTH)
+    assert response.headers["cache-control"] == "no-store"
 
 
 async def test_a_thought_body_with_html_is_escaped_on_the_rendered_page(
@@ -106,14 +167,14 @@ async def test_a_thought_body_with_html_is_escaped_on_the_rendered_page(
         source_message_id=unique_message_id,
     )
 
-    response = await api.get("/debug/thoughts", headers=AUTH)
+    response = await api.get("/debug/thoughts", headers=BASIC_AUTH)
 
     assert payload not in response.text
     assert f"&lt;script&gt;alert(&#x27;{unique_message_id}&#x27;)&lt;/script&gt;" in response.text
 
 
 async def test_entities_page_renders(api: httpx.AsyncClient) -> None:
-    response = await api.get("/debug/entities", headers=AUTH)
+    response = await api.get("/debug/entities", headers=BASIC_AUTH)
     assert response.status_code == 200
     assert "Entities" in response.text
 
@@ -156,9 +217,14 @@ async def test_digests_page_renders_a_written_digest(
         unorganized_thought_ids=(),
     )
     writer = PostgresOrganizeWriter(app_session_factory)
-    await writer.write(workspace_id=WorkspaceId(workspace_id), run_id=run_id, request=request)
+    await writer.write(
+        workspace_id=WorkspaceId(workspace_id),
+        run_id=run_id,
+        request=request,
+        outcome=_outcome(),
+    )
 
-    response = await api_fresh.get("/debug/digests", headers=AUTH)
+    response = await api_fresh.get("/debug/digests", headers=BASIC_AUTH)
 
     assert response.status_code == 200
     assert f"Digest {unique_message_id}" in response.text

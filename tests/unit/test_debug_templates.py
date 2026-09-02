@@ -33,23 +33,27 @@ def a_thought(body: str) -> ThoughtRecord:
 
 def test_a_thought_body_containing_html_is_escaped_not_rendered() -> None:
     record = a_thought("<script>alert(1)</script>")
-    html = debug_templates.thoughts_page([record], next_cursor=None, token=None)
+    html = debug_templates.thoughts_page([record], next_cursor=None)
 
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
 
 def test_thoughts_page_includes_a_next_link_only_when_there_is_a_cursor() -> None:
-    with_cursor = debug_templates.thoughts_page([], next_cursor="abc.1", token=None)
-    without_cursor = debug_templates.thoughts_page([], next_cursor=None, token=None)
+    with_cursor = debug_templates.thoughts_page([], next_cursor="abc.1")
+    without_cursor = debug_templates.thoughts_page([], next_cursor=None)
 
     assert "cursor=abc.1" in with_cursor
     assert "Next page" not in without_cursor
 
 
-def test_the_token_is_carried_into_pagination_and_nav_links() -> None:
-    html = debug_templates.thoughts_page([], next_cursor="abc.1", token="secret-token")
-    assert "token=secret-token" in html
+def test_nav_and_pagination_links_never_carry_a_secret() -> None:
+    """Basic Auth credentials are cached by the browser per-origin - unlike
+    the query-param token this replaced, no page-rendered link ever needs
+    to carry the secret, so none of them may.
+    """
+    html = debug_templates.thoughts_page([], next_cursor="abc.1")
+    assert "token=" not in html
 
 
 def test_an_entity_with_a_malicious_alias_is_escaped() -> None:
@@ -63,14 +67,14 @@ def test_an_entity_with_a_malicious_alias_is_escaped() -> None:
         last_mentioned_at=CREATED_AT,
         created_at=CREATED_AT,
     )
-    html = debug_templates.entities_page([record], token=None)
+    html = debug_templates.entities_page([record])
 
     assert "<img src=x onerror=alert(1)>" not in html
     assert "&lt;img src=x onerror=alert(1)&gt;" in html
 
 
 def test_digests_page_shows_a_placeholder_when_there_are_none() -> None:
-    html = debug_templates.digests_page([], {}, token=None)
+    html = debug_templates.digests_page([], {})
     assert "No digests yet." in html
 
 
@@ -86,7 +90,7 @@ def test_a_digest_body_is_escaped_inside_the_preformatted_block() -> None:
         updated_at=CREATED_AT,
     )
     bodies = {document_id: "## Summary\n\n<script>evil()</script>"}
-    html = debug_templates.digests_page([summary], bodies, token=None)
+    html = debug_templates.digests_page([summary], bodies)
 
     assert "<script>evil()</script>" not in html
     assert "&lt;script&gt;evil()&lt;/script&gt;" in html
