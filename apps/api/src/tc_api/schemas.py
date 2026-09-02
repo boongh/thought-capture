@@ -7,9 +7,12 @@ never accepted from the client: it comes from authentication.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from pydantic import BaseModel, Field
 
+from tc_infrastructure.db.document_reader import DocumentDetail, DocumentSummary
+from tc_infrastructure.db.entity_reader import EntityRecord
 from tc_infrastructure.db.thought_reader import ThoughtPage, ThoughtRecord
 
 
@@ -110,6 +113,94 @@ class ThoughtListResponse(BaseModel):
             items=[ThoughtResponse.of(record) for record in page.items],
             next_cursor=page.next_cursor,
         )
+
+
+class DocumentSummaryResponse(BaseModel):
+    id: uuid.UUID
+    kind: str
+    stable_key: str
+    title: str
+    revision_number: int
+    change_summary: str
+    updated_at: dt.datetime
+
+    @classmethod
+    def of(cls, record: DocumentSummary) -> DocumentSummaryResponse:
+        return cls(
+            id=record.id,
+            kind=record.kind,
+            stable_key=record.stable_key,
+            title=record.title,
+            revision_number=record.revision_number,
+            change_summary=record.change_summary,
+            updated_at=record.updated_at,
+        )
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentSummaryResponse]
+
+    @classmethod
+    def of(cls, records: list[DocumentSummary]) -> DocumentListResponse:
+        return cls(items=[DocumentSummaryResponse.of(r) for r in records])
+
+
+class DocumentDetailResponse(BaseModel):
+    id: uuid.UUID
+    kind: str
+    stable_key: str
+    title: str
+    revision_number: int
+    body_markdown: str
+    change_summary: str
+    updated_at: dt.datetime
+    source_thought_ids: list[int]
+
+    @classmethod
+    def of(cls, record: DocumentDetail) -> DocumentDetailResponse:
+        return cls(
+            id=record.id,
+            kind=record.kind,
+            stable_key=record.stable_key,
+            title=record.title,
+            revision_number=record.revision_number,
+            body_markdown=record.body_markdown,
+            change_summary=record.change_summary,
+            updated_at=record.updated_at,
+            source_thought_ids=list(record.source_thought_ids),
+        )
+
+
+class EntityResponse(BaseModel):
+    id: uuid.UUID
+    entity_type: str
+    canonical_name: str
+    stable_key: str
+    aliases: list[str]
+    mention_count: int
+    last_mentioned_at: dt.datetime | None
+    created_at: dt.datetime
+
+    @classmethod
+    def of(cls, record: EntityRecord) -> EntityResponse:
+        return cls(
+            id=record.id,
+            entity_type=record.entity_type,
+            canonical_name=record.canonical_name,
+            stable_key=record.stable_key,
+            aliases=list(record.aliases),
+            mention_count=record.mention_count,
+            last_mentioned_at=record.last_mentioned_at,
+            created_at=record.created_at,
+        )
+
+
+class EntityListResponse(BaseModel):
+    items: list[EntityResponse]
+
+    @classmethod
+    def of(cls, records: list[EntityRecord]) -> EntityListResponse:
+        return cls(items=[EntityResponse.of(r) for r in records])
 
 
 class HealthResponse(BaseModel):

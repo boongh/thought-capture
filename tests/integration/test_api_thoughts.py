@@ -9,68 +9,16 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tc_api.app import create_app
-from tc_api.dependencies import ApiContext
-from tc_application.capture import CaptureThought
-from tc_domain.capture import UserId, WorkspaceId
-from tc_domain.policy import AttachmentPolicy
-from tc_infrastructure.config import Settings
-from tc_infrastructure.db.outbox import PostgresOutbox
-from tc_infrastructure.db.thought_reader import PostgresThoughtReader
-from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
-from tests.unit.fakes import FakeAttachmentArchive
+from tests.integration.conftest import API_TOKEN
 
 pytestmark = pytest.mark.integration
 
-TOKEN = "test-bearer-token-value"
+TOKEN = API_TOKEN
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-
-
-@pytest.fixture
-async def api(
-    app_session_factory: async_sessionmaker[AsyncSession],
-    seeded_identity: tuple[uuid.UUID, uuid.UUID],
-) -> AsyncIterator[httpx.AsyncClient]:
-    """The real app, wired to the test database with a known bearer token.
-
-    The lifespan is replaced so the test does not depend on a seeded Discord
-    identity or a live HTTP client; everything else is the production code path.
-    """
-    workspace_id, user_id = seeded_identity
-    settings = Settings(_env_file=None, api_bearer_token=TOKEN, workspace_timezone="Asia/Bangkok")
-
-    context = ApiContext(
-        settings=settings,
-        capture=CaptureThought(
-            PostgresThoughtRepository(app_session_factory),
-            FakeAttachmentArchive(),
-            AttachmentPolicy(max_bytes=1024),
-        ),
-        reader=PostgresThoughtReader(app_session_factory),
-        outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
-        session_factory=app_session_factory,
-        workspace_id=WorkspaceId(workspace_id),
-        user_id=UserId(user_id),
-    )
-
-    @asynccontextmanager
-    async def no_startup(_: object) -> AsyncIterator[None]:
-        """Skip the production lifespan; the context is injected below."""
-        yield
-
-    app = create_app(lifespan_handler=no_startup)
-    app.state.context = context
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
 
 
 def a_key() -> str:

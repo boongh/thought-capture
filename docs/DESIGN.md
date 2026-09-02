@@ -1,8 +1,8 @@
 # Thought Capture AI - System Design
 
 - **Status:** Accepted implementation anchor
-- **Version:** 1.5
-- **Date:** 2026-09-01
+- **Version:** 1.6
+- **Date:** 2026-09-02
 - **Audience:** Small experienced engineering team
 - **Owner:** Project owner
 
@@ -52,7 +52,10 @@ The product goal is to make capture nearly effortless while moving structure, en
 ### 2.2 Non-goals for Release 1
 
 - Multi-user authentication, collaboration, or sharing in production.
-- A custom browser UI.
+- A custom browser UI. (`docs/adr/0009` adds a minimal, loopback-only, read-only
+  operator debug view - three plain HTML pages behind the existing bearer
+  token - which this non-goal does not cover; it is not a step toward 4.4's
+  future unified interface.)
 - Voice capture or transcription.
 - OCR, image understanding, attachment semantic indexing, or media generation.
 - Automatic deletion or LLM rewriting of raw thoughts.
