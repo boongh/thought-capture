@@ -26,6 +26,7 @@ from tc_domain.digest import DigestContent
 from tc_domain.digest_ports import PendingDigest
 from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
+from tc_domain.search import SearchPage, SearchQuery
 
 
 class FakeThoughtRepository:
@@ -117,6 +118,23 @@ class FakeContextIndex:
         self, workspace_id: WorkspaceId, stable_keys: frozenset[str]
     ) -> dict[str, str]:
         return {key: body for key, body in self.bodies.items() if key in stable_keys}
+
+
+class FakeExactSearch:
+    """Records the query it was given and returns whatever the test set up.
+
+    Real filtering/ranking is PostgreSQL's job (``PostgresExactSearch``,
+    proven by integration tests); this fake exists to drive the ``Search``
+    use case's mode-gating, not to re-prove the query.
+    """
+
+    def __init__(self, page: SearchPage | None = None) -> None:
+        self.page = page if page is not None else SearchPage(items=(), next_cursor=None)
+        self.calls: list[tuple[WorkspaceId, SearchQuery]] = []
+
+    async def search(self, workspace_id: WorkspaceId, query: SearchQuery) -> SearchPage:
+        self.calls.append((workspace_id, query))
+        return self.page
 
 
 class FakeOrganizeWriter:
