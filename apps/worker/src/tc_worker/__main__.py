@@ -32,7 +32,7 @@ from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.windows import PostgresCaptureWindows
-from tc_infrastructure.llm.factory import build_organize_provider
+from tc_infrastructure.llm.factory import build_organize_provider, build_select_provider
 from tc_infrastructure.runtime import run
 from tc_worker.scheduler import OrganizeScheduler
 
@@ -75,6 +75,7 @@ async def serve(settings: Settings) -> None:
             thoughts=thoughts,
             context_index=PostgresContextIndex(sessions),
             provider=build_organize_provider(settings),
+            select_provider=build_select_provider(settings),
             journal_factory=_journal_factory(journal),
             writer=PostgresOrganizeWriter(sessions, entities=PostgresEntityRepository()),
             run_ledger=PostgresRunLedger(sessions),

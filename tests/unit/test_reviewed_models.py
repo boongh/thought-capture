@@ -26,18 +26,29 @@ def test_every_entry_records_at_least_one_reviewed_provider() -> None:
         assert entry.providers, f"{entry.model_id} has no reviewed provider recorded"
 
 
-def test_the_allowlist_is_currently_empty() -> None:
-    """qwen/qwen3.8-flash, the one staged candidate, was removed 2026-09-01.
+def test_organize_has_no_reviewed_candidate() -> None:
+    """Round 4's organize recommendation did not survive round 5's higher-N retest.
 
-    Its only OpenRouter endpoint (Alibaba) is not on OpenRouter's
-    zero-data-retention endpoint list, and Alibaba's raw API-traffic
-    retention policy was never independently confirmed - so it did not
-    actually meet the "private" bar this registry exists to enforce. See
-    ``reviewed_models.py``'s module docstring and docs/adr/0006. Safe mode
-    with an empty allowlist runs organize/query-plan on the offline adapter
-    rather than admit an unconfirmed-retention model on trust.
+    ``meta-llama/llama-4-maverick`` (docs/model-evaluation-organize-select.md)
+    surfaced a reproducible structural defect under higher-N testing and was
+    not added to the registry pending further evidence or an owner decision.
+    Safe mode with no reviewed organize candidate runs organize on the
+    offline adapter rather than admit an unresolved candidate on trust.
     """
-    assert REVIEWED_MODELS == {}
+    assert "meta-llama/llama-4-maverick" not in REVIEWED_MODELS
+
+
+def test_select_has_exactly_one_reviewed_candidate() -> None:
+    """upstage/solar-pro4 is the first model to pass all three review bars.
+
+    See ``reviewed_models.py``'s module docstring and
+    docs/model-evaluation-organize-select.md for the five-round evaluation
+    this entry is based on.
+    """
+    assert set(REVIEWED_MODELS) == {"upstage/solar-pro4"}
+    entry = REVIEWED_MODELS["upstage/solar-pro4"]
+    assert entry.supports_strict_schema is True
+    assert entry.providers == frozenset({"upstage/zdr"})
 
 
 def test_a_reviewed_model_records_all_required_fields() -> None:

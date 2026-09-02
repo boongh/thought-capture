@@ -22,6 +22,7 @@ from tc_domain.capture import UserId, WorkspaceId
 from tc_infrastructure.config import Settings
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
+from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 
@@ -36,6 +37,7 @@ class ApiContext:
     documents: PostgresDocumentReader
     entities: PostgresEntityReader
     search: Search
+    llm_calls: PostgresLlmCallReader
     outbox: PostgresOutbox
     session_factory: async_sessionmaker[AsyncSession]
     workspace_id: WorkspaceId

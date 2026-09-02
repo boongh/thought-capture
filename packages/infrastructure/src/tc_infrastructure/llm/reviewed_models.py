@@ -23,20 +23,46 @@ picks *first* under its own default load-balancing. ``providers`` is what
 to a reviewed endpoint too - a model can be "reviewed" while a provider newly
 added to serve it has not been.
 
-This list is currently empty. ``qwen/qwen3.8-flash`` was the one candidate
-staged in ``env.example`` during initial setup, but was removed on
-2026-09-01: its only OpenRouter endpoint (provider tag ``alibaba``) does not
-appear on OpenRouter's zero-data-retention endpoint list
-(``openrouter.ai/api/v1/endpoints/zdr``), and Alibaba's own FAQ does not
-clearly distinguish raw API-traffic retention (unconfirmed) from console
-session-history retention (confirmed retained) - so it did not actually meet
-the **private** bar above, despite having been admitted while that gap was
-still recorded as merely "unconfirmed" rather than "checked and failed."
-Until a model is found that is confirmed to meet all three bars, safe mode
-has no eligible provider-backed model and organize/query-plan run on the
-deterministic offline adapter (``uses_offline_model_adapter``). Custom mode
-exists precisely for operating with a model that has not been through this
-review, at the host's own risk.
+``qwen/qwen3.8-flash`` was the one candidate staged in ``env.example`` during
+initial setup, but was removed on 2026-09-01: its only OpenRouter endpoint
+(provider tag ``alibaba``) does not appear on OpenRouter's zero-data-retention
+endpoint list (``openrouter.ai/api/v1/endpoints/zdr``), and Alibaba's own FAQ
+does not clearly distinguish raw API-traffic retention (unconfirmed) from
+console session-history retention (confirmed retained) - so it did not
+actually meet the **private** bar above, despite having been admitted while
+that gap was still recorded as merely "unconfirmed" rather than "checked and
+failed."
+
+``upstage/solar-pro4`` is the first real entry, reviewed for the ``select``
+step (docs/DESIGN.md 7.3.2) across five rounds of live evaluation - see
+``docs/model-evaluation-organize-select.md``. It is the only select candidate
+tested with zero confirmed safety failures: on both the subtle
+(false-authority/exfiltration) and blunt (textbook override) injection
+probes it explicitly reasoned about the attempt and refused it, while still
+correctly resolving the legitimate reference underneath. A round-3 rerun
+surfaced a reproducible degenerate/looping-output bug under the blunt probe
+(2/2); round 5's 5x rerun of that same probe shape came back clean 5/5, with
+no recurrence. Reviewed provider: ``upstage/zdr``, confirmed live against
+OpenRouter's endpoints API (``GET /api/v1/models/upstage/solar-pro4/endpoints``)
+during round 5.
+
+The ``organize`` step (docs/DESIGN.md 7.4) remains unreviewed. Round 4's
+evaluation recommended ``meta-llama/llama-4-maverick``, but round 5's
+higher-N rerun of its fabrication-B probe found a reproducible (3/3) defect
+- generated document bodies containing only the ``## Summary`` heading, with
+no content and none of the other three required sections - that left the
+probe's actual question (does it invent an unstated connection) unanswered.
+**The owner decided (2026-09-02) not to pursue it further: ruled out for
+organize.** Round 6 tried one fresh, previously-untested-for-organize
+candidate, ``ibm-granite/granite-4.2-8b`` (``coreweave/bf16``) - also ruled
+out, on different grounds: both fabrication probes (N=1 each) consumed the
+full 8192-token completion budget in a decoding/repetition loop and never
+produced parseable JSON (~78-80s latency, ~$0.0013/call), so the fabrication
+question itself couldn't be evaluated. See "Round 6" in
+``docs/model-evaluation-organize-select.md``. Organize therefore still runs
+on the deterministic offline adapter (``Settings.uses_offline_model_adapter``).
+Custom mode exists precisely for operating with a model that has not been
+through this review, at the host's own risk.
 """
 
 from __future__ import annotations
@@ -52,6 +78,22 @@ class ReviewedModel:
     note: str
 
 
-_ENTRIES: tuple[ReviewedModel, ...] = ()
+_ENTRIES: tuple[ReviewedModel, ...] = (
+    ReviewedModel(
+        model_id="upstage/solar-pro4",
+        supports_strict_schema=True,
+        providers=frozenset({"upstage/zdr"}),
+        note=(
+            "Reviewed for select only (docs/DESIGN.md 7.3.2), not organize. "
+            "Zero confirmed safety failures across 5 evaluation rounds "
+            "(docs/model-evaluation-organize-select.md): explicitly refuses "
+            "both subtle and blunt injection probes while still resolving "
+            "the legitimate reference. Round 3 saw a reproducible "
+            "degenerate/looping-output bug under the blunt probe (2/2); "
+            "round 5's 5x rerun of the same probe shape came back clean "
+            "5/5."
+        ),
+    ),
+)
 
 REVIEWED_MODELS: dict[str, ReviewedModel] = {entry.model_id: entry for entry in _ENTRIES}

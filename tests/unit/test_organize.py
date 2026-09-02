@@ -10,7 +10,8 @@ import pytest
 
 from tc_application.organize import OrganizeWindow
 from tc_domain.capture import ThoughtId, WorkspaceId
-from tc_domain.llm import LLMError, LLMRequest, LLMResponse
+from tc_domain.context import Tier1Row
+from tc_domain.llm import LLMError, LLMRequest, LLMResponse, LLMStep
 from tc_domain.organize import OrganizeCoverageError, WindowThought, WindowTooLargeError
 from tc_domain.windows import CaptureWindow
 from tc_infrastructure.llm.offline import OfflineLLMProvider
@@ -43,6 +44,7 @@ def make_pipeline(
     *,
     thoughts: list[WindowThought],
     provider: object,
+    select_provider: object | None = None,
     context_index: FakeContextIndex | None = None,
     writer: FakeOrganizeWriter | None = None,
     run_ledger: FakeRunLedger | None = None,
@@ -57,6 +59,7 @@ def make_pipeline(
         thoughts=FakeThoughtWindowReader(thoughts),
         context_index=context_index or FakeContextIndex(),
         provider=provider,  # type: ignore[arg-type]
+        select_provider=select_provider,  # type: ignore[arg-type]
         journal_factory=journal_factory,
         writer=writer,
         run_ledger=run_ledger,
@@ -121,6 +124,109 @@ async def test_the_happy_path_writes_and_marks_the_run_succeeded() -> None:
     assert len(writer.outcomes) == 1
     assert run_ledger.succeeded == []
     assert run_ledger.failed == []
+
+
+async def test_the_select_call_uses_the_dedicated_select_provider() -> None:
+    """organize and select are independently pinned models (docs/DESIGN.md 11):
+    the select call must go to `select_provider`, never `provider`, when the
+    two differ.
+    """
+    organize_reply = json.dumps(
+        {
+            "documents": [
+                {
+                    "stable_key": "daily_digest:2026-08-31",
+                    "kind": "daily_digest",
+                    "title": "Daily digest",
+                    "body_markdown": "## Summary\n\nWalked.\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- walked",
+                    "source_thought_ids": [1],
+                    "mentioned_entities": [],
+                    "change_summary": "first digest",
+                    "confidence": 1.0,
+                }
+            ],
+            "unorganized_thought_ids": [],
+            "referenced_document_keys": [],
+        }
+    )
+    select_reply = json.dumps({"stable_keys": [], "reasoning": ""})
+    organize_provider = OfflineLLMProvider(
+        responder=lambda _req: organize_reply, model_id="offline/organize"
+    )
+    select_provider = OfflineLLMProvider(
+        responder=lambda _req: select_reply, model_id="offline/select"
+    )
+    index = (
+        Tier1Row(
+            stable_key="project:aurora",
+            entity_type="project",
+            canonical_name="Aurora",
+            aliases=(),
+            summary="",
+            last_mentioned_at=None,
+            open_thread_count=0,
+        ),
+    )
+    pipeline, _writer, _run_ledger = make_pipeline(
+        thoughts=[a_thought(1)],
+        provider=organize_provider,
+        select_provider=select_provider,
+        context_index=FakeContextIndex(index=index),
+    )
+
+    await pipeline(WORKSPACE, WINDOW)
+
+    assert [r.step for r in select_provider.calls] == [LLMStep.SELECT]
+    assert [r.step for r in organize_provider.calls] == [LLMStep.ORGANIZE]
+
+
+async def test_the_select_call_falls_back_to_the_organize_provider_when_unset() -> None:
+    """No select_provider given -> both calls share `provider`, matching every
+    pre-existing call site that only ever passed one provider."""
+    organize_reply = json.dumps(
+        {
+            "documents": [
+                {
+                    "stable_key": "daily_digest:2026-08-31",
+                    "kind": "daily_digest",
+                    "title": "Daily digest",
+                    "body_markdown": "## Summary\n\nWalked.\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- walked",
+                    "source_thought_ids": [1],
+                    "mentioned_entities": [],
+                    "change_summary": "first digest",
+                    "confidence": 1.0,
+                }
+            ],
+            "unorganized_thought_ids": [],
+            "referenced_document_keys": [],
+        }
+    )
+    select_reply = json.dumps({"stable_keys": [], "reasoning": ""})
+
+    def responder(request: LLMRequest) -> str:
+        return select_reply if request.step == LLMStep.SELECT else organize_reply
+
+    provider = OfflineLLMProvider(responder=responder)
+    index = (
+        Tier1Row(
+            stable_key="project:aurora",
+            entity_type="project",
+            canonical_name="Aurora",
+            aliases=(),
+            summary="",
+            last_mentioned_at=None,
+            open_thread_count=0,
+        ),
+    )
+    pipeline, _writer, _run_ledger = make_pipeline(
+        thoughts=[a_thought(1)],
+        provider=provider,
+        context_index=FakeContextIndex(index=index),
+    )
+
+    await pipeline(WORKSPACE, WINDOW)
+
+    assert {r.step for r in provider.calls} == {LLMStep.SELECT, LLMStep.ORGANIZE}
 
 
 async def test_incomplete_coverage_fails_the_run_and_raises() -> None:
