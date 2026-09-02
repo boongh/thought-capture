@@ -19,8 +19,9 @@ from fastapi.responses import JSONResponse
 
 from tc_api.dependencies import ApiContext
 from tc_api.problems import ProblemError, problem_response
-from tc_api.routers import debug, documents, entities, health, thoughts
+from tc_api.routers import debug, documents, entities, health, search, thoughts
 from tc_application.capture import CaptureThought
+from tc_application.search import Search
 from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
@@ -28,6 +29,7 @@ from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
 from tc_infrastructure.db.identity import resolve_identity
 from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
@@ -65,6 +67,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         reader=PostgresThoughtReader(sessions),
         documents=PostgresDocumentReader(sessions),
         entities=PostgresEntityReader(sessions),
+        search=Search(PostgresExactSearch(sessions)),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         session_factory=sessions,
         workspace_id=identity.workspace_id,
@@ -125,5 +128,6 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
     app.include_router(thoughts.router)
     app.include_router(documents.router)
     app.include_router(entities.router)
+    app.include_router(search.router)
     app.include_router(debug.router)
     return app

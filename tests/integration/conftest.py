@@ -29,12 +29,14 @@ from sqlalchemy.pool import NullPool
 from tc_api.app import create_app
 from tc_api.dependencies import ApiContext
 from tc_application.capture import CaptureThought
+from tc_application.search import Search
 from tc_domain.capture import UserId, WorkspaceId
 from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
 from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
 from tests.integration.support import CONNECT_ARGS
@@ -296,6 +298,7 @@ async def _api_client(
         reader=PostgresThoughtReader(app_session_factory),
         documents=PostgresDocumentReader(app_session_factory),
         entities=PostgresEntityReader(app_session_factory),
+        search=Search(PostgresExactSearch(app_session_factory)),
         outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
         session_factory=app_session_factory,
         workspace_id=WorkspaceId(workspace_id),

@@ -145,6 +145,9 @@ document_revisions = sa.Table(
     sa.Column("change_summary", sa.Text, nullable=False),
     sa.Column("change_kind", sa.Text, nullable=False),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    # Generated STORED (migration 0006); read-only from the application's
+    # point of view, like thoughts.body_tsv above.
+    sa.Column("body_tsv", pg.TSVECTOR),
 )
 
 revision_sources = sa.Table(

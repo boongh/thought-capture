@@ -11,6 +11,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from tc_domain.search import SearchPage, SearchResult
 from tc_infrastructure.db.document_reader import DocumentDetail, DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
 from tc_infrastructure.db.thought_reader import ThoughtPage, ThoughtRecord
@@ -201,6 +202,52 @@ class EntityListResponse(BaseModel):
     @classmethod
     def of(cls, records: list[EntityRecord]) -> EntityListResponse:
         return cls(items=[EntityResponse.of(r) for r in records])
+
+
+class SearchResultResponse(BaseModel):
+    result_id: str
+    document_id: uuid.UUID
+    revision_id: uuid.UUID
+    thought_ids: list[int]
+    kind: str
+    title: str
+    snippet: str
+    updated_at: dt.datetime
+    entities: list[str]
+    channels: list[str]
+    rank: float
+
+    @classmethod
+    def of(cls, record: SearchResult) -> SearchResultResponse:
+        return cls(
+            result_id=record.result_id,
+            document_id=record.document_id,
+            revision_id=record.revision_id,
+            thought_ids=[int(t) for t in record.thought_ids],
+            kind=record.kind,
+            title=record.title,
+            snippet=record.snippet,
+            updated_at=record.updated_at,
+            entities=list(record.entities),
+            channels=list(record.channels),
+            rank=record.rank,
+        )
+
+
+class SearchResponse(BaseModel):
+    items: list[SearchResultResponse]
+    next_cursor: str | None = Field(
+        default=None, description="Opaque. Pass as `cursor` for the next page; null when exhausted."
+    )
+    degraded: bool = Field(description="True only when a requested channel could not run at all.")
+
+    @classmethod
+    def of(cls, page: SearchPage) -> SearchResponse:
+        return cls(
+            items=[SearchResultResponse.of(r) for r in page.items],
+            next_cursor=page.next_cursor,
+            degraded=page.degraded,
+        )
 
 
 class HealthResponse(BaseModel):
