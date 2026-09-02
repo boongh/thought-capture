@@ -65,6 +65,7 @@ class PostgresContextIndex:
                 summary=_extract_summary(bodies.get(stable_keys[row.id], "")),
                 last_mentioned_at=last_mentioned.get(row.id),
                 open_thread_count=open_threads.get(row.id, 0),
+                body_tokens=_estimate_tokens(bodies.get(stable_keys[row.id], "")),
             )
             for row in entity_rows
         )
@@ -102,10 +103,24 @@ class PostgresContextIndex:
     async def _last_mentioned_at(
         self, session: AsyncSession, entity_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, dt.datetime]:
+        """The most recent capture window each entity was mentioned in.
+
+        ``runs.window_end`` - not ``runs.created_at`` - is the actual time
+        the mentioning content was captured. They coincide for a run
+        processed promptly, but diverge for a worker catching up on a
+        backlog of missed windows on startup: every backlogged run gets a
+        ``created_at`` clustered around the catch-up moment, which would
+        mark historically unrelated entities "recently mentioned" and pull
+        their full bodies into unrelated future organize prompts (the
+        ``recency`` signal). ``window_end`` is only null for a run with no
+        window at all (not the organize pipeline's own runs, but tolerated
+        here defensively), where ``created_at`` is the only time available.
+        """
         rows = (
             await session.execute(
                 sa.text("""
-                    SELECT em.entity_id AS entity_id, MAX(r.created_at) AS last_mentioned_at
+                    SELECT em.entity_id AS entity_id,
+                           MAX(COALESCE(r.window_end, r.created_at)) AS last_mentioned_at
                     FROM entity_mentions em
                     JOIN runs r ON r.id = em.run_id
                     WHERE em.entity_id = ANY(:entity_ids)
@@ -171,3 +186,15 @@ def _extract_summary(body: str) -> str:
     end = body.find(_NEXT_SECTION, start)
     section = body[start:] if end == -1 else body[start:end]
     return section.strip()
+
+
+def _estimate_tokens(body: str) -> int:
+    """Rough token count for budgeting (docs/DESIGN.md 7.3.6).
+
+    Same chars-per-4 approximation ``tc_infrastructure.llm.offline`` already
+    uses for cost-budget plumbing - counting real tokens needs the target
+    model's tokenizer, which this codebase does not otherwise depend on, and
+    the budget this feeds is itself an approximate cost/privacy envelope, not
+    a hard provider limit.
+    """
+    return len(body) // 4

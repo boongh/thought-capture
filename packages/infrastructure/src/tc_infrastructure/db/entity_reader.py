@@ -107,28 +107,53 @@ class PostgresEntityReader:
         thresholds: EntityResolutionThresholds | None = None,
         limit: int = 50,
     ) -> list[ReviewCandidate]:
-        """Entity pairs in the ambiguous band: close, but not auto-merged."""
+        """Entity pairs in the ambiguous band: close, but not auto-merged.
+
+        Compares every name each entity is known by - its canonical name
+        *and* its aliases - the same ``GREATEST(canonical, alias)`` relation
+        ``PostgresEntityRepository.resolve_mention`` uses to decide MERGE
+        vs. AMBIGUOUS. A canonical-name-only comparison would miss a pair
+        that only resolve_mention's alias check flagged as ambiguous, so it
+        could never appear here for a human to review (docs/DESIGN.md 6.4).
+        """
         bounds = thresholds or EntityResolutionThresholds()
         async with self._session_factory() as session:
             rows = (
                 await session.execute(
                     sa.text("""
+                        WITH names AS (
+                            SELECT id AS entity_id, workspace_id, entity_type, normalized_name
+                            FROM entities
+                            UNION ALL
+                            SELECT ea.entity_id, e.workspace_id, e.entity_type, ea.normalized_alias
+                            FROM entity_aliases ea
+                            JOIN entities e ON e.id = ea.entity_id
+                        ),
+                        pair_scores AS (
+                            SELECT
+                                a.entity_id AS entity_a,
+                                b.entity_id AS entity_b,
+                                a.workspace_id AS workspace_id,
+                                a.entity_type AS entity_type,
+                                MAX(similarity(a.normalized_name, b.normalized_name)) AS score
+                            FROM names a
+                            JOIN names b
+                              ON a.workspace_id = b.workspace_id
+                             AND a.entity_type = b.entity_type
+                             AND a.entity_id < b.entity_id
+                            GROUP BY a.entity_id, b.entity_id, a.workspace_id, a.entity_type
+                        )
                         SELECT
-                            a.id AS entity_a, a.canonical_name AS name_a,
-                            b.id AS entity_b, b.canonical_name AS name_b,
-                            a.entity_type AS entity_type,
-                            similarity(a.normalized_name, b.normalized_name) AS score
-                        FROM entities a
-                        JOIN entities b
-                          ON a.workspace_id = b.workspace_id
-                         AND a.entity_type = b.entity_type
-                         AND a.id < b.id
-                        WHERE a.workspace_id = :workspace_id
-                          AND similarity(a.normalized_name, b.normalized_name)
-                              >= :floor
-                          AND similarity(a.normalized_name, b.normalized_name)
-                              < :merge_at
-                        ORDER BY score DESC
+                            ps.entity_a AS entity_a, ea_ent.canonical_name AS name_a,
+                            ps.entity_b AS entity_b, eb_ent.canonical_name AS name_b,
+                            ps.entity_type AS entity_type, ps.score AS score
+                        FROM pair_scores ps
+                        JOIN entities ea_ent ON ea_ent.id = ps.entity_a
+                        JOIN entities eb_ent ON eb_ent.id = ps.entity_b
+                        WHERE ps.workspace_id = :workspace_id
+                          AND ps.score >= :floor
+                          AND ps.score < :merge_at
+                        ORDER BY ps.score DESC
                         LIMIT :limit
                     """),
                     {
