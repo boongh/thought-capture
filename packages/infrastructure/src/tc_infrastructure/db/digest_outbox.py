@@ -31,6 +31,7 @@ class PostgresDigestOutbox:
                 pending.append(
                     PendingDigest(
                         event_id=event.id,
+                        workspace_id=event.workspace_id,
                         run_id=uuid.UUID(str(event.payload["run_id"])),
                         document_id=uuid.UUID(str(event.payload["document_id"])),
                         revision_id=uuid.UUID(str(event.payload["revision_id"])),

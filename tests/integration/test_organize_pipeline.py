@@ -196,12 +196,16 @@ async def test_a_window_is_organized_into_a_digest_and_a_project_document(
 
     run_id = await pipeline(workspace, window)
 
+    # The digest's stable_key is forced to the window-end timestamp
+    # (docs/DESIGN.md 8.3), never whatever the model proposed - see
+    # `_to_write_request` - so it is looked up that way here too.
     async with app_session_factory() as session:
         run = (await session.execute(sa.select(runs).where(runs.c.id == run_id))).one()
         digest = (
             await session.execute(
                 sa.select(documents).where(
-                    documents.c.workspace_id == workspace, documents.c.stable_key == digest_key
+                    documents.c.workspace_id == workspace,
+                    documents.c.stable_key == end.isoformat(),
                 )
             )
         ).one()
@@ -275,6 +279,16 @@ async def test_a_named_reference_is_found_by_the_alias_signal_on_a_later_run(
             {
                 "documents": [
                     {
+                        "stable_key": "daily_digest:day1",
+                        "kind": "daily_digest",
+                        "title": "Daily digest",
+                        "body_markdown": DIGEST_BODY.format(name=project_name),
+                        "source_thought_ids": [day1_thought_id],
+                        "mentioned_entities": [],
+                        "change_summary": "first digest",
+                        "confidence": 1.0,
+                    },
+                    {
                         "stable_key": project_key,
                         "kind": "project",
                         "title": project_name,
@@ -290,7 +304,7 @@ async def test_a_named_reference_is_found_by_the_alias_signal_on_a_later_run(
                         ],
                         "change_summary": "created",
                         "confidence": 1.0,
-                    }
+                    },
                 ],
                 "unorganized_thought_ids": [],
                 "referenced_document_keys": [],
@@ -326,6 +340,16 @@ async def test_a_named_reference_is_found_by_the_alias_signal_on_a_later_run(
             {
                 "documents": [
                     {
+                        "stable_key": "daily_digest:day2",
+                        "kind": "daily_digest",
+                        "title": "Daily digest",
+                        "body_markdown": DIGEST_BODY.format(name=project_name),
+                        "source_thought_ids": [day2_thought_id],
+                        "mentioned_entities": [],
+                        "change_summary": "second digest",
+                        "confidence": 1.0,
+                    },
+                    {
                         "stable_key": project_key,
                         "kind": "project",
                         "title": project_name,
@@ -341,7 +365,7 @@ async def test_a_named_reference_is_found_by_the_alias_signal_on_a_later_run(
                         ],
                         "change_summary": "updated",
                         "confidence": 1.0,
-                    }
+                    },
                 ],
                 "unorganized_thought_ids": [],
                 "referenced_document_keys": [project_key],

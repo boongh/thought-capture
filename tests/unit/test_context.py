@@ -26,6 +26,7 @@ def row(
     last_mentioned_at: dt.datetime | None = None,
     open_thread_count: int = 0,
     summary: str = "",
+    body_tokens: int = 0,
 ) -> Tier1Row:
     return Tier1Row(
         stable_key=stable_key,
@@ -35,6 +36,7 @@ def row(
         summary=summary,
         last_mentioned_at=last_mentioned_at,
         open_thread_count=open_thread_count,
+        body_tokens=body_tokens,
     )
 
 
@@ -54,6 +56,22 @@ class TestAliasSignal:
     def test_is_accent_and_case_insensitive(self) -> None:
         index = (row("person:jose", canonical_name="José"),)
         assert alias_signal("caught up with JOSE yesterday", index) == {"person:jose"}
+
+    def test_does_not_match_inside_an_unrelated_word(self) -> None:
+        """A bare substring check would find "Ann" inside "annual" - a
+        privacy bug, since it pulls an unrelated person's document into the
+        prompt for every note that happens to contain that substring.
+        """
+        index = (row("person:ann", canonical_name="Ann"),)
+        assert alias_signal("planning the annual budget review", index) == set()
+
+    def test_still_matches_the_name_as_a_standalone_word(self) -> None:
+        index = (row("person:ann", canonical_name="Ann"),)
+        assert alias_signal("caught up with Ann yesterday", index) == {"person:ann"}
+
+    def test_matches_a_multi_word_name_at_the_end_of_the_text(self) -> None:
+        index = (row("person:jane-doe", canonical_name="Jane Doe"),)
+        assert alias_signal("grabbed lunch with Jane Doe", index) == {"person:jane-doe"}
 
 
 class TestRecencySignal:
@@ -177,6 +195,73 @@ class TestAssemble:
             selector_degraded=True,
         )
         assert degraded is True
+
+    def test_a_document_over_the_per_document_budget_is_partial_not_full(self) -> None:
+        index = (row("a", body_tokens=5000),)
+        selections, _ = assemble(
+            index,
+            deterministic={
+                "alias": frozenset({"a"}),
+                "recency": frozenset(),
+                "open_thread": frozenset(),
+            },
+            config=ContextAssemblyConfig(max_body_tokens=2000, max_selected_body_tokens=8000),
+        )
+        assert selections[0].inclusion == "partial"
+
+    def test_a_document_within_the_per_document_budget_stays_full(self) -> None:
+        index = (row("a", body_tokens=500),)
+        selections, _ = assemble(
+            index,
+            deterministic={
+                "alias": frozenset({"a"}),
+                "recency": frozenset(),
+                "open_thread": frozenset(),
+            },
+            config=ContextAssemblyConfig(max_body_tokens=2000, max_selected_body_tokens=8000),
+        )
+        assert selections[0].inclusion == "full"
+
+    def test_the_aggregate_token_budget_downgrades_excess_documents(self) -> None:
+        """docs/DESIGN.md 7.3.6: selected bodies must not exceed the aggregate cap.
+
+        Three 3k-token documents (each individually under the per-document
+        cap) sum to 9k, over an 8k aggregate budget - the last one in
+        deterministic order must be downgraded even though none is
+        individually oversized.
+        """
+        index = (row("a", body_tokens=3000), row("b", body_tokens=3000), row("c", body_tokens=3000))
+        selections, _ = assemble(
+            index,
+            deterministic={
+                "alias": frozenset({"a", "b", "c"}),
+                "recency": frozenset(),
+                "open_thread": frozenset(),
+            },
+            config=ContextAssemblyConfig(max_body_tokens=4000, max_selected_body_tokens=8000),
+        )
+        by_key = {s.stable_key: s.inclusion for s in selections}
+        assert by_key["a"] == "full"
+        assert by_key["b"] == "full"
+        assert by_key["c"] != "full", "the third document must not exceed the aggregate budget"
+
+    def test_a_document_too_large_even_partial_falls_to_index_only(self) -> None:
+        """Once the aggregate budget is nearly spent, even a capped partial
+        contribution from a huge document must not be allowed to exceed it.
+        """
+        index = (row("a", body_tokens=2000), row("b", body_tokens=50000))
+        selections, _ = assemble(
+            index,
+            deterministic={
+                "alias": frozenset({"a", "b"}),
+                "recency": frozenset(),
+                "open_thread": frozenset(),
+            },
+            config=ContextAssemblyConfig(max_body_tokens=2000, max_selected_body_tokens=2500),
+        )
+        by_key = {s.stable_key: s.inclusion for s in selections}
+        assert by_key["a"] == "full"
+        assert by_key["b"] == "index_only"
 
     def test_ordering_is_deterministic_across_two_calls(self) -> None:
         index = tuple(row(f"z{i}") for i in range(5))

@@ -9,6 +9,7 @@ because it is I/O, not policy.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -108,6 +109,22 @@ def document_stable_key(entity_type: EntityType, normalized_name: str) -> str:
     so this only has to make it filename- and Markdown-front-matter-safe: ASCII
     letters, digits, and hyphens, matching the design's own example
     (``project:thought-capture-ai``).
+
+    ``_NON_SLUG`` strips every character outside ``a-z0-9``, so a name made
+    entirely of non-Latin script (e.g. two different Japanese place names)
+    or of stripped punctuation would otherwise both collapse to the same
+    empty slug and collide under the ``(workspace_id, kind, stable_key)``
+    unique key - a later entity silently overwriting an earlier one's
+    document. A pure-ASCII name (the common case) keeps the readable slug
+    unchanged; anything else gets a short content hash of the *full*
+    normalized name appended (or used alone, if nothing ASCII survives),
+    which makes two distinct normalized names collide only as likely as a
+    SHA-256 collision.
     """
     slug = _NON_SLUG.sub("-", normalized_name).strip("-")
-    return f"{entity_type}:{slug}"
+    if slug and normalized_name.isascii():
+        return f"{entity_type}:{slug}"
+    digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()[:12]
+    if slug:
+        return f"{entity_type}:{slug}-{digest}"
+    return f"{entity_type}:{digest}"

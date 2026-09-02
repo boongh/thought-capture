@@ -42,19 +42,33 @@ def _sections(body_markdown: str) -> list[str]:
 
 
 def _hard_split(section: str, max_chars: int) -> list[str]:
-    """Last-resort split of one oversized section, on line boundaries."""
+    """Last-resort split of one oversized section: line boundaries first,
+    then a character-level split for any single line that alone still
+    exceeds ``max_chars``. Discord rejects a message over its length limit
+    outright rather than truncating it, so every piece this returns must
+    itself fit - a single pathologically long line (no newlines at all)
+    cannot be allowed to pass through unsplit.
+    """
     pieces: list[str] = []
     current = ""
     for line in section.splitlines():
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > max_chars and current:
-            pieces.append(current)
-            current = line
-        else:
-            current = candidate
+        for fragment in _chunk_line(line, max_chars):
+            candidate = f"{current}\n{fragment}" if current else fragment
+            if len(candidate) > max_chars and current:
+                pieces.append(current)
+                current = fragment
+            else:
+                current = candidate
     if current:
         pieces.append(current)
     return pieces
+
+
+def _chunk_line(line: str, max_chars: int) -> list[str]:
+    """A single line, further split into ``<= max_chars`` pieces if needed."""
+    if len(line) <= max_chars:
+        return [line]
+    return [line[i : i + max_chars] for i in range(0, len(line), max_chars)]
 
 
 def format_digest_messages(

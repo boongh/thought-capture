@@ -39,7 +39,12 @@ class DeliverDigests:
 
     async def _deliver_one(self, event: PendingDigest) -> bool:
         try:
-            content = await self._source.get(event.document_id, event.revision_id)
+            content = await self._source.get(
+                workspace_id=event.workspace_id,
+                run_id=event.run_id,
+                document_id=event.document_id,
+                revision_id=event.revision_id,
+            )
             chunks = format_digest_messages(content)
             sent = await self._sender.send(chunks)
         except Exception as exc:

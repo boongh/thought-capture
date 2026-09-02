@@ -30,7 +30,11 @@ def unique(unique_message_id: str) -> str:
 
 
 async def _run_row(
-    factory: async_sessionmaker[AsyncSession], workspace_id: WorkspaceId, *, created_at: dt.datetime
+    factory: async_sessionmaker[AsyncSession],
+    workspace_id: WorkspaceId,
+    *,
+    created_at: dt.datetime,
+    window_end: dt.datetime | None = None,
 ) -> uuid.UUID:
     run_id = uuid.uuid4()
     async with factory() as session, session.begin():
@@ -41,6 +45,7 @@ async def _run_row(
                 kind="organize",
                 status="succeeded",
                 created_at=created_at,
+                window_end=window_end,
             )
         )
     return run_id
@@ -236,3 +241,77 @@ async def test_last_mentioned_at_is_the_most_recent_run(
     index = await PostgresContextIndex(app_session_factory).tier1_index(workspace)
     row = next(r for r in index if r.stable_key == resolved.stable_key)
     assert row.last_mentioned_at == late
+
+
+async def test_body_tokens_reflects_the_current_document_body_size(
+    app_session_factory: async_sessionmaker[AsyncSession], workspace: WorkspaceId, unique: str
+) -> None:
+    run_id = await _run_row(app_session_factory, workspace, created_at=dt.datetime.now(dt.UTC))
+    stable_key = f"project:sized-{unique}"
+    body = "## Summary\n\n" + ("word " * 100)
+    await _document_with_revision(
+        app_session_factory, workspace, run_id, kind="project", stable_key=stable_key, body=body
+    )
+    async with app_session_factory() as session, session.begin():
+        await session.execute(
+            sa.text("""
+                INSERT INTO entities (id, workspace_id, entity_type, canonical_name, normalized_name)
+                VALUES (:id, :workspace_id, 'project', :name, :normalized)
+            """),
+            {
+                "id": uuid.uuid4(),
+                "workspace_id": workspace,
+                "name": f"Sized {unique}",
+                "normalized": f"sized {unique}".lower(),
+            },
+        )
+
+    index = await PostgresContextIndex(app_session_factory).tier1_index(workspace)
+    row = next(r for r in index if r.stable_key == stable_key)
+    assert row.body_tokens == len(body) // 4
+    assert row.body_tokens > 0
+
+
+async def test_last_mentioned_at_uses_the_capture_window_not_the_run_creation_time(
+    app_session_factory: async_sessionmaker[AsyncSession], workspace: WorkspaceId, unique: str
+) -> None:
+    """A worker catching up on a backlog processes old windows at `created_at`
+    values clustered around "now" - `last_mentioned_at` must reflect when the
+    content was actually captured (`window_end`), or a startup catch-up would
+    mark long-stale entities "recent" and pull their full bodies into
+    unrelated future organize prompts (the `recency` signal).
+    """
+    stale_window_end = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    catch_up_created_at = dt.datetime(2026, 8, 30, tzinfo=dt.UTC)
+    run_id = await _run_row(
+        app_session_factory,
+        workspace,
+        created_at=catch_up_created_at,
+        window_end=stale_window_end,
+    )
+    _, revision_id = await _document_with_revision(
+        app_session_factory,
+        workspace,
+        run_id,
+        kind="daily_digest",
+        stable_key=f"digest:catchup-{unique}",
+        body="## Summary\n\nbacklog\n",
+    )
+
+    repo = PostgresEntityRepository()
+    async with app_session_factory() as session, session.begin():
+        resolved = await repo.resolve_mention(
+            session,
+            workspace_id=workspace,
+            run_id=run_id,
+            entity_type=EntityType.TOPIC,
+            canonical_name=f"Stale Topic {unique}",
+            surface_form=f"Stale Topic {unique}",
+            confidence=0.9,
+            revision_id=revision_id,
+        )
+
+    index = await PostgresContextIndex(app_session_factory).tier1_index(workspace)
+    row = next(r for r in index if r.stable_key == resolved.stable_key)
+    assert row.last_mentioned_at == stale_window_end
+    assert row.last_mentioned_at != catch_up_created_at

@@ -30,7 +30,13 @@ class DiscordDigestSender:
 
         for chunk in chunks:
             try:
-                await destination.send(chunk)
+                # The digest body is model-generated from captured thoughts,
+                # which are untrusted free text: an `@everyone`, an `@role`,
+                # or a `@user` mention it happens to contain must never
+                # actually notify anyone. `AllowedMentions.none()` strips
+                # every mention's notification regardless of channel-level
+                # defaults.
+                await destination.send(chunk, allowed_mentions=discord.AllowedMentions.none())
             except discord.DiscordException as exc:
                 # Sanitized: a Discord exception can carry request URLs and
                 # response bodies (docs/DESIGN.md 14.2).
