@@ -224,8 +224,17 @@ class FakeDigestSource:
     ) -> None:
         self.content = content
         self.missing = missing or set()
+        self.calls: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]] = []
 
-    async def get(self, document_id: uuid.UUID, revision_id: uuid.UUID) -> DigestContent:
+    async def get(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        run_id: uuid.UUID,
+        document_id: uuid.UUID,
+        revision_id: uuid.UUID,
+    ) -> DigestContent:
+        self.calls.append((workspace_id, run_id, document_id, revision_id))
         if revision_id in self.missing:
             raise DigestNotFound(f"no such revision: {revision_id}")
         assert self.content is not None

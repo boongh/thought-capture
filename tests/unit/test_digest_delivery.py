@@ -21,6 +21,7 @@ CONTENT = DigestContent(
 def a_pending(*, attempts: int = 1) -> PendingDigest:
     return PendingDigest(
         event_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
         run_id=uuid.uuid4(),
         document_id=uuid.uuid4(),
         revision_id=uuid.uuid4(),
@@ -45,7 +46,8 @@ async def test_a_successful_send_marks_the_event_delivered() -> None:
     event = a_pending()
     outbox = FakeDigestOutbox([event])
     sender = FakeDigestSender(succeed=True)
-    deliver = DeliverDigests(outbox=outbox, source=FakeDigestSource(CONTENT), sender=sender)
+    source = FakeDigestSource(CONTENT)
+    deliver = DeliverDigests(outbox=outbox, source=source, sender=sender)
 
     delivered = await deliver()
 
@@ -53,6 +55,11 @@ async def test_a_successful_send_marks_the_event_delivered() -> None:
     assert outbox.delivered == [event.event_id]
     assert outbox.failed == []
     assert len(sender.sent) == 1
+    # The event's own workspace and run travel into the read, not just the
+    # bare document/revision ids - see PendingDigest's docstring.
+    assert source.calls == [
+        (event.workspace_id, event.run_id, event.document_id, event.revision_id)
+    ]
 
 
 async def test_a_sender_returning_false_marks_the_event_failed_not_delivered() -> None:

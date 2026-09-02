@@ -62,6 +62,24 @@ def test_a_single_oversized_section_is_hard_split_rather_than_dropped() -> None:
     assert "line 49 " in chunks[-1]
 
 
+def test_a_single_line_longer_than_the_limit_is_still_split() -> None:
+    """A regression test: line-boundary splitting alone leaves a single
+    2001+ character line (no newlines at all) as one oversized piece, which
+    Discord rejects outright rather than truncating - the packer's own
+    per-chunk bound must never be violated regardless of the source text's
+    shape.
+    """
+    huge_line = "no newlines anywhere " + "z" * (MAX_MESSAGE_CHARS * 2)
+    body = f"## Huge\n\n{huge_line}"
+    chunks = format_digest_messages(a_digest(body))
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= MAX_MESSAGE_CHARS for chunk in chunks)
+    # No content is lost across the split.
+    assert "no newlines anywhere" in chunks[1]
+    assert "z" in chunks[-1]
+
+
 def test_consecutive_short_sections_are_packed_into_one_chunk() -> None:
     body = "## A\n\nshort\n\n## B\n\nshort\n\n## C\n\nshort"
     chunks = format_digest_messages(a_digest(body))

@@ -207,12 +207,14 @@ async def test_digest_reader_returns_the_written_content(
     thought_id = await _thought_id(
         app_session_factory, workspace, user_id, source_message_id=unique
     )
-    _run_id, document_id, revision_id = await _write_digest(
+    run_id, document_id, revision_id = await _write_digest(
         app_session_factory, workspace, thought_id, unique=unique
     )
 
     reader = PostgresDigestReader(app_session_factory)
-    content = await reader.get(document_id, revision_id)
+    content = await reader.get(
+        workspace_id=workspace, run_id=run_id, document_id=document_id, revision_id=revision_id
+    )
 
     assert content.title == "Daily digest"
     assert content.body_markdown == BODY
@@ -222,7 +224,111 @@ async def test_digest_reader_returns_the_written_content(
 
 async def test_digest_reader_raises_for_an_unknown_revision(
     app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
 ) -> None:
     reader = PostgresDigestReader(app_session_factory)
     with pytest.raises(DigestNotFound):
-        await reader.get(uuid.uuid4(), uuid.uuid4())
+        await reader.get(
+            workspace_id=workspace,
+            run_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            revision_id=uuid.uuid4(),
+        )
+
+
+async def test_digest_reader_rejects_a_revision_from_a_different_workspace(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """The security boundary this closes: a malformed or miswired event
+    citing a real revision but the wrong workspace must not resolve.
+    """
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    run_id, document_id, revision_id = await _write_digest(
+        app_session_factory, workspace, thought_id, unique=unique
+    )
+
+    reader = PostgresDigestReader(app_session_factory)
+    with pytest.raises(DigestNotFound):
+        await reader.get(
+            workspace_id=uuid.uuid4(),
+            run_id=run_id,
+            document_id=document_id,
+            revision_id=revision_id,
+        )
+
+
+async def test_digest_reader_rejects_a_revision_from_a_different_run(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """A revision must belong to the exact run the event claims produced
+    it, not merely some run in the same workspace.
+    """
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    _run_id, document_id, revision_id = await _write_digest(
+        app_session_factory, workspace, thought_id, unique=unique
+    )
+
+    reader = PostgresDigestReader(app_session_factory)
+    with pytest.raises(DigestNotFound):
+        await reader.get(
+            workspace_id=workspace,
+            run_id=uuid.uuid4(),
+            document_id=document_id,
+            revision_id=revision_id,
+        )
+
+
+async def test_digest_reader_rejects_a_non_digest_document(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """Even a real, correctly workspace/run-scoped revision must not
+    resolve unless the document is actually a daily_digest - otherwise a
+    miswired event could disclose any project/person/topic document.
+    """
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    ledger = PostgresRunLedger(app_session_factory)
+    run_id = await ledger.start(workspace, window_start=WINDOW_START, window_end=WINDOW_END)
+    stable_key = f"project:not-a-digest-{unique}"
+    request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=stable_key,
+                kind="project",
+                title="Not a digest",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+    writer = PostgresOrganizeWriter(app_session_factory)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
+
+    reader = PostgresDigestReader(app_session_factory)
+    with pytest.raises(DigestNotFound):
+        await reader.get(
+            workspace_id=workspace,
+            run_id=run_id,
+            document_id=result.document_ids[stable_key],
+            revision_id=result.revision_ids[stable_key],
+        )

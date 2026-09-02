@@ -11,9 +11,19 @@ from tc_domain.digest import DigestContent
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PendingDigest:
-    """One claimed ``digest.ready`` event, parsed and ready to deliver."""
+    """One claimed ``digest.ready`` event, parsed and ready to deliver.
+
+    ``workspace_id`` and ``run_id`` travel with the event (the outbox row's
+    own ``workspace_id`` column, and the run that produced the digest) so
+    ``DigestSource.get`` can verify the revision it reads actually belongs
+    to this workspace and this run, not just that *some* revision matches
+    the bare ``(document_id, revision_id)`` pair - a malformed or miswired
+    event must never be able to make an unrelated document's content, from
+    any workspace, reach Discord.
+    """
 
     event_id: uuid.UUID
+    workspace_id: uuid.UUID
     run_id: uuid.UUID
     document_id: uuid.UUID
     revision_id: uuid.UUID
@@ -46,8 +56,21 @@ class DigestOutbox(Protocol):
 class DigestSource(Protocol):
     """Reads the specific document revision an outbox event points at."""
 
-    async def get(self, document_id: uuid.UUID, revision_id: uuid.UUID) -> DigestContent:
-        """Raise if the revision no longer resolves (e.g. a corrupted event)."""
+    async def get(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        run_id: uuid.UUID,
+        document_id: uuid.UUID,
+        revision_id: uuid.UUID,
+    ) -> DigestContent:
+        """Raise ``DigestNotFound`` unless the revision resolves *and* it
+        belongs to this workspace, this run, and a ``daily_digest`` document
+        - never on ``document_id``/``revision_id`` alone. This is the
+        boundary that keeps a malformed or miswired event from disclosing
+        an unrelated document (another workspace's, or a non-digest kind)
+        to Discord.
+        """
         ...
 
 
