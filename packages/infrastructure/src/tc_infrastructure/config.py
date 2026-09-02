@@ -187,6 +187,32 @@ class Settings(BaseSettings):
         reviewed = REVIEWED_MODELS.get(model_id)
         return reviewed.providers if reviewed is not None else None
 
+    def strict_schema_supported(self, model_id: str, *, custom_flag: bool) -> bool:
+        """Whether to request strict `response_format`/`require_parameters` for `model_id`.
+
+        Safe mode (docs/adr/0006) is a hard-enforced allowlist: every safe-mode
+        admission requirement - including JSON-structure enforceability - is
+        derived from the reviewed model's own recorded capability in
+        `REVIEWED_MODELS`, never from a mutable operator-set flag. An operator
+        leaving `model_supports_strict_schema`/`model_select_supports_strict_schema`
+        at its default (or setting it wrong) must not silently weaken a
+        safe-mode guarantee the registry already established - that is
+        exactly the gap this method closes (independent PR #16 review).
+        `custom_flag` (the corresponding `model_supports_strict_schema` /
+        `model_select_supports_strict_schema` setting) is consulted only in
+        custom mode, where an operator-set override is legitimate because the
+        operator has already opted out of the allowlist.
+
+        `_safe_mode_restricts_to_reviewed_models` already guarantees a
+        non-empty slug reaching here in safe mode is a `REVIEWED_MODELS` key,
+        so the `None` branch below is unreachable in practice - same
+        defensive shape as `openrouter_only_providers`.
+        """
+        if self.model_selection_mode != "safe":
+            return custom_flag
+        reviewed = REVIEWED_MODELS.get(model_id)
+        return reviewed.supports_strict_schema if reviewed is not None else False
+
     @property
     def openrouter_deny_data_collection(self) -> bool:
         """Whether to tell OpenRouter to route only through non-retaining providers.

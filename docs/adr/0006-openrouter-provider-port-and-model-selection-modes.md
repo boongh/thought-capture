@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01; `model_select` added and gated by safe mode, `upstage/solar-pro4` added to the registry for `select`, 2026-09-02)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01; `model_select` added and gated by safe mode, `upstage/solar-pro4` added to the registry for `select`, 2026-09-02; `Settings.strict_schema_supported` closes a gap where the composition root trusted the mutable `model_supports_strict_schema`/`model_select_supports_strict_schema` flags directly in safe mode instead of `REVIEWED_MODELS`, 2026-09-02)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -232,6 +232,32 @@ happens to also appear in `REVIEWED_MODELS` - custom mode's promise is
 freedom from the allowlist machinery entirely, not a silent partial
 application of it.
 
+**Strict-schema derivation (`Settings.strict_schema_supported`).** The
+composition root (`tc_infrastructure.llm.factory`) that wires
+`OpenRouterProvider` for `organize`/`select` was found (PR #16 independent
+review, 2026-09-02) to pass `model_supports_strict_schema`/
+`model_select_supports_strict_schema` - ordinary, operator-configurable
+`Settings` fields, both defaulting to `false` - straight through as
+`supports_strict_schema`, in both modes. In safe mode this defeated the
+**JSON structure enforceable** admission bar above: a reviewed model like
+`upstage/solar-pro4`, confirmed to support
+`response_format: {"type": "json_schema", "strict": true}`, would silently
+run non-strict (no `response_format`, no `provider.require_parameters`) if
+the corresponding flag was ever left at its default or set incorrectly - the
+exact "mutable config flag overrides a safe-mode admission requirement" shape
+every other request-side control in this ADR was already written to refuse.
+`Settings.strict_schema_supported(model_id, *, custom_flag)` closes it,
+matching the mode-derivation shape already used by
+`openrouter_only_providers`/`openrouter_allow_fallbacks`/
+`openrouter_deny_data_collection`/`openrouter_require_zdr`: safe mode always
+returns `REVIEWED_MODELS[model_id].supports_strict_schema` (the registry
+entry's own recorded capability, unreachable as anything but a hit once
+`_safe_mode_restricts_to_reviewed_models` has run), never the flag; custom
+mode returns `custom_flag` unconditionally, since custom mode is exactly
+where an operator-set override is legitimate. `factory.build_organize_provider`
+and `factory.build_select_provider` both call it now, so the fix is uniform
+across both pinned steps rather than special-cased for `select`.
+
 **`require_parameters`.** OpenRouter defaults this to `false`, so a provider
 that does not actually honor the parameters in the request - the strict
 `response_format` enforcement, specifically - can still be selected and
@@ -377,6 +403,23 @@ when given and is absent by default; `zdr` is present (`true`) by default and
 absent - not sent as `false` - when `require_zdr=False`; the journaled
 `request_params["provider_routing"]` matches the object actually sent; and
 the separate served-model guard this ADR does not change is still covered.
+
+`tests/unit/test_settings.py` additionally asserts `strict_schema_supported`
+derives `True` for a reviewed model in safe mode even when `custom_flag=False`
+(the PR #16 finding), ignores a `custom_flag=True` that disagrees with the
+registry in safe mode, returns `False` for a model not in the registry, and
+in custom mode follows `custom_flag` unconditionally - including for a slug
+that also happens to be reviewed. `tests/unit/test_llm_factory.py` proves the
+fix at the composition-root and request level: `build_select_provider` with
+`TC_MODEL_SELECTION_MODE=safe`, `TC_MODEL_SELECT=upstage/solar-pro4`, and
+`TC_MODEL_SELECT_SUPPORTS_STRICT_SCHEMA` left at its `false` default builds a
+provider with `supports_strict_schema=True`; the same setup driven through a
+stub OpenAI client asserts the actual outgoing `chat.completions.create`
+call carries `response_format: {"type": "json_schema", "strict": true}` and
+`extra_body["provider"]["require_parameters"] is True`, not just the
+internal flag; a parallel test proves `build_organize_provider` derives the
+same way via a synthetic registry entry, since the real registry has no
+reviewed `organize` candidate yet.
 
 `tests/unit/test_reviewed_models.py` asserts every registry entry records at
 least one provider, that the registry is currently empty (documenting why,
