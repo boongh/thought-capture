@@ -127,7 +127,16 @@ def build_admin_commands(
         # `PostgresCaptureWindows.succeeded_run_for` only matches `kind ==
         # "organize"`, so this can never be mistaken for the scheduled run
         # that later supersedes it.
+        # Captured via `on_run_started`, not the return value: `organize()`
+        # re-raises on failure without returning anything, but it has already
+        # created and (in its except block) failed the run by then - this is
+        # the only way to learn that run's id in the failure case too.
         run_id: uuid.UUID | None = None
+
+        def _record_run_id(started_run_id: uuid.UUID) -> None:
+            nonlocal run_id
+            run_id = started_run_id
+
         async with windows.locked(workspace_id, window) as acquired:
             if not acquired:
                 await interaction.followup.send(
@@ -138,24 +147,26 @@ def build_admin_commands(
                 return
 
             try:
-                run_id = await organize(workspace_id, window, kind="force_organize")
+                await organize(
+                    workspace_id, window, kind="force_organize", on_run_started=_record_run_id
+                )
             except Exception as exc:
                 # OrganizeWindow already wrote the sanitized failure to the run
                 # row before re-raising (organize.py); nothing from `exc`
-                # itself is safe to surface here (docs/DESIGN.md 14.2). It
-                # also does not return a run id on this path, so the fallback
-                # below is the best available lookup.
+                # itself is safe to surface here (docs/DESIGN.md 14.2).
                 logger.warning("organize_command.failed", extra={"error_class": type(exc).__name__})
 
-        # Loaded by the id this call's own run actually produced, not
-        # `most_recent()` - a concurrent scheduled or manual run on a
-        # different window could otherwise complete first and this reply
-        # would show that run's outcome instead of this one's.
-        record = (
-            await runs.get(workspace_id, run_id)
-            if run_id is not None
-            else await runs.most_recent(workspace_id)
-        )
+        if run_id is None:
+            # `run_ledger.start` itself never even completed, so no run
+            # exists to look up - never fall back to `most_recent()` here, or
+            # a concurrent run on another window could be shown instead.
+            await interaction.followup.send(
+                "Organize failed before a run could be recorded; check the bot's logs.",
+                ephemeral=True,
+            )
+            return
+
+        record = await runs.get(workspace_id, run_id)
         await interaction.followup.send(_format_organize_result(window, record), ephemeral=True)
 
     async def status_callback(interaction: discord.Interaction, run_id: str | None = None) -> None:

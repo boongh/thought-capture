@@ -308,6 +308,30 @@ async def test_a_provider_failure_on_organize_fails_the_run_and_raises() -> None
     assert run_ledger.failed[0]["error_code"] == "LLMError"
 
 
+async def test_on_run_started_fires_with_the_run_id_even_when_the_run_later_fails() -> None:
+    """The only way a caller learns a failed run's id: `__call__` re-raises
+    without returning anything, so `/organize` (tc_discord_bot.commands)
+    depends on this firing before the failure to look the run up afterward."""
+
+    class FailingProvider:
+        model_id = "failing/model"
+        supports_strict_schema = False
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            raise LLMError("synthetic outage")
+
+    pipeline, _writer, run_ledger = make_pipeline(
+        thoughts=[a_thought(1)], provider=FailingProvider()
+    )
+    seen: list[uuid.UUID] = []
+
+    with pytest.raises(LLMError):
+        await pipeline(WORKSPACE, WINDOW, on_run_started=seen.append)
+
+    assert len(seen) == 1
+    assert run_ledger.failed[0]["run_id"] == seen[0]
+
+
 async def test_an_oversized_window_fails_before_touching_the_provider_or_writer() -> None:
     """docs/DESIGN.md 14.1: a very large window must not reach the provider
     unbounded. Real chunking-with-overlap is a follow-up; this is the safety

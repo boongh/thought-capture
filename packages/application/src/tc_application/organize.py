@@ -85,6 +85,11 @@ UsageLookup = Callable[[WorkspaceId, uuid.UUID], Awaitable[tuple[int, int]]]
 # a `run_id`, so it cannot be a fixed, constructor-time value the way the
 # provider or writer are.
 JournalFactory = Callable[[WorkspaceId, uuid.UUID], JournalWriter]
+# Fired synchronously the instant `run_ledger.start` returns a `run_id` - the
+# only way a caller can learn it when the run later fails: `__call__` re-raises
+# on failure without returning anything, so a caller relying on the return
+# value alone has no id to look the failed run up by.
+RunStartedCallback = Callable[[uuid.UUID], None]
 
 
 class OrganizeWindow:
@@ -118,11 +123,18 @@ class OrganizeWindow:
         self._max_window_tokens = max_window_tokens
 
     async def __call__(
-        self, workspace_id: WorkspaceId, window: CaptureWindow, *, kind: str = "organize"
+        self,
+        workspace_id: WorkspaceId,
+        window: CaptureWindow,
+        *,
+        kind: str = "organize",
+        on_run_started: RunStartedCallback | None = None,
     ) -> uuid.UUID:
         run_id = await self._run_ledger.start(
             workspace_id, window_start=window.start, window_end=window.end, kind=kind
         )
+        if on_run_started is not None:
+            on_run_started(run_id)
         journal = self._journal_factory(workspace_id, run_id)
         try:
             window_thoughts = await self._thoughts.list_between(
