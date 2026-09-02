@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
 from tc_domain.errors import DigestNotFound
-from tc_domain.organize import DocumentWrite, OrganizeWriteRequest
+from tc_domain.organize import DocumentWrite, OrganizeWriteRequest, RunOutcome
 from tc_infrastructure.db.digest_outbox import PostgresDigestOutbox
 from tc_infrastructure.db.digest_reader import PostgresDigestReader
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
@@ -25,6 +25,18 @@ BODY = (
 )
 WINDOW_START = dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC)
 WINDOW_END = dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC)
+
+
+def _outcome() -> RunOutcome:
+    return RunOutcome(
+        model_provider="offline",
+        model_id="offline-model",
+        prompt_version="organize-v1",
+        input_tokens=0,
+        output_tokens=0,
+        context_recall=None,
+        context_degraded=False,
+    )
 
 
 @pytest.fixture
@@ -98,7 +110,9 @@ async def _write_digest(
         unorganized_thought_ids=(),
     )
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
     assert result.digest_document_id is not None
     return run_id, result.digest_document_id, result.revision_ids[stable_key]
 
@@ -154,7 +168,7 @@ async def test_claim_ignores_non_digest_documents(
         unorganized_thought_ids=(),
     )
     writer = PostgresOrganizeWriter(app_session_factory)
-    await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    await writer.write(workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome())
 
     outbox = PostgresDigestOutbox(app_session_factory, lease_owner="test")
     pending = await outbox.claim(limit=50)
