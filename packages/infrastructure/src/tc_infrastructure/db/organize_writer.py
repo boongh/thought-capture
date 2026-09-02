@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
-from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult
+from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome
 from tc_infrastructure.db.entity_repository import PostgresEntityRepository
 from tc_infrastructure.db.tables import (
     document_revisions,
@@ -26,6 +26,7 @@ from tc_infrastructure.db.tables import (
     outbox_events,
     revision_sources,
     run_context_selections,
+    runs,
 )
 
 DIGEST_READY_EVENT = "digest.ready"
@@ -43,7 +44,12 @@ class PostgresOrganizeWriter:
         self._entities = entities or PostgresEntityRepository()
 
     async def write(
-        self, *, workspace_id: WorkspaceId, run_id: uuid.UUID, request: OrganizeWriteRequest
+        self,
+        *,
+        workspace_id: WorkspaceId,
+        run_id: uuid.UUID,
+        request: OrganizeWriteRequest,
+        outcome: RunOutcome,
     ) -> OrganizeWriteResult:
         document_ids: dict[str, uuid.UUID] = {}
         revision_ids: dict[str, uuid.UUID] = {}
@@ -110,6 +116,28 @@ class PostgresOrganizeWriter:
                     document_id=digest_document_id,
                     revision_id=digest_revision_id,
                 )
+
+            # Marking the run succeeded is part of *this* transaction, not a
+            # later, separate one (see the ``RunOutcome`` docstring): either
+            # everything above and this status flip commit together, or a
+            # crash rolls all of it back and the window is retried from
+            # scratch - never a state where the output exists durably but
+            # nothing signals that to the scheduler's resume check.
+            await session.execute(
+                sa.update(runs)
+                .where(runs.c.id == run_id)
+                .values(
+                    status="succeeded",
+                    finished_at=sa.func.now(),
+                    model_provider=outcome.model_provider,
+                    model_id=outcome.model_id,
+                    prompt_version=outcome.prompt_version,
+                    input_tokens=outcome.input_tokens,
+                    output_tokens=outcome.output_tokens,
+                    context_recall=outcome.context_recall,
+                    context_degraded=outcome.context_degraded,
+                )
+            )
 
         return OrganizeWriteResult(
             document_ids=document_ids,

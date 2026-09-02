@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 
 from tc_domain.capture import WorkspaceId
 from tc_domain.context import Tier1Row
-from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, WindowThought
+from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
 
 
 @runtime_checkable
@@ -47,13 +47,21 @@ class ContextIndexPort(Protocol):
 @runtime_checkable
 class OrganizeWriter(Protocol):
     async def write(
-        self, *, workspace_id: WorkspaceId, run_id: uuid.UUID, request: OrganizeWriteRequest
+        self,
+        *,
+        workspace_id: WorkspaceId,
+        run_id: uuid.UUID,
+        request: OrganizeWriteRequest,
+        outcome: RunOutcome,
     ) -> OrganizeWriteResult:
         """Write every document revision, provenance row, entity mention,
-        context-selection record, and the digest outbox event in one
-        transaction (docs/DESIGN.md 7.2 step 9: never write a partial
-        document set after validation failure - so this either commits
-        everything or raises and commits nothing).
+        context-selection record, the digest outbox event, and the run's
+        ``succeeded`` status transition in one transaction (docs/DESIGN.md
+        7.2 step 9: never write a partial document set after validation
+        failure - so this either commits everything, including marking the
+        run succeeded, or raises and commits nothing). The run must not be
+        markable ``succeeded`` by any path that is not atomic with this
+        write - see ``RunOutcome``.
         """
         ...
 

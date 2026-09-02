@@ -23,7 +23,7 @@ from tc_domain.capture import (
 )
 from tc_domain.context import Tier1Row
 from tc_domain.errors import AttachmentArchiveFailed
-from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, WindowThought
+from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
 
 
 class FakeThoughtRepository:
@@ -122,11 +122,18 @@ class FakeOrganizeWriter:
 
     def __init__(self) -> None:
         self.calls: list[OrganizeWriteRequest] = []
+        self.outcomes: list[RunOutcome] = []
 
     async def write(
-        self, *, workspace_id: WorkspaceId, run_id: uuid.UUID, request: OrganizeWriteRequest
+        self,
+        *,
+        workspace_id: WorkspaceId,
+        run_id: uuid.UUID,
+        request: OrganizeWriteRequest,
+        outcome: RunOutcome,
     ) -> OrganizeWriteResult:
         self.calls.append(request)
+        self.outcomes.append(outcome)
         document_ids = {doc.stable_key: uuid.uuid4() for doc in request.documents}
         revision_ids = {doc.stable_key: uuid.uuid4() for doc in request.documents}
         digest_id = next(

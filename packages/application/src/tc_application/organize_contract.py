@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 SCHEMA_VERSION = "organize-v1"
 
@@ -64,12 +64,23 @@ class ProposedDocument(BaseModel):
 
     @field_validator("body_markdown")
     @classmethod
-    def _entity_documents_use_the_fixed_sections(cls, value: str, info: object) -> str:
-        """Entity documents must carry the four sections, in order.
+    def _non_digest_documents_use_the_fixed_sections(cls, value: str, info: ValidationInfo) -> str:
+        """Every document but the digest must carry the four sections, in order.
 
         Enforced here rather than at render time because the section contract is
-        what makes graded inclusion (index_only / partial / full) meaningful.
+        what makes graded inclusion (index_only / partial / full) meaningful -
+        a document written without it can never be safely truncated to
+        ``partial`` later. The digest is exempt: it is generated fresh every
+        window and is never itself re-fetched or partially included by a
+        later organize call, so the contract that exists to make *that*
+        re-fetch well defined does not apply to it.
         """
+        kind = info.data.get("kind")
+        if kind is not None and kind != "daily_digest" and not has_required_sections(value):
+            raise ValueError(
+                f"{kind} documents must use the fixed section order: "
+                + ", ".join(REQUIRED_SECTIONS)
+            )
         return value
 
 
@@ -87,6 +98,21 @@ class OrganizationResult(BaseModel):
     # Which documents the model actually drew on, so context recall can be
     # computed (v1.1 section 7.3.5).
     referenced_document_keys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _exactly_one_daily_digest(self) -> OrganizationResult:
+        """One organize call for a non-empty window means exactly one digest.
+
+        Zero would silently lose that window's digest forever - the write
+        side only enqueues a `digest.ready` outbox event when it finds a
+        `daily_digest` document, and a run that "succeeds" with none is
+        never retried. More than one is ambiguous: the write side keeps
+        only the last one it sees, silently discarding the rest.
+        """
+        digest_count = sum(1 for doc in self.documents if doc.kind == "daily_digest")
+        if digest_count != 1:
+            raise ValueError(f"exactly one daily_digest document is required, got {digest_count}")
+        return self
 
 
 class SelectedContext(BaseModel):
