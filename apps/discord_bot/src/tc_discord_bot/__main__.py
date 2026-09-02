@@ -11,22 +11,38 @@ from __future__ import annotations
 
 import logging
 import sys
+import uuid
 
 import httpx
 
 from tc_application.capture import CaptureThought
 from tc_application.digest_delivery import DeliverDigests
+from tc_application.organize import JournalFactory, OrganizeWindow
+from tc_application.structured import JournalWriter
 from tc_discord_bot.client import CaptureClient
+from tc_discord_bot.commands import build_admin_commands
 from tc_discord_bot.digest_loop import DigestDeliveryLoop
 from tc_discord_bot.digest_sender import DiscordDigestSender
+from tc_domain.capture import WorkspaceId
+from tc_domain.context import ContextAssemblyConfig
+from tc_domain.llm import LLMRequest, LLMResponse
 from tc_domain.policy import AttachmentPolicy, CaptureAllowlist
 from tc_infrastructure.config import Settings, get_settings
+from tc_infrastructure.db.context_index import PostgresContextIndex
 from tc_infrastructure.db.digest_outbox import PostgresDigestOutbox
 from tc_infrastructure.db.digest_reader import PostgresDigestReader
 from tc_infrastructure.db.engine import create_engine, create_session_factory
+from tc_infrastructure.db.entity_repository import PostgresEntityRepository
 from tc_infrastructure.db.identity import resolve_identity
+from tc_infrastructure.db.llm_journal import PostgresLLMJournal
+from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.run_ledger import PostgresRunLedger
+from tc_infrastructure.db.run_reader import PostgresRunReader
+from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.db.windows import PostgresCaptureWindows
+from tc_infrastructure.llm.factory import build_organize_provider
 from tc_infrastructure.runtime import run
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
@@ -38,6 +54,25 @@ DISCORD_PROVIDER = "discord"
 
 class MissingBotTokenError(RuntimeError):
     """The bot cannot start without a token."""
+
+
+def _journal_factory(journal: PostgresLLMJournal) -> JournalFactory:
+    """Identical to tc_worker.__main__'s own factory - the bot runs the exact
+    same OrganizeWindow the scheduler does, not a second implementation."""
+
+    def make(workspace_id: WorkspaceId, run_id: uuid.UUID) -> JournalWriter:
+        async def write(request: LLMRequest, response: LLMResponse, attempt: int) -> None:
+            await journal.record(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                request=request,
+                response=response,
+                sequence=attempt,
+            )
+
+        return write
+
+    return make
 
 
 def build_allowlist(settings: Settings) -> CaptureAllowlist:
@@ -103,6 +138,33 @@ async def serve(settings: Settings) -> None:
             ),
         )
         client.attach_digest_loop(DigestDeliveryLoop(deliver_digests))
+
+        thoughts_for_organize = PostgresThoughtReader(sessions)
+        journal = PostgresLLMJournal(sessions)
+        organize = OrganizeWindow(
+            thoughts=thoughts_for_organize,
+            context_index=PostgresContextIndex(sessions),
+            provider=build_organize_provider(settings),
+            journal_factory=_journal_factory(journal),
+            writer=PostgresOrganizeWriter(sessions, entities=PostgresEntityRepository()),
+            run_ledger=PostgresRunLedger(sessions),
+            usage_for=journal.usage_for,
+            config=ContextAssemblyConfig(
+                max_selected_documents=settings.context_max_selected_documents,
+                recency_days=settings.context_recency_days,
+            ),
+        )
+        admin_commands = build_admin_commands(
+            organize=organize,
+            windows=PostgresCaptureWindows(sessions),
+            runs=PostgresRunReader(sessions),
+            first_capture_at=thoughts_for_organize.first_capture_at,
+            workspace_id=identity.workspace_id,
+            owner_user_id=settings.discord_owner_user_id,
+            digest_local_time=settings.digest_local_time,
+            timezone=settings.workspace_timezone,
+        )
+        client.attach_admin_commands(admin_commands, guild_id=settings.discord_guild_id)
 
         # discord.py installs its own logging; keep it at INFO so a Gateway
         # disconnect is visible without dumping message content.
