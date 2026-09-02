@@ -121,6 +121,13 @@ def build_admin_commands(
         # Discord's 3-second interaction-acknowledgement budget.
         await interaction.response.defer(ephemeral=True)
 
+        # `/organize` is always an owner-triggered, out-of-band run - never the
+        # scheduler's own - so it is persisted as `force_organize`, distinct
+        # from the scheduler's `organize` rows (docs/DESIGN.md 4.2, 6.3).
+        # `PostgresCaptureWindows.succeeded_run_for` only matches `kind ==
+        # "organize"`, so this can never be mistaken for the scheduled run
+        # that later supersedes it.
+        run_id: uuid.UUID | None = None
         async with windows.locked(workspace_id, window) as acquired:
             if not acquired:
                 await interaction.followup.send(
@@ -131,14 +138,24 @@ def build_admin_commands(
                 return
 
             try:
-                await organize(workspace_id, window)
+                run_id = await organize(workspace_id, window, kind="force_organize")
             except Exception as exc:
                 # OrganizeWindow already wrote the sanitized failure to the run
                 # row before re-raising (organize.py); nothing from `exc`
-                # itself is safe to surface here (docs/DESIGN.md 14.2).
+                # itself is safe to surface here (docs/DESIGN.md 14.2). It
+                # also does not return a run id on this path, so the fallback
+                # below is the best available lookup.
                 logger.warning("organize_command.failed", extra={"error_class": type(exc).__name__})
 
-        record = await runs.most_recent(workspace_id)
+        # Loaded by the id this call's own run actually produced, not
+        # `most_recent()` - a concurrent scheduled or manual run on a
+        # different window could otherwise complete first and this reply
+        # would show that run's outcome instead of this one's.
+        record = (
+            await runs.get(workspace_id, run_id)
+            if run_id is not None
+            else await runs.most_recent(workspace_id)
+        )
         await interaction.followup.send(_format_organize_result(window, record), ephemeral=True)
 
     async def status_callback(interaction: discord.Interaction, run_id: str | None = None) -> None:

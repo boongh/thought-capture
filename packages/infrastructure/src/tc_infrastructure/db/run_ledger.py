@@ -24,7 +24,12 @@ class PostgresRunLedger:
         self._session_factory = session_factory
 
     async def start(
-        self, workspace_id: WorkspaceId, *, window_start: dt.datetime, window_end: dt.datetime
+        self,
+        workspace_id: WorkspaceId,
+        *,
+        window_start: dt.datetime,
+        window_end: dt.datetime,
+        kind: str = "organize",
     ) -> uuid.UUID:
         run_id = uuid.uuid4()
         async with self._session_factory() as session, session.begin():
@@ -32,7 +37,7 @@ class PostgresRunLedger:
                 sa.insert(runs).values(
                     id=run_id,
                     workspace_id=workspace_id,
-                    kind="organize",
+                    kind=kind,
                     status="running",
                     window_start=window_start,
                     window_end=window_end,

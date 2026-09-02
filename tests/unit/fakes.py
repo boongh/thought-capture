@@ -173,14 +173,19 @@ class FakeRunLedger:
     """Records lifecycle transitions for one pipeline run."""
 
     def __init__(self) -> None:
-        self.started: list[tuple[WorkspaceId, dt.datetime, dt.datetime]] = []
+        self.started: list[tuple[WorkspaceId, dt.datetime, dt.datetime, str]] = []
         self.succeeded: list[dict[str, object]] = []
         self.failed: list[dict[str, object]] = []
 
     async def start(
-        self, workspace_id: WorkspaceId, *, window_start: dt.datetime, window_end: dt.datetime
+        self,
+        workspace_id: WorkspaceId,
+        *,
+        window_start: dt.datetime,
+        window_end: dt.datetime,
+        kind: str = "organize",
     ) -> uuid.UUID:
-        self.started.append((workspace_id, window_start, window_end))
+        self.started.append((workspace_id, window_start, window_end, kind))
         return uuid.uuid4()
 
     async def succeed(

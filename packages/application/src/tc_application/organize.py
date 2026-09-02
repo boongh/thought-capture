@@ -117,9 +117,11 @@ class OrganizeWindow:
         self._clock = clock
         self._max_window_tokens = max_window_tokens
 
-    async def __call__(self, workspace_id: WorkspaceId, window: CaptureWindow) -> uuid.UUID:
+    async def __call__(
+        self, workspace_id: WorkspaceId, window: CaptureWindow, *, kind: str = "organize"
+    ) -> uuid.UUID:
         run_id = await self._run_ledger.start(
-            workspace_id, window_start=window.start, window_end=window.end
+            workspace_id, window_start=window.start, window_end=window.end, kind=kind
         )
         journal = self._journal_factory(workspace_id, run_id)
         try:
