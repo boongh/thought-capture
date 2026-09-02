@@ -64,17 +64,22 @@ class Settings(BaseSettings):
     # -- OpenRouter --------------------------------------------------------
     openrouter_api_key: SecretStr = SecretStr("")
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # Safe mode (docs/adr/0006) restricts model_organize/model_query_plan to
-    # tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS. Custom mode lifts
-    # that restriction for a host who accepts responsibility for whatever
-    # model they pin. Defaults to safe: an operator who wants the wider
-    # selection has to say so.
+    # Safe mode (docs/adr/0006) restricts model_organize/model_select/
+    # model_query_plan to tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS.
+    # Custom mode lifts that restriction for a host who accepts responsibility
+    # for whatever model they pin. Defaults to safe: an operator who wants the
+    # wider selection has to say so.
     model_selection_mode: Literal["safe", "custom"] = "safe"
     # Deliberately empty until a slug is pinned. An empty value selects the
     # deterministic offline adapter rather than silently calling a provider.
     model_organize: str = ""
+    model_select: str = ""
     model_query_plan: str = ""
     model_supports_strict_schema: bool = False
+    # Separate from model_supports_strict_schema: organize and select are
+    # independently pinned models (docs/DESIGN.md 11) and may differ on
+    # whether their provider enforces json_schema server-side.
+    model_select_supports_strict_schema: bool = False
     # Only consulted in custom mode - safe mode never allows provider
     # fallback, regardless of this value. See openrouter_allow_fallbacks.
     model_allow_fallback: bool = True
@@ -137,7 +142,7 @@ class Settings(BaseSettings):
         """
         if self.model_selection_mode != "safe":
             return self
-        for field_name in ("model_organize", "model_query_plan"):
+        for field_name in ("model_organize", "model_select", "model_query_plan"):
             slug = getattr(self, field_name)
             if slug and slug not in REVIEWED_MODELS:
                 raise ValueError(
@@ -220,6 +225,11 @@ class Settings(BaseSettings):
     def uses_offline_model_adapter(self) -> bool:
         """True when no provider slug is pinned, so organization runs offline."""
         return not self.model_organize
+
+    @property
+    def uses_offline_select_adapter(self) -> bool:
+        """True when no select-stage slug is pinned, so context selection runs offline."""
+        return not self.model_select
 
 
 @lru_cache(maxsize=1)

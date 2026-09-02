@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01; `model_select` added and gated by safe mode, `upstage/solar-pro4` added to the registry for `select`, 2026-09-02)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -110,11 +110,14 @@ basis - see "Zero-data-retention enforcement" under Decision.
 Model selection has two modes, set by `TC_MODEL_SELECTION_MODE` (`safe` by
 default):
 
-- **Safe mode.** `model_organize` and `model_query_plan` must each be either
-  empty (selects the deterministic offline adapter) or a slug present in
-  `tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS`. A slug enters that
-  registry only after being checked against all three of `docs/DESIGN.md`
-  11's concerns:
+- **Safe mode.** `model_organize`, `model_select`, and `model_query_plan`
+  must each be either empty (selects the deterministic offline adapter) or a
+  slug present in `tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS`.
+  `model_select` (docs/DESIGN.md 7.3.2) was added 2026-09-02, after this
+  ADR's original text only named the other two - it makes a live provider
+  call exactly like organize/query-plan does, so it gets the same startup
+  guarantee, not a silent exception. A slug enters that registry only after
+  being checked against all three of `docs/DESIGN.md` 11's concerns:
   - **Safe** - observed to treat captured text as quoted data rather than
     instructions (`docs/DESIGN.md` 12.2's prompt-injection assumption).
   - **Private** - the provider's data-collection/training policy for this
@@ -129,14 +132,19 @@ default):
   "Provider-endpoint pinning" below for why this is a separate field rather
   than folded into the model-review criteria above.
 
-  The registry is currently empty - `qwen/qwen3.8-flash`, the research
-  `env.example` originally staged, was added and then removed the same day
-  once its endpoint failed the private bar (see Context). With an empty
-  registry, a non-empty `model_organize`/`model_query_plan` in safe mode is
-  always rejected, so organize/query-plan run on the deterministic offline
-  adapter until a model actually passes review. Adding a model means adding
-  an entry after doing the review above - a code change and a commit, not a
-  config edit, which is the point: the review has to have actually happened.
+  `qwen/qwen3.8-flash`, the research `env.example` originally staged, was
+  added and then removed the same day once its endpoint failed the private
+  bar (see Context). The registry stayed empty until 2026-09-02, when
+  `upstage/solar-pro4` was added for `select` after a five-round live
+  evaluation (`docs/model-evaluation-organize-select.md`) - the first entry
+  to actually pass all three bars. `organize` still has no reviewed
+  candidate: a promising round-4 candidate did not hold up under round 5's
+  higher-N retest and was not added (see that document's "What this does not
+  settle"), so `model_organize` in safe mode is still always rejected if
+  non-empty, and organize runs on the deterministic offline adapter. Adding a
+  model means adding an entry after doing the review above - a code change
+  and a commit, not a config edit, which is the point: the review has to
+  have actually happened.
 
 - **Custom mode.** `TC_MODEL_SELECTION_MODE=custom` lifts the allowlist. Any
   non-empty slug is accepted, including `nvidia/nemotron-3.5-lightning:free`

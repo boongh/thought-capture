@@ -149,6 +149,30 @@ def test_safe_mode_rejects_an_unreviewed_query_plan_model(monkeypatch: pytest.Mo
         build(monkeypatch, TC_MODEL_QUERY_PLAN="an/unreviewed-model")
 
 
+def test_safe_mode_rejects_an_unreviewed_select_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """model_select makes a live provider call exactly like organize/query-plan
+    (docs/DESIGN.md 7.3.2), so it gets the same safe-mode startup guarantee."""
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_SELECT="an/unreviewed-model")
+
+
+def test_safe_mode_accepts_a_reviewed_select_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(
+        monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_SELECT="test/reviewed-model"
+    )
+    assert settings.model_select == "test/reviewed-model"
+
+
+def test_offline_select_adapter_is_selected_when_no_slug_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert build(monkeypatch, TC_MODEL_SELECT="").uses_offline_select_adapter is True
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    pinned = build(monkeypatch, TC_MODEL_SELECT="test/reviewed-model")
+    assert pinned.uses_offline_select_adapter is False
+
+
 def test_safe_mode_permits_an_empty_slug(monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty selects the offline adapter, not a provider call - nothing to review."""
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_ORGANIZE="")
