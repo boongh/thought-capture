@@ -96,6 +96,7 @@ class OrganizeWindow:
         thoughts: ThoughtWindowReader,
         context_index: ContextIndexPort,
         provider: LLMProvider,
+        select_provider: LLMProvider | None = None,
         journal_factory: JournalFactory,
         writer: OrganizeWriter,
         run_ledger: RunLedger,
@@ -107,6 +108,7 @@ class OrganizeWindow:
         self._thoughts = thoughts
         self._context_index = context_index
         self._provider = provider
+        self._select_provider = select_provider or provider
         self._journal_factory = journal_factory
         self._writer = writer
         self._run_ledger = run_ledger
@@ -155,7 +157,7 @@ class OrganizeWindow:
             assembled = await assemble_context(
                 index=index,
                 window_text=window_text,
-                provider=self._provider,
+                provider=self._select_provider,
                 journal=journal,
                 now=self._clock(),
                 config=self._config,
