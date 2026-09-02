@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import discord
+from discord import app_commands
 
 from tc_application.capture import CaptureThought
 from tc_discord_bot.adapter import acknowledgement_for, command_from, facts_from
@@ -71,6 +73,9 @@ class CaptureClient(discord.Client):
         self._user_id = user_id
         self._timezone = workspace_timezone
         self._digest_loop: DigestDeliveryLoop | None = None
+        self.tree = app_commands.CommandTree(self)
+        self._guild_id_for_command_sync: int | None = None
+        self._commands_synced = False
 
     def attach_digest_loop(self, digest_loop: DigestDeliveryLoop) -> None:
         """Wire the digest poller in after construction.
@@ -81,6 +86,19 @@ class CaptureClient(discord.Client):
         """
         self._digest_loop = digest_loop
 
+    def attach_admin_commands(
+        self, commands: tuple[app_commands.Command[Any, ..., Any], ...], *, guild_id: int | None
+    ) -> None:
+        """Registers ``/organize``/``/status`` (or any admin commands) onto ``self.tree``.
+
+        Must be called before ``start()``; ``on_ready`` performs the actual
+        Discord-side sync (network calls belong after the Gateway connection
+        is up, not during construction).
+        """
+        for command in commands:
+            self.tree.add_command(command)
+        self._guild_id_for_command_sync = guild_id
+
     async def on_ready(self) -> None:
         # The bot's own identity is not personal memory content, but the owner's
         # account ID is, so it is not logged.
@@ -90,6 +108,35 @@ class CaptureClient(discord.Client):
         )
         if self._digest_loop is not None:
             self._digest_loop.start()
+        await self._sync_commands()
+
+    async def _sync_commands(self) -> None:
+        """Sync once per process lifetime.
+
+        ``on_ready`` can fire again after a Gateway reconnect; re-syncing
+        every time would needlessly spend this bot's command-sync rate limit
+        for no behavior change, since the command set is fixed at startup.
+        """
+        if self._commands_synced or len(self.tree.get_commands()) == 0:
+            return
+        try:
+            # Global sync: required for DM usage (docs/DESIGN.md 4.1's
+            # DM-only capture mode has no guild to scope a faster sync to),
+            # but can take up to an hour to propagate to every surface.
+            await self.tree.sync()
+            if self._guild_id_for_command_sync is not None:
+                # Guild-scoped copy: instant availability in the configured
+                # guild, so a developer/operator is not stuck waiting on
+                # global propagation to test a change.
+                guild = discord.Object(id=self._guild_id_for_command_sync)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            self._commands_synced = True
+            logger.info("discord.commands_synced", extra={"count": len(self.tree.get_commands())})
+        except discord.DiscordException as exc:
+            # Never fatal: capture must keep working even if command sync
+            # fails (rate limit, transient API error).
+            logger.warning("discord.command_sync_failed", extra={"error_class": type(exc).__name__})
 
     async def close(self) -> None:
         if self._digest_loop is not None:
