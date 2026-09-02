@@ -59,6 +59,10 @@ class AssembledContext:
     def full_stable_keys(self) -> frozenset[str]:
         return frozenset(s.stable_key for s in self.selections if s.inclusion == "full")
 
+    @property
+    def partial_stable_keys(self) -> frozenset[str]:
+        return frozenset(s.stable_key for s in self.selections if s.inclusion == "partial")
+
 
 def render_index(index: tuple[Tier1Row, ...]) -> str:
     """Tier 1 index rendered compactly for a prompt (docs/DESIGN.md 7.3.1).

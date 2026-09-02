@@ -38,6 +38,32 @@ class TestDocumentStableKey:
     def test_strips_leading_and_trailing_punctuation(self) -> None:
         assert document_stable_key(EntityType.PERSON, "jane!!") == "person:jane"
 
+    def test_distinct_non_ascii_names_do_not_collide(self) -> None:
+        """Two different Japanese place names must not both slug to empty."""
+        tokyo = document_stable_key(EntityType.PLACE, normalize_entity_name("東京"))
+        beijing = document_stable_key(EntityType.PLACE, normalize_entity_name("北京"))
+        assert tokyo != beijing
+        assert tokyo.startswith("place:")
+        assert beijing.startswith("place:")
+
+    def test_distinct_all_punctuation_names_do_not_collide(self) -> None:
+        """Two names that strip to an empty ASCII slug must still differ."""
+        a = document_stable_key(EntityType.PERSON, "!!!")
+        b = document_stable_key(EntityType.PERSON, "???")
+        assert a != b
+
+    def test_a_name_with_a_dropped_non_ascii_suffix_does_not_collide(self) -> None:
+        """An ASCII prefix with a stripped non-ASCII tail must stay distinct."""
+        a = document_stable_key(EntityType.PERSON, normalize_entity_name("Jane 東"))
+        b = document_stable_key(EntityType.PERSON, normalize_entity_name("Jane 京"))
+        assert a != b
+
+    def test_is_deterministic(self) -> None:
+        name = normalize_entity_name("東京")
+        assert document_stable_key(EntityType.PLACE, name) == document_stable_key(
+            EntityType.PLACE, name
+        )
+
 
 class TestEntityResolutionThresholds:
     def test_rejects_an_inverted_ordering(self) -> None:

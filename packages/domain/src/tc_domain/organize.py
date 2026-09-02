@@ -32,6 +32,19 @@ class OrganizeCoverageError(DomainError):
     """
 
 
+class WindowTooLargeError(DomainError):
+    """The window's rendered text exceeds the organize pipeline's input bound.
+
+    docs/DESIGN.md 14.1 calls for "deterministic chunking with overlap and
+    final coverage validation" on a very large window; that splitter is not
+    implemented yet (see the organize-pipeline slice's commit report). Until
+    it is, an oversized window - an import, or a long stretch of missed
+    catch-up windows merged into one - must fail loudly and cheaply, before
+    a single token is sent to the provider, rather than silently paying for
+    (and risking a timeout or truncation on) an unbounded prompt.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class WindowThought:
     """The minimal shape of a raw thought the organize pipeline needs."""
@@ -75,6 +88,29 @@ class ContextSelectionWrite:
     signals: tuple[Signal, ...]
     inclusion: Inclusion
     referenced_in_output: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    """The ``runs`` row fields a successful organize call finishes with.
+
+    Passed into ``OrganizeWriter.write`` so the run's ``succeeded`` status
+    transition lands in the *same* transaction as the documents, revisions,
+    entities, and outbox event it describes - never as a separate write
+    after the fact. A separate later write is exactly the crash window that
+    let a completed-but-unmarked run go undetected by
+    ``OrganizeScheduler``'s resume check, causing a retry to redo an
+    already-committed window: a second run, a second digest document, and a
+    second ``digest.ready`` event delivered to Discord for the same day.
+    """
+
+    model_provider: str | None
+    model_id: str | None
+    prompt_version: str
+    input_tokens: int
+    output_tokens: int
+    context_recall: float | None
+    context_degraded: bool
 
 
 @dataclass(frozen=True, slots=True)

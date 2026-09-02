@@ -16,6 +16,7 @@ from tc_domain.organize import (
     DocumentWrite,
     EntityMentionWrite,
     OrganizeWriteRequest,
+    RunOutcome,
 )
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
@@ -26,6 +27,7 @@ from tc_infrastructure.db.tables import (
     outbox_events,
     revision_sources,
     run_context_selections,
+    runs,
     thoughts,
 )
 
@@ -34,6 +36,20 @@ pytestmark = pytest.mark.integration
 BODY = (
     "## Summary\n\nsomething\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- x"
 )
+
+
+def _outcome(**overrides: object) -> RunOutcome:
+    defaults: dict[str, object] = {
+        "model_provider": "offline",
+        "model_id": "offline-model",
+        "prompt_version": "organize-v1",
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "context_recall": None,
+        "context_degraded": False,
+    }
+    defaults.update(overrides)
+    return RunOutcome(**defaults)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -119,7 +135,9 @@ async def test_writing_a_new_document_creates_it_with_revision_one(
     )
 
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
 
     async with app_session_factory() as session:
         doc = (
@@ -177,10 +195,12 @@ async def test_a_second_write_to_the_same_document_chains_the_revision(
             unorganized_thought_ids=(),
         )
 
-    first = await writer.write(workspace_id=workspace, run_id=run_id, request=request("first"))
+    first = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request("first"), outcome=_outcome()
+    )
     second_run = await _run_id(app_session_factory, workspace)
     second = await writer.write(
-        workspace_id=workspace, run_id=second_run, request=request("second")
+        workspace_id=workspace, run_id=second_run, request=request("second"), outcome=_outcome()
     )
 
     assert first.document_ids[stable_key] == second.document_ids[stable_key]
@@ -238,7 +258,7 @@ async def test_mentioned_entities_are_resolved_and_linked_to_the_revision(
     )
 
     writer = PostgresOrganizeWriter(app_session_factory)
-    await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    await writer.write(workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome())
 
     async with app_session_factory() as session:
         entity = (
@@ -294,7 +314,9 @@ async def test_context_selections_are_written_only_for_documents_that_exist(
     )
 
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
 
     async with app_session_factory() as session:
         rows = (
@@ -335,7 +357,9 @@ async def test_a_daily_digest_document_enqueues_the_digest_outbox_event(
     )
 
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
 
     async with app_session_factory() as session:
         event = (
@@ -376,7 +400,9 @@ async def test_a_non_digest_only_write_enqueues_no_outbox_event(
     )
 
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(workspace_id=workspace, run_id=run_id, request=request)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
 
     assert result.digest_document_id is None
     async with app_session_factory() as session:
@@ -386,3 +412,58 @@ async def test_a_non_digest_only_write_enqueues_no_outbox_event(
             )
         ).all()
     assert events == []
+
+
+async def test_write_marks_the_run_succeeded_in_the_same_transaction(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """The crash window this closes: a prior version called ``RunLedger.succeed``
+    in a *separate* transaction after ``write`` committed, so a crash in
+    between left durable output with a run stuck ``running`` forever -
+    invisible to ``OrganizeScheduler``'s resume check, which only trusts
+    ``status='succeeded'``. Retrying such a window would silently create a
+    second run, a second digest document, and a second Discord delivery for
+    the same day. Folding the status transition into ``write``'s own
+    transaction means there is no longer a gap for a crash to land in: this
+    call either produces both the documents *and* the succeeded status, or
+    neither.
+    """
+    run_id = await _run_id(app_session_factory, workspace)
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=f"project:outcome-{unique}",
+                kind="project",
+                title="Outcome",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+
+    writer = PostgresOrganizeWriter(app_session_factory)
+    await writer.write(
+        workspace_id=workspace,
+        run_id=run_id,
+        request=request,
+        outcome=_outcome(input_tokens=42, output_tokens=99, context_recall=0.75),
+    )
+
+    async with app_session_factory() as session:
+        row = (await session.execute(sa.select(runs).where(runs.c.id == run_id))).one()
+
+    assert row.status == "succeeded"
+    assert row.finished_at is not None
+    assert row.input_tokens == 42
+    assert row.output_tokens == 99
+    assert float(row.context_recall) == pytest.approx(0.75)
