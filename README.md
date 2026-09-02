@@ -1,14 +1,17 @@
 # Thought Capture AI
 
-Thought Capture AI is a self-hosted, single-user-first personal memory system. A Discord bot captures low-friction text and file attachments, an append-only store preserves the original record, and a scheduled pipeline turns captured fragments into cited daily and evolving documents. Khoj supplies semantic retrieval and Ask/RAG; the application adds deterministic date, time, entity, and lexical search.
+Thought Capture AI is a self-hosted, single-user-first personal memory system. A Discord bot captures low-friction text and file attachments, an append-only store preserves the original record, and a scheduled pipeline turns captured fragments into cited daily and evolving documents. The intended retrieval architecture reserves Khoj for semantic retrieval and Ask/RAG and the application for deterministic date, time, entity, and lexical search; that Phase 2 capability is not implemented yet.
 
 ## Project status
 
-Implementation in progress. The durable-capture slice is runnable: PostgreSQL,
-one-shot migration and workspace bootstrap, the Discord capture bot, and the
-raw-thought HTTP API are available through the `core` Compose profile. The
-organization pipeline, digest worker, Khoj integration, and custom UI are not
-runnable yet.
+Implementation in progress. The `core` Compose profile now runs PostgreSQL,
+one-shot migration and workspace bootstrap, the Discord capture bot, the API,
+and the worker. It supports durable capture, organization of closed capture
+windows, versioned documents and entities, and queued Discord digest delivery.
+The default safe-mode model configuration remains deliberately offline until a
+reviewed provider model is registered. Khoj integration and the future unified
+custom UI are not runnable yet; the current read-only operator debug pages are
+an inspection tool, not that future UI.
 
 The implementation target and acceptance criteria are defined in
 [docs/DESIGN.md](docs/DESIGN.md). That document remains the project anchor:
@@ -95,7 +98,7 @@ thought-capture-ai/
   apps/
     api/                 # public gateway and read API
     discord_bot/         # Discord Gateway adapter
-    worker/              # migration bootstrap and organization scheduling primitives
+    worker/              # migration bootstrap and organization scheduler
   packages/
     domain/              # entities, commands, policies, ports
     application/         # use cases and orchestration
@@ -111,10 +114,11 @@ thought-capture-ai/
 
 ## Development sequence
 
-Implementation follows the release gates in the design document. The durable
-capture slice — Discord text and attachments -> append-only PostgreSQL ->
-acknowledgement — and the raw-log HTTP API are implemented. Organization,
-digests, Khoj, and the future custom UI remain later slices.
+Implementation follows the release gates in the design document. Durable
+capture, scheduled organization, derived document/entity persistence, digest
+delivery, and operator inspection endpoints are now represented in the stack.
+Khoj retrieval/Ask, backup and restore operations, and the future unified
+custom UI remain later slices.
 
 ## AI-assisted development workflow
 
