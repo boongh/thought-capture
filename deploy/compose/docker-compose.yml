@@ -10,7 +10,7 @@
 #
 # Profiles:
 #   core          postgres, one-shot migrate, api, discord-bot, worker
-#   ai            Khoj and its own database (Phase 2, not yet defined)
+#   ai            Khoj and its own database (docs/adr/0003)
 #   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
 
 name: thought-capture
@@ -169,8 +169,74 @@ services:
     environment:
       <<: *service-env
 
+  # docs/adr/0003. Khoj's own database - deliberately not sharing the
+  # first-party `postgres` server/image: Khoj's reference deployment requires
+  # a pgvector-capable build, which would otherwise couple the first-party
+  # server's base image to an internal detail of a system this project
+  # declares replaceable (docs/DESIGN.md 5 invariant 7).
+  khoj-db:
+    image: docker.io/pgvector/pgvector:pg15
+    profiles: ["ai"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: khoj
+      POSTGRES_USER: khoj
+      POSTGRES_PASSWORD: ${TC_KHOJ_DB_PASSWORD:?TC_KHOJ_DB_PASSWORD must be set in .env}
+    volumes:
+      - khoj-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U khoj -d khoj"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  # docs/adr/0003. Pinned by digest; --anonymous-mode means every request
+  # gets Khoj's built-in anonymous user, so this project's own gateway
+  # remains the only real authorization boundary - the port is bound to
+  # loopback only, matching postgres and the debug UI (docs/adr/0009).
+  khoj:
+    image: ghcr.io/khoj-ai/khoj:2.0.0-beta.28@sha256:eb2e44669df44b51cb206b394dc0a00c782ac152dda02c97c9e3dac3d643dbb4
+    profiles: ["ai"]
+    restart: unless-stopped
+    depends_on:
+      khoj-db:
+        condition: service_healthy
+    command: ["--host=0.0.0.0", "--port=42110", "--anonymous-mode", "--non-interactive"]
+    environment:
+      POSTGRES_DB: khoj
+      POSTGRES_USER: khoj
+      POSTGRES_PASSWORD: ${TC_KHOJ_DB_PASSWORD:?TC_KHOJ_DB_PASSWORD must be set in .env}
+      POSTGRES_HOST: khoj-db
+      POSTGRES_PORT: "5432"
+      KHOJ_DJANGO_SECRET_KEY: ${TC_KHOJ_DJANGO_SECRET_KEY:?TC_KHOJ_DJANGO_SECRET_KEY must be set in .env}
+      KHOJ_DEBUG: "False"
+      # Admin-panel credentials only (Khoj's own Django admin at /server/admin);
+      # not this project's auth boundary and not consumed by any adapter here.
+      KHOJ_ADMIN_EMAIL: ${TC_KHOJ_ADMIN_EMAIL:-admin@localhost}
+      KHOJ_ADMIN_PASSWORD: ${TC_KHOJ_ADMIN_PASSWORD:?TC_KHOJ_ADMIN_PASSWORD must be set in .env}
+      # Self-hosting Khoj specifically to keep personal data local; leaving
+      # telemetry on by default would undermine that (docs/adr/0003).
+      KHOJ_TELEMETRY_DISABLE: "True"
+    ports:
+      - "127.0.0.1:${TC_KHOJ_PORT:-42110}:42110"
+    volumes:
+      - khoj-config:/root/.khoj/
+      - khoj-models:/root/.cache/torch/sentence_transformers
+      - khoj-models:/root/.cache/huggingface
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   postgres-data:
     driver: local
   attachments:
+    driver: local
+  khoj-db-data:
+    driver: local
+  khoj-config:
+    driver: local
+  khoj-models:
     driver: local

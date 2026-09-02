@@ -116,6 +116,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Contract tests: require the pinned Khoj instance from the 'ai' compose
+# profile (docs/adr/0003). Unlike PostgreSQL/'core' above, 'ai' is a new,
+# heavy, optional-so-far dependency - reachability is probed explicitly
+# (Docker being up does not imply this profile was ever started) and an
+# unreachable Khoj is a skip, not a hard failure, until Phase 2 makes it
+# required.
+# ---------------------------------------------------------------------------
+printf '\n--- contract tests\n'
+khoj_url="${TC_KHOJ_BASE_URL:-http://127.0.0.1:42110}"
+if curl --silent --fail --max-time 3 "$khoj_url/api/search?q=check" >/dev/null 2>&1; then
+  if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract; then
+    printf 'FAIL: contract tests\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "OK: contract tests"
+else
+  skipped+=("contract tests (Khoj unreachable at $khoj_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile ai up -d)")
+  printf '%s\n' "SKIPPED: Khoj unreachable at $khoj_url"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n'
 if [[ ${#skipped[@]} -gt 0 ]]; then
   printf '%s\n' "PASS WITH SKIPS"

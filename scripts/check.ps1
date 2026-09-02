@@ -123,6 +123,42 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # Contract tests: require the pinned Khoj instance from the 'ai' compose
+    # profile (docs/adr/0003). Unlike PostgreSQL/'core' above, 'ai' is a new,
+    # heavy, optional-so-far dependency - reachability is probed explicitly
+    # (Docker being up does not imply this profile was ever started) and an
+    # unreachable Khoj is a skip, not a hard failure, until Phase 2 makes it
+    # required.
+    # -----------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- contract tests" -ForegroundColor Cyan
+    $KhojUrl = if ($env:TC_KHOJ_BASE_URL) { $env:TC_KHOJ_BASE_URL } else { "http://127.0.0.1:42110" }
+    $KhojUp = $false
+    try {
+        $response = Invoke-WebRequest -Uri "$KhojUrl/api/search?q=check" -TimeoutSec 3 -UseBasicParsing
+        if ($response.StatusCode -eq 200) { $KhojUp = $true }
+    }
+    catch {
+        $KhojUp = $false
+    }
+
+    if ($KhojUp) {
+        $env:TC_REQUIRE_CONTRACT = "1"
+        try {
+            & $Uv run pytest -m contract
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (exit $LASTEXITCODE)" }
+        }
+        finally {
+            Remove-Item Env:\TC_REQUIRE_CONTRACT -ErrorAction SilentlyContinue
+        }
+        Write-Host "OK: contract tests"
+    }
+    else {
+        $Script:Skipped += "contract tests (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile ai up -d)"
+        Write-Host "SKIPPED: Khoj unreachable at $KhojUrl" -ForegroundColor Yellow
+    }
+
+    # -----------------------------------------------------------------------
     Write-Host ""
     if ($Script:Skipped.Count -gt 0) {
         Write-Host "PASS WITH SKIPS" -ForegroundColor Yellow

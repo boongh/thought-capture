@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8080, ge=1, le=65535)
     api_bearer_token: SecretStr = SecretStr("")
 
+    # -- Khoj (docs/adr/0003) -----------------------------------------------
+    # Loopback-only, --anonymous-mode: no Khoj API token is provisioned or
+    # used (docs/adr/0003's auth-mode decision).
+    khoj_base_url: str = "http://127.0.0.1:42110"
+
     @field_validator(
         "discord_owner_user_id",
         "discord_guild_id",
