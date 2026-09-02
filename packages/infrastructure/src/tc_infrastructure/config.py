@@ -64,17 +64,22 @@ class Settings(BaseSettings):
     # -- OpenRouter --------------------------------------------------------
     openrouter_api_key: SecretStr = SecretStr("")
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # Safe mode (docs/adr/0006) restricts model_organize/model_query_plan to
-    # tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS. Custom mode lifts
-    # that restriction for a host who accepts responsibility for whatever
-    # model they pin. Defaults to safe: an operator who wants the wider
-    # selection has to say so.
+    # Safe mode (docs/adr/0006) restricts model_organize/model_select/
+    # model_query_plan to tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS.
+    # Custom mode lifts that restriction for a host who accepts responsibility
+    # for whatever model they pin. Defaults to safe: an operator who wants the
+    # wider selection has to say so.
     model_selection_mode: Literal["safe", "custom"] = "safe"
     # Deliberately empty until a slug is pinned. An empty value selects the
     # deterministic offline adapter rather than silently calling a provider.
     model_organize: str = ""
+    model_select: str = ""
     model_query_plan: str = ""
     model_supports_strict_schema: bool = False
+    # Separate from model_supports_strict_schema: organize and select are
+    # independently pinned models (docs/DESIGN.md 11) and may differ on
+    # whether their provider enforces json_schema server-side.
+    model_select_supports_strict_schema: bool = False
     # Only consulted in custom mode - safe mode never allows provider
     # fallback, regardless of this value. See openrouter_allow_fallbacks.
     model_allow_fallback: bool = True
@@ -93,6 +98,11 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8080, ge=1, le=65535)
     api_bearer_token: SecretStr = SecretStr("")
+
+    # -- Khoj (docs/adr/0003) -----------------------------------------------
+    # Loopback-only, --anonymous-mode: no Khoj API token is provisioned or
+    # used (docs/adr/0003's auth-mode decision).
+    khoj_base_url: str = "http://127.0.0.1:42110"
 
     @field_validator(
         "discord_owner_user_id",
@@ -137,7 +147,7 @@ class Settings(BaseSettings):
         """
         if self.model_selection_mode != "safe":
             return self
-        for field_name in ("model_organize", "model_query_plan"):
+        for field_name in ("model_organize", "model_select", "model_query_plan"):
             slug = getattr(self, field_name)
             if slug and slug not in REVIEWED_MODELS:
                 raise ValueError(
@@ -182,6 +192,32 @@ class Settings(BaseSettings):
         reviewed = REVIEWED_MODELS.get(model_id)
         return reviewed.providers if reviewed is not None else None
 
+    def strict_schema_supported(self, model_id: str, *, custom_flag: bool) -> bool:
+        """Whether to request strict `response_format`/`require_parameters` for `model_id`.
+
+        Safe mode (docs/adr/0006) is a hard-enforced allowlist: every safe-mode
+        admission requirement - including JSON-structure enforceability - is
+        derived from the reviewed model's own recorded capability in
+        `REVIEWED_MODELS`, never from a mutable operator-set flag. An operator
+        leaving `model_supports_strict_schema`/`model_select_supports_strict_schema`
+        at its default (or setting it wrong) must not silently weaken a
+        safe-mode guarantee the registry already established - that is
+        exactly the gap this method closes (independent PR #16 review).
+        `custom_flag` (the corresponding `model_supports_strict_schema` /
+        `model_select_supports_strict_schema` setting) is consulted only in
+        custom mode, where an operator-set override is legitimate because the
+        operator has already opted out of the allowlist.
+
+        `_safe_mode_restricts_to_reviewed_models` already guarantees a
+        non-empty slug reaching here in safe mode is a `REVIEWED_MODELS` key,
+        so the `None` branch below is unreachable in practice - same
+        defensive shape as `openrouter_only_providers`.
+        """
+        if self.model_selection_mode != "safe":
+            return custom_flag
+        reviewed = REVIEWED_MODELS.get(model_id)
+        return reviewed.supports_strict_schema if reviewed is not None else False
+
     @property
     def openrouter_deny_data_collection(self) -> bool:
         """Whether to tell OpenRouter to route only through non-retaining providers.
@@ -220,6 +256,11 @@ class Settings(BaseSettings):
     def uses_offline_model_adapter(self) -> bool:
         """True when no provider slug is pinned, so organization runs offline."""
         return not self.model_organize
+
+    @property
+    def uses_offline_select_adapter(self) -> bool:
+        """True when no select-stage slug is pinned, so context selection runs offline."""
+        return not self.model_select
 
 
 @lru_cache(maxsize=1)

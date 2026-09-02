@@ -7,7 +7,7 @@ actually stored. Written for the project owner.
 
 Install Docker Desktop and ensure its engine is running. For host-side
 development and checks, also install `uv` and the pinned Python version as
-described in the repository README.
+described in [DEVELOPMENT.md](DEVELOPMENT.md).
 
 From the repository root, copy `env.example` to `.env` if needed. Set unique
 values for `POSTGRES_PASSWORD`, `TC_APP_DB_PASSWORD`, and

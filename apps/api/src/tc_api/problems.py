@@ -81,3 +81,7 @@ def service_unavailable(detail: str) -> ProblemError:
     return ProblemError(
         status=503, title="Service Unavailable", code="dependency-unavailable", detail=detail
     )
+
+
+def not_implemented(code: str, detail: str) -> ProblemError:
+    return ProblemError(status=501, title="Not Implemented", code=code, detail=detail)

@@ -149,6 +149,30 @@ def test_safe_mode_rejects_an_unreviewed_query_plan_model(monkeypatch: pytest.Mo
         build(monkeypatch, TC_MODEL_QUERY_PLAN="an/unreviewed-model")
 
 
+def test_safe_mode_rejects_an_unreviewed_select_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """model_select makes a live provider call exactly like organize/query-plan
+    (docs/DESIGN.md 7.3.2), so it gets the same safe-mode startup guarantee."""
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_SELECT="an/unreviewed-model")
+
+
+def test_safe_mode_accepts_a_reviewed_select_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(
+        monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_SELECT="test/reviewed-model"
+    )
+    assert settings.model_select == "test/reviewed-model"
+
+
+def test_offline_select_adapter_is_selected_when_no_slug_is_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert build(monkeypatch, TC_MODEL_SELECT="").uses_offline_select_adapter is True
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    pinned = build(monkeypatch, TC_MODEL_SELECT="test/reviewed-model")
+    assert pinned.uses_offline_select_adapter is False
+
+
 def test_safe_mode_permits_an_empty_slug(monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty selects the offline adapter, not a provider call - nothing to review."""
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_ORGANIZE="")
@@ -246,3 +270,59 @@ def test_custom_mode_never_restricts_providers(monkeypatch: pytest.MonkeyPatch) 
     stub_reviewed_model(monkeypatch, "test/reviewed-model")
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
     assert settings.openrouter_only_providers("test/reviewed-model") is None
+
+
+# ---------------------------------------------------------------------------
+# strict_schema_supported (PR #16 review: safe mode must derive strict-schema
+# enforcement from REVIEWED_MODELS, not from the mutable
+# model_supports_strict_schema / model_select_supports_strict_schema flags)
+# ---------------------------------------------------------------------------
+
+
+def test_safe_mode_derives_strict_schema_from_the_reviewed_model_even_if_the_flag_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact PR #16 finding: a reviewed model's own recorded capability
+    must win over an operator-set flag left at its false default."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.strict_schema_supported("test/reviewed-model", custom_flag=False) is True
+
+
+def test_safe_mode_ignores_a_flag_that_disagrees_with_the_reviewed_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Safe mode is a hard-enforced allowlist: an operator cannot silently
+    weaken it by setting the flag `True` either, when nothing derives from
+    that flag in safe mode in the first place - the registry alone decides."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.strict_schema_supported("test/reviewed-model", custom_flag=True) is True
+
+
+def test_safe_mode_has_no_strict_schema_support_for_a_model_not_looked_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a realistic call in practice - the validator already rejects an
+    unreviewed pin - but the lookup itself must not fabricate support for a
+    model it doesn't recognize, same defensive shape as openrouter_only_providers."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.strict_schema_supported("an/unreviewed-model", custom_flag=True) is False
+
+
+def test_custom_mode_follows_the_strict_schema_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Custom mode is exactly where an operator-set override is legitimate -
+    the operator has already opted out of the allowlist."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.strict_schema_supported("an/unreviewed-model", custom_flag=True) is True
+    assert settings.strict_schema_supported("an/unreviewed-model", custom_flag=False) is False
+
+
+def test_custom_mode_ignores_the_registry_for_strict_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even for a slug that happens to also be reviewed - custom mode's
+    promise is freedom from the allowlist entirely."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.strict_schema_supported("test/reviewed-model", custom_flag=False) is False
