@@ -56,6 +56,7 @@ The `core` profile currently starts:
 | `migrate` | One-shot schema migration and workspace/owner seed |
 | `api` | Health endpoints and authenticated raw-thought capture/read API |
 | `discord-bot` | Allowlisted Discord text and attachment capture |
+| `worker` | Closed-window organization scheduler and catch-up worker |
 
 Check status and readiness:
 
@@ -67,12 +68,14 @@ curl http://127.0.0.1:8080/health/ready
 Follow startup or failure logs without printing the contents of `.env`:
 
 ```bash
-docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core logs -f migrate api discord-bot
+docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core logs -f migrate api discord-bot worker
 ```
 
 The interactive API documentation is at <http://127.0.0.1:8080/docs>.
 `/health/live` and `/health/ready` are intentionally unauthenticated; `/v1`
-routes require `Authorization: Bearer <TC_API_BEARER_TOKEN>`.
+and `/debug` routes require bearer authentication. Send
+`Authorization: Bearer <TC_API_BEARER_TOKEN>` from an authenticated client;
+do not place a reusable bearer token in a URL or a log.
 
 Stop the services while preserving the PostgreSQL and attachment volumes:
 
@@ -153,10 +156,14 @@ Every committed thought writes a `thought.captured` row into `outbox_events` in
 the same transaction. After a Discord capture commits, the bot replies directly
 and marks the matching event delivered. If the reply or settlement fails, the
 event remains pending. This is the table to inspect when a message was captured
-but no reply appeared. A persistent retry consumer is not wired yet, so pending
-events are diagnostic state rather than proof that an automatic retry will run.
-API captures also leave their acknowledgement events pending because there is
-no Discord message to reply to and no consumer to route them elsewhere yet.
+but no reply appeared. Capture-acknowledgement retry is not yet wired, so those
+pending events are diagnostic state rather than proof that an automatic retry
+will run. API captures also leave acknowledgement events pending because there
+is no Discord message to reply to and no consumer to route them elsewhere yet.
+
+The bot now has a separate persistent consumer for `digest.ready` events. It
+claims and retries only generated-digest delivery; it does not consume or send
+capture acknowledgements.
 
 **Anything still undelivered:**
 
@@ -226,11 +233,19 @@ that could not execute a stage says `NOT RUN` and is not a passing run.
 ## Current scope and known gaps
 
 The runnable stack captures allowlisted Discord text and attachments, exposes
-authenticated API capture and raw-log reads, and preserves canonical data in
-PostgreSQL. The API currently provides health and `/v1/thoughts` routes only.
+authenticated API capture and reads, and preserves canonical data in
+PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`, and
+`/v1/entities` routes. A separate read-only `/debug` operator view exposes raw
+thoughts, entities, and daily digests; it is not the future unified UI.
 
-Schema and scheduling building blocks for later slices exist, but there is no
-persistent worker entrypoint or completed organization pipeline. Daily digests,
-automatic outbox retries, Khoj indexing/search/Ask, backup jobs, and the custom
-UI are not runnable yet. The `ai` and `backup` Compose profiles described in the
-design are likewise not defined yet.
+The `worker` processes closed capture windows, catches up missed windows after
+startup, and writes versioned derived documents and entities. The Discord bot
+polls queued daily-digest deliveries separately from capture acknowledgements.
+With no reviewed model registered, safe mode uses the deterministic offline
+adapter; configuring a provider model remains subject to ADR-0006's review
+requirements.
+
+Khoj indexing/search/Ask, backup and restore jobs, retry delivery for capture
+acknowledgements, and the future unified custom UI are not runnable yet. The
+`ai` and `backup` Compose profiles described in the design are likewise not
+defined yet.
