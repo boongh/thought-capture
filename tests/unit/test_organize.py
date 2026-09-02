@@ -89,6 +89,28 @@ async def test_an_empty_window_skips_the_llm_and_writer() -> None:
     assert run_ledger.succeeded[0]["input_tokens"] == 0
 
 
+async def test_run_kind_defaults_to_organize() -> None:
+    provider = OfflineLLMProvider()
+    pipeline, _writer, run_ledger = make_pipeline(thoughts=[], provider=provider)
+
+    await pipeline(WORKSPACE, WINDOW)
+
+    assert run_ledger.started[0][3] == "organize"
+
+
+async def test_run_kind_is_persisted_for_a_forced_run() -> None:
+    """An owner-triggered ``/organize`` passes ``kind="force_organize"``
+    through to the run ledger (docs/DESIGN.md 4.2), so it is never mistaken
+    for the scheduler's own ``organize`` run of the same window
+    (``PostgresCaptureWindows.succeeded_run_for`` only matches ``"organize"``)."""
+    provider = OfflineLLMProvider()
+    pipeline, _writer, run_ledger = make_pipeline(thoughts=[], provider=provider)
+
+    await pipeline(WORKSPACE, WINDOW, kind="force_organize")
+
+    assert run_ledger.started[0][3] == "force_organize"
+
+
 async def test_the_happy_path_writes_and_marks_the_run_succeeded() -> None:
     organize_reply = json.dumps(
         {

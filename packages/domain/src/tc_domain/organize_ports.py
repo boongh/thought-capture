@@ -69,10 +69,21 @@ class OrganizeWriter(Protocol):
 @runtime_checkable
 class RunLedger(Protocol):
     async def start(
-        self, workspace_id: WorkspaceId, *, window_start: dt.datetime, window_end: dt.datetime
+        self,
+        workspace_id: WorkspaceId,
+        *,
+        window_start: dt.datetime,
+        window_end: dt.datetime,
+        kind: str = "organize",
     ) -> uuid.UUID:
         """Create the ``runs`` row before anything else - including the first
         LLM call, whose journal entry needs a valid ``run_id`` to reference.
+
+        ``kind`` distinguishes the scheduler's own runs (``"organize"``) from
+        an owner-triggered ``/organize`` (``"force_organize"``,
+        docs/DESIGN.md 4.2/6.3) - kept out of the ``runs.kind`` CHECK
+        constraint's other values (``khoj_sync``, ``export``, ...), which this
+        pipeline never writes.
         """
         ...
 

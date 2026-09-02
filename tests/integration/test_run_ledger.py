@@ -39,6 +39,24 @@ async def test_start_creates_a_running_row(
     assert row.started_at is not None
 
 
+async def test_start_persists_a_forced_run_kind(
+    app_session_factory: async_sessionmaker[AsyncSession], workspace: WorkspaceId
+) -> None:
+    """An owner-triggered ``/organize`` run is labeled ``force_organize``
+    (docs/DESIGN.md 4.2), distinct from the scheduler's own ``organize`` rows."""
+    ledger = PostgresRunLedger(app_session_factory)
+    start = dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC)
+    end = dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC)
+
+    run_id = await ledger.start(
+        workspace, window_start=start, window_end=end, kind="force_organize"
+    )
+
+    async with app_session_factory() as session:
+        row = (await session.execute(sa.select(runs).where(runs.c.id == run_id))).one()
+    assert row.kind == "force_organize"
+
+
 async def test_succeed_records_usage_and_recall(
     app_session_factory: async_sessionmaker[AsyncSession], workspace: WorkspaceId
 ) -> None:
