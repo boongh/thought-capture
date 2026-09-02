@@ -14,7 +14,11 @@ from tc_domain.organize import DocumentWrite, OrganizeWriteRequest, RunOutcome
 from tc_domain.search import SearchQuery
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
-from tc_infrastructure.db.search_reader import PostgresExactSearch
+from tc_infrastructure.db.search_reader import (
+    PostgresExactSearch,
+    _entity_names_for,
+    _thought_ids_for,
+)
 from tc_infrastructure.db.tables import entities, entity_mentions, thoughts
 
 pytestmark = pytest.mark.integration
@@ -123,6 +127,85 @@ async def _write_document(
         )
     assert revision_id is not None
     return document_id, revision_id
+
+
+async def _write_document_with_sources(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    thought_ids: tuple[ThoughtId, ...],
+    *,
+    stable_key: str,
+    kind: str,
+    title: str,
+    body_markdown: str,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Like ``_write_document`` but for a document cited by more than one
+    thought - needed to exercise a filter combination where no single cited
+    thought satisfies every provenance predicate on its own."""
+    ledger = PostgresRunLedger(app_session_factory)
+    run_id = await ledger.start(
+        workspace,
+        window_start=dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC),
+        window_end=dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC),
+    )
+    request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=stable_key,
+                kind=kind,
+                title=title,
+                body_markdown=body_markdown,
+                source_thought_ids=thought_ids,
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+    writer = PostgresOrganizeWriter(app_session_factory)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
+    document_id = result.document_ids[stable_key]
+    async with app_session_factory() as session:
+        revision_id = await session.scalar(
+            sa.text("SELECT current_revision_id FROM documents WHERE id = :id").bindparams(
+                id=document_id
+            )
+        )
+    assert revision_id is not None
+    return document_id, revision_id
+
+
+async def _second_workspace(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[WorkspaceId, uuid.UUID]:
+    """A second, independent workspace/owner - mirrors the ``fresh_identity``
+    fixture's own seeding, done inline so a single test can hold both
+    workspace identities at once for a cross-workspace isolation check."""
+    workspace_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(
+            sa.text("INSERT INTO users (id, display_name) VALUES (:id, :name)"),
+            {"id": user_id, "name": "synthetic other owner"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspaces (id, name, mode, timezone)"
+                " VALUES (:id, :name, 'personal', 'Asia/Bangkok')"
+            ),
+            {"id": workspace_id, "name": "synthetic other workspace"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspace_memberships (workspace_id, user_id, role)"
+                " VALUES (:workspace_id, :user_id, 'owner')"
+            ),
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+    return WorkspaceId(workspace_id), user_id
 
 
 async def test_q_matches_body_text_via_full_text_search(
@@ -426,3 +509,203 @@ async def test_pagination_cursor_returns_the_next_page_without_duplicates(
     first_ids = {item.document_id for item in first_page.items}
     second_ids = {item.document_id for item in second_page.items}
     assert first_ids.isdisjoint(second_ids)
+
+
+async def test_source_and_date_filters_require_one_thought_to_satisfy_both(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """Source and date/time are both provenance predicates on "a thought that
+    supports this citation" and must be checked against the *same* cited
+    thought, not against the document's citations independently. A document
+    cited by a discord thought from 2019 and an api thought from today must
+    not match `source=discord AND date in [2025, 2027]` - no single cited
+    thought satisfies both at once."""
+    source_only_thought = await _thought_id(
+        app_session_factory,
+        workspace,
+        user_id,
+        source_message_id=f"{unique}-source-only",
+        source="discord",
+        client_created_at=dt.datetime(2019, 1, 1, tzinfo=dt.UTC),
+    )
+    date_only_thought = await _thought_id(
+        app_session_factory,
+        workspace,
+        user_id,
+        source_message_id=f"{unique}-date-only",
+        source="api",
+    )
+    split_document_id, _ = await _write_document_with_sources(
+        app_session_factory,
+        workspace,
+        (source_only_thought, date_only_thought),
+        stable_key=f"split:{unique}",
+        kind="project",
+        title="Split provenance",
+        body_markdown=f"## Summary\n\n{unique} split provenance across two thoughts",
+    )
+
+    both_thought = await _thought_id(
+        app_session_factory,
+        workspace,
+        user_id,
+        source_message_id=f"{unique}-both",
+        source="discord",
+    )
+    combined_document_id, _ = await _write_document(
+        app_session_factory,
+        workspace,
+        both_thought,
+        stable_key=f"combined:{unique}",
+        kind="project",
+        title="Combined provenance",
+        body_markdown=f"## Summary\n\n{unique} single thought satisfies both filters",
+    )
+
+    reader = PostgresExactSearch(app_session_factory)
+    page = await reader.search(
+        workspace,
+        SearchQuery(
+            q=unique,
+            source="discord",
+            date_from=dt.date(2025, 1, 1),
+            date_to=dt.date(2027, 1, 1),
+        ),
+    )
+
+    result_ids = {item.document_id for item in page.items}
+    assert split_document_id not in result_ids
+    assert combined_document_id in result_ids
+
+
+async def test_hydration_never_leaks_another_workspaces_thoughts_or_entities(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """docs/adr/0005-workspace-scoped-single-user-first-schema.md treats a
+    cross-workspace leak as P0. Citation and entity-mention hydration must
+    stay scoped to the searching workspace on their own, rather than relying
+    entirely on the caller (``search()``'s own revision-id list) always being
+    correctly scoped - the same way every other query in this module already
+    predicates on ``workspace_id`` rather than trusting an id alone."""
+    other_workspace, other_user_id = await _second_workspace(admin_session_factory)
+
+    thought_a = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=f"{unique}-a"
+    )
+    document_a, revision_a = await _write_document(
+        app_session_factory,
+        workspace,
+        thought_a,
+        stable_key=f"project:{unique}-a",
+        kind="project",
+        title="Workspace A project",
+        body_markdown=f"## Summary\n\n{unique} workspace a content",
+    )
+
+    other_thought = await _thought_id(
+        app_session_factory,
+        other_workspace,
+        other_user_id,
+        source_message_id=f"{unique}-b",
+    )
+    _, revision_b = await _write_document(
+        app_session_factory,
+        other_workspace,
+        other_thought,
+        stable_key=f"project:{unique}-b",
+        kind="project",
+        title="Workspace B project",
+        body_markdown=f"## Summary\n\n{unique} workspace b content",
+    )
+
+    # Overlapping entity names in each workspace: entities are unique per
+    # (workspace_id, entity_type, normalized_name), so the same display name
+    # can legitimately exist in both workspaces under different ids.
+    entity_a = uuid.uuid4()
+    entity_b = uuid.uuid4()
+    async with app_session_factory() as session, session.begin():
+        await session.execute(
+            sa.insert(entities).values(
+                id=entity_a,
+                workspace_id=workspace,
+                entity_type="person",
+                canonical_name=f"Person {unique}",
+                normalized_name=f"person {unique}",
+                created_at=dt.datetime.now(dt.UTC),
+            )
+        )
+        await session.execute(
+            sa.insert(entities).values(
+                id=entity_b,
+                workspace_id=other_workspace,
+                entity_type="person",
+                canonical_name=f"Person {unique}",
+                normalized_name=f"person {unique}",
+                created_at=dt.datetime.now(dt.UTC),
+            )
+        )
+
+    async with app_session_factory() as session:
+        run_a = await session.scalar(
+            sa.text("SELECT run_id FROM document_revisions WHERE id = :rid").bindparams(
+                rid=revision_a
+            )
+        )
+        run_b = await session.scalar(
+            sa.text("SELECT run_id FROM document_revisions WHERE id = :rid").bindparams(
+                rid=revision_b
+            )
+        )
+    assert run_a is not None
+    assert run_b is not None
+
+    async with app_session_factory() as session, session.begin():
+        await session.execute(
+            sa.insert(entity_mentions).values(
+                workspace_id=workspace,
+                entity_id=entity_a,
+                revision_id=revision_a,
+                run_id=run_a,
+                surface_form=f"Person {unique}",
+                confidence=1.0,
+            )
+        )
+        await session.execute(
+            sa.insert(entity_mentions).values(
+                workspace_id=other_workspace,
+                entity_id=entity_b,
+                revision_id=revision_b,
+                run_id=run_b,
+                surface_form=f"Person {unique}",
+                confidence=1.0,
+            )
+        )
+
+    # Direct helper-level check: this is exactly the scenario the fix guards
+    # against - a revision belonging to workspace B is present in the
+    # `revision_ids` list, but hydration scoped to workspace A must not
+    # return workspace B's own, otherwise perfectly valid, citation or entity
+    # rows for it.
+    async with app_session_factory() as session:
+        thought_ids = await _thought_ids_for(session, workspace, [revision_a, revision_b])
+        entity_names = await _entity_names_for(session, workspace, [revision_a, revision_b])
+
+    assert revision_b not in thought_ids
+    assert thought_ids[revision_a] == (thought_a,)
+    assert revision_b not in entity_names
+    assert entity_names[revision_a] == (f"Person {unique}",)
+
+    # End-to-end: workspace A's own search result never surfaces workspace
+    # B's citation or entity data, even with overlapping entity display names.
+    reader = PostgresExactSearch(app_session_factory)
+    page = await reader.search(workspace, SearchQuery(q=unique))
+    result = next(item for item in page.items if item.document_id == document_a)
+    assert result.thought_ids == (thought_a,)
+    assert result.entities == (f"Person {unique}",)

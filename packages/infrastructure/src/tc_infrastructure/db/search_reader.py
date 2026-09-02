@@ -11,6 +11,12 @@ full-text search (migration 0006). A title-only match still surfaces through
 ``phrase`` (trigram/ILIKE, checked against both title and body), but a title
 word alone does not currently contribute to ``q``'s rank - a documented
 narrowing, not a silent gap.
+
+TODO(docs/DESIGN.md 9.1): prefix matching and thresholded trigram fuzzy
+spelling are documented as part of ``exact`` but are not implemented by this
+slice. Tracked as deferred, not a silent gap - ``phrase``/``q``/``include``/
+``exclude`` cover this slice's scope; a follow-up slice should add prefix and
+opt-in fuzzy matching or update DESIGN.md if they are dropped.
 """
 
 from __future__ import annotations
@@ -83,8 +89,8 @@ class PostgresExactSearch:
             has_more = len(rows) > limit
             rows = rows[:limit]
             revision_ids = [row.revision_id for row in rows]
-            thought_ids = await _thought_ids_for(session, revision_ids)
-            entity_names = await _entity_names_for(session, revision_ids)
+            thought_ids = await _thought_ids_for(session, workspace_id, revision_ids)
+            entity_names = await _entity_names_for(session, workspace_id, revision_ids)
 
         items = tuple(
             _to_result(
@@ -167,31 +173,25 @@ def _filter_conditions(
             )
         )
 
+    # Source and date/time filters both scope "a thought that supports this
+    # citation" - they must be joined into a single EXISTS over the same
+    # thought row. Two separate EXISTS subqueries would let different cited
+    # thoughts each satisfy one predicate (thought A matches the source,
+    # thought B matches the date) with no single thought satisfying both,
+    # which is not what "this document cites a discord thought from March"
+    # means.
+    provenance_conditions: list[sa.ColumnElement[bool]] = []
     if query.source is not None:
-        conditions.append(
-            sa.exists(
-                sa.select(1)
-                .select_from(
-                    revision_sources.join(thoughts, thoughts.c.id == revision_sources.c.thought_id)
-                )
-                .where(
-                    revision_sources.c.revision_id == document_revisions.c.id,
-                    revision_sources.c.workspace_id == workspace_id,
-                    thoughts.c.source == query.source,
-                )
-            )
-        )
-
-    time_conditions: list[sa.ColumnElement[bool]] = []
+        provenance_conditions.append(thoughts.c.source == query.source)
     if query.date_from is not None:
-        time_conditions.append(thoughts.c.client_local_date >= query.date_from)
+        provenance_conditions.append(thoughts.c.client_local_date >= query.date_from)
     if query.date_to is not None:
-        time_conditions.append(thoughts.c.client_local_date <= query.date_to)
+        provenance_conditions.append(thoughts.c.client_local_date <= query.date_to)
     if query.local_time_from is not None:
-        time_conditions.append(thoughts.c.client_local_time >= query.local_time_from)
+        provenance_conditions.append(thoughts.c.client_local_time >= query.local_time_from)
     if query.local_time_to is not None:
-        time_conditions.append(thoughts.c.client_local_time <= query.local_time_to)
-    if time_conditions:
+        provenance_conditions.append(thoughts.c.client_local_time <= query.local_time_to)
+    if provenance_conditions:
         conditions.append(
             sa.exists(
                 sa.select(1)
@@ -201,7 +201,7 @@ def _filter_conditions(
                 .where(
                     revision_sources.c.revision_id == document_revisions.c.id,
                     revision_sources.c.workspace_id == workspace_id,
-                    *time_conditions,
+                    *provenance_conditions,
                 )
             )
         )
@@ -214,15 +214,25 @@ def _escape_like(text: str) -> str:
 
 
 async def _thought_ids_for(
-    session: AsyncSession, revision_ids: list[uuid.UUID]
+    session: AsyncSession, workspace_id: WorkspaceId, revision_ids: list[uuid.UUID]
 ) -> dict[uuid.UUID, tuple[ThoughtId, ...]]:
-    """One query for the whole page rather than one per row."""
+    """One query for the whole page rather than one per row.
+
+    ``revision_id`` alone identifies rows uniquely, but every ``revision_sources``
+    row is still predicated on ``workspace_id`` - the caller's search already
+    scoped ``revision_ids`` to one workspace, and this keeps that same
+    boundary explicit at the point that reads citation rows, rather than
+    relying on the caller having filtered correctly upstream.
+    """
     if not revision_ids:
         return {}
     rows = (
         await session.execute(
             sa.select(revision_sources.c.revision_id, revision_sources.c.thought_id)
-            .where(revision_sources.c.revision_id.in_(revision_ids))
+            .where(
+                revision_sources.c.revision_id.in_(revision_ids),
+                revision_sources.c.workspace_id == workspace_id,
+            )
             .order_by(revision_sources.c.revision_id, revision_sources.c.thought_id)
         )
     ).all()
@@ -233,8 +243,12 @@ async def _thought_ids_for(
 
 
 async def _entity_names_for(
-    session: AsyncSession, revision_ids: list[uuid.UUID]
+    session: AsyncSession, workspace_id: WorkspaceId, revision_ids: list[uuid.UUID]
 ) -> dict[uuid.UUID, tuple[str, ...]]:
+    """Scoped the same way as ``_thought_ids_for``: both ``entity_mentions``
+    and the ``entities`` it joins to are predicated on ``workspace_id`` so a
+    cross-workspace entity can never be hydrated onto another workspace's
+    result."""
     if not revision_ids:
         return {}
     rows = (
@@ -243,7 +257,11 @@ async def _entity_names_for(
             .select_from(
                 entity_mentions.join(entities, entities.c.id == entity_mentions.c.entity_id)
             )
-            .where(entity_mentions.c.revision_id.in_(revision_ids))
+            .where(
+                entity_mentions.c.revision_id.in_(revision_ids),
+                entity_mentions.c.workspace_id == workspace_id,
+                entities.c.workspace_id == workspace_id,
+            )
             .distinct()
             .order_by(entity_mentions.c.revision_id, entities.c.canonical_name)
         )
