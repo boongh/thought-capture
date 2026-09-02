@@ -363,3 +363,77 @@ async def test_review_queue_surfaces_ambiguous_pairs(
     queue = await reader.review_queue(workspace, thresholds=thresholds)
     pairs = {frozenset((c.entity_a, c.entity_b)) for c in queue}
     assert frozenset((first.entity_id, second.entity_id)) in pairs
+
+
+async def test_review_queue_surfaces_an_alias_only_ambiguous_match(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """A pair close only via one entity's *alias* must still reach the queue.
+
+    ``resolve_mention`` matches against ``GREATEST(canonical, alias)``
+    similarity (docs/DESIGN.md 6.4); the review queue has to use the same
+    relation, or an alias-only ambiguous match becomes a permanent, silent
+    duplicate that never surfaces for a human to merge.
+    """
+    thresholds = EntityResolutionThresholds(merge_at=0.999, ambiguous_floor=0.5)
+    repo = PostgresEntityRepository(thresholds=thresholds)
+    reader = PostgresEntityReader(app_session_factory)
+    run_id = await _run_row(app_session_factory, workspace)
+
+    unrelated_thought = await _thought_row(
+        app_session_factory, workspace, user_id, source_message_id=f"{unique}-a"
+    )
+    other = await _resolve(
+        app_session_factory,
+        repo,
+        workspace_id=workspace,
+        run_id=run_id,
+        entity_type=EntityType.TOPIC,
+        canonical_name=f"Falcon Nine {unique}",
+        surface_form=f"Falcon Nine {unique}",
+        confidence=0.9,
+        thought_id=unrelated_thought,
+    )
+
+    seed_thought = await _thought_row(
+        app_session_factory, workspace, user_id, source_message_id=f"{unique}-b"
+    )
+    base = await _resolve(
+        app_session_factory,
+        repo,
+        workspace_id=workspace,
+        run_id=run_id,
+        entity_type=EntityType.TOPIC,
+        canonical_name=f"Willow Creek {unique}",
+        surface_form=f"Willow Creek {unique}",
+        confidence=0.9,
+        thought_id=seed_thought,
+    )
+    assert base.entity_id != other.entity_id, "canonical names must not have auto-merged"
+
+    # Attach an alias to ``base`` that is a near-exact match for ``other``'s
+    # canonical name (missing one character) - close enough to land in the
+    # ambiguous band, without being an exact match that would auto-merge.
+    alias_thought = await _thought_row(
+        app_session_factory, workspace, user_id, source_message_id=f"{unique}-c"
+    )
+    await _resolve(
+        app_session_factory,
+        repo,
+        workspace_id=workspace,
+        run_id=run_id,
+        entity_type=EntityType.TOPIC,
+        canonical_name=f"Willow Creek {unique}",
+        surface_form=f"Falcon Nin {unique}",
+        confidence=0.9,
+        thought_id=alias_thought,
+    )
+
+    queue = await reader.review_queue(workspace, thresholds=thresholds)
+    pairs = {frozenset((c.entity_a, c.entity_b)) for c in queue}
+    assert frozenset((base.entity_id, other.entity_id)) in pairs, (
+        "alias-only similarity must still surface the pair for review"
+    )
