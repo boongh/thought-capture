@@ -7,7 +7,9 @@ the real decision logic rather than a simplification of it.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
+import uuid
 
 from tc_domain.capture import (
     AppendOutcome,
@@ -19,7 +21,9 @@ from tc_domain.capture import (
     ThoughtId,
     WorkspaceId,
 )
+from tc_domain.context import Tier1Row
 from tc_domain.errors import AttachmentArchiveFailed
+from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
 
 
 class FakeThoughtRepository:
@@ -77,4 +81,114 @@ class FakeAttachmentArchive:
             storage_key=f"{digest[:2]}/{digest}",
             source_filename=candidate.filename,
             source_url_expires_at=candidate.url_expires_at,
+        )
+
+
+class FakeThoughtWindowReader:
+    """Ignores the requested bounds and returns whatever the test set up.
+
+    Real window filtering is PostgreSQL's job (``PostgresThoughtReader.list_between``,
+    proven by integration tests); this fake exists to drive the pipeline's
+    *orchestration*, not to re-prove the query.
+    """
+
+    def __init__(self, thoughts: list[WindowThought]) -> None:
+        self.thoughts = thoughts
+
+    async def list_between(
+        self, workspace_id: WorkspaceId, start: dt.datetime, end: dt.datetime
+    ) -> list[WindowThought]:
+        return self.thoughts
+
+
+class FakeContextIndex:
+    def __init__(
+        self, *, index: tuple[Tier1Row, ...] = (), bodies: dict[str, str] | None = None
+    ) -> None:
+        self.index = index
+        self.bodies = bodies or {}
+
+    async def tier1_index(self, workspace_id: WorkspaceId) -> tuple[Tier1Row, ...]:
+        return self.index
+
+    async def bodies_for(
+        self, workspace_id: WorkspaceId, stable_keys: frozenset[str]
+    ) -> dict[str, str]:
+        return {key: body for key, body in self.bodies.items() if key in stable_keys}
+
+
+class FakeOrganizeWriter:
+    """Records the request it was given rather than writing anything."""
+
+    def __init__(self) -> None:
+        self.calls: list[OrganizeWriteRequest] = []
+        self.outcomes: list[RunOutcome] = []
+
+    async def write(
+        self,
+        *,
+        workspace_id: WorkspaceId,
+        run_id: uuid.UUID,
+        request: OrganizeWriteRequest,
+        outcome: RunOutcome,
+    ) -> OrganizeWriteResult:
+        self.calls.append(request)
+        self.outcomes.append(outcome)
+        document_ids = {doc.stable_key: uuid.uuid4() for doc in request.documents}
+        revision_ids = {doc.stable_key: uuid.uuid4() for doc in request.documents}
+        digest_id = next(
+            (
+                document_ids[doc.stable_key]
+                for doc in request.documents
+                if doc.kind == "daily_digest"
+            ),
+            None,
+        )
+        return OrganizeWriteResult(
+            document_ids=document_ids, revision_ids=revision_ids, digest_document_id=digest_id
+        )
+
+
+class FakeRunLedger:
+    """Records lifecycle transitions for one pipeline run."""
+
+    def __init__(self) -> None:
+        self.started: list[tuple[WorkspaceId, dt.datetime, dt.datetime]] = []
+        self.succeeded: list[dict[str, object]] = []
+        self.failed: list[dict[str, object]] = []
+
+    async def start(
+        self, workspace_id: WorkspaceId, *, window_start: dt.datetime, window_end: dt.datetime
+    ) -> uuid.UUID:
+        self.started.append((workspace_id, window_start, window_end))
+        return uuid.uuid4()
+
+    async def succeed(
+        self,
+        run_id: uuid.UUID,
+        *,
+        model_provider: str | None,
+        model_id: str | None,
+        prompt_version: str,
+        input_tokens: int,
+        output_tokens: int,
+        context_recall: float | None,
+        context_degraded: bool,
+    ) -> None:
+        self.succeeded.append(
+            {
+                "run_id": run_id,
+                "model_provider": model_provider,
+                "model_id": model_id,
+                "prompt_version": prompt_version,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "context_recall": context_recall,
+                "context_degraded": context_degraded,
+            }
+        )
+
+    async def fail(self, run_id: uuid.UUID, *, error_code: str, error_detail: str) -> None:
+        self.failed.append(
+            {"run_id": run_id, "error_code": error_code, "error_detail": error_detail}
         )

@@ -19,6 +19,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
+from tc_domain.organize import WindowThought
 from tc_infrastructure.db.tables import blobs, thought_attachments, thoughts
 
 MAX_PAGE_SIZE = 100
@@ -122,6 +123,59 @@ class PostgresThoughtReader:
         items = tuple(_to_record(row, attachments.get(ThoughtId(row.id), ())) for row in rows)
         next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
         return ThoughtPage(items=items, next_cursor=next_cursor)
+
+    async def first_capture_at(self, workspace_id: WorkspaceId) -> dt.datetime | None:
+        """When this workspace's oldest thought was captured, or ``None`` if empty.
+
+        Anchors the scheduler's catch-up for a workspace that has never been
+        organized (``tc_worker.scheduler.OrganizeScheduler.catch_up``).
+        """
+        async with self._session_factory() as session:
+            earliest: dt.datetime | None = await session.scalar(
+                sa.select(sa.func.min(thoughts.c.client_created_at)).where(
+                    thoughts.c.workspace_id == workspace_id
+                )
+            )
+        return earliest
+
+    async def list_between(
+        self, workspace_id: WorkspaceId, start: dt.datetime, end: dt.datetime
+    ) -> list[WindowThought]:
+        """Every thought in ``(start, end]``, for the organize pipeline (docs/DESIGN.md 7.2).
+
+        Unbounded, unlike ``list_thoughts``: a capture window is organized as
+        a whole, not paged. docs/DESIGN.md 14.1 calls for deterministic
+        chunking with overlap on a very large window; that is not implemented
+        yet, so an exceptionally large window is read in full rather than
+        silently truncated - a caller that wants to guard against one is
+        expected to check the returned count itself.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    sa.select(
+                        thoughts.c.id,
+                        thoughts.c.body,
+                        thoughts.c.client_local_date,
+                        thoughts.c.client_local_time,
+                    )
+                    .where(
+                        thoughts.c.workspace_id == workspace_id,
+                        thoughts.c.client_created_at > start,
+                        thoughts.c.client_created_at <= end,
+                    )
+                    .order_by(thoughts.c.client_created_at, thoughts.c.id)
+                )
+            ).all()
+        return [
+            WindowThought(
+                id=ThoughtId(row.id),
+                body=row.body,
+                client_local_date=row.client_local_date.isoformat(),
+                client_local_time=row.client_local_time.isoformat(),
+            )
+            for row in rows
+        ]
 
     async def _attachments_for(
         self, session: AsyncSession, thought_ids: list[ThoughtId]

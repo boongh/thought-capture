@@ -192,6 +192,44 @@ def seeded_identity(engine: Engine) -> tuple[uuid.UUID, uuid.UUID]:
 
 
 @pytest.fixture
+async def fresh_identity(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """A committed workspace and owner, private to one test.
+
+    Unlike ``seeded_identity`` (session-scoped, shared by every integration
+    test), this workspace belongs to nobody else - for a test whose own
+    ``runs`` rows would otherwise collide with another file's workspace-wide
+    cleanup logic (organize-pipeline tests, notably, whose runs always carry
+    ``window_start``/``window_end`` and now have ``document_revisions``
+    pointing at them, which a same-workspace ``DELETE FROM runs`` elsewhere
+    cannot get past).
+    """
+    workspace_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(
+            sa.text("INSERT INTO users (id, display_name) VALUES (:id, :name)"),
+            {"id": user_id, "name": "synthetic owner"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspaces (id, name, mode, timezone)"
+                " VALUES (:id, :name, 'personal', 'Asia/Bangkok')"
+            ),
+            {"id": workspace_id, "name": "synthetic workspace"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspace_memberships (workspace_id, user_id, role)"
+                " VALUES (:workspace_id, :user_id, 'owner')"
+            ),
+            {"workspace_id": workspace_id, "user_id": user_id},
+        )
+    return workspace_id, user_id
+
+
+@pytest.fixture
 async def admin_session_factory(
     migrated_database: URL,
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
