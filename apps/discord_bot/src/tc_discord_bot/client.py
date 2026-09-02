@@ -14,6 +14,7 @@ import discord
 
 from tc_application.capture import CaptureThought
 from tc_discord_bot.adapter import acknowledgement_for, command_from, facts_from
+from tc_discord_bot.digest_loop import DigestDeliveryLoop
 from tc_domain.capture import (
     CaptureCommand,
     CaptureResult,
@@ -69,6 +70,16 @@ class CaptureClient(discord.Client):
         self._workspace_id = workspace_id
         self._user_id = user_id
         self._timezone = workspace_timezone
+        self._digest_loop: DigestDeliveryLoop | None = None
+
+    def attach_digest_loop(self, digest_loop: DigestDeliveryLoop) -> None:
+        """Wire the digest poller in after construction.
+
+        The sender the loop drives needs this client as its send target, so
+        the loop cannot exist before the client does; this setter breaks that
+        construction-order cycle without exposing the private attribute.
+        """
+        self._digest_loop = digest_loop
 
     async def on_ready(self) -> None:
         # The bot's own identity is not personal memory content, but the owner's
@@ -77,6 +88,13 @@ class CaptureClient(discord.Client):
             "discord.ready",
             extra={"bot_user": str(self.user), "workspace_id": str(self._workspace_id)},
         )
+        if self._digest_loop is not None:
+            self._digest_loop.start()
+
+    async def close(self) -> None:
+        if self._digest_loop is not None:
+            self._digest_loop.stop()
+        await super().close()
 
     async def on_message(self, message: discord.Message) -> None:
         facts = facts_from(message)

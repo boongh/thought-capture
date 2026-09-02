@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,16 +61,23 @@ class PostgresOutbox:
         self._lease_owner = lease_owner
         self._lease = lease_duration
 
-    async def claim(self, limit: int = DEFAULT_BATCH) -> list[OutboxEvent]:
-        """Lease up to ``limit`` due events.
+    async def claim(
+        self, limit: int = DEFAULT_BATCH, *, event_types: Sequence[str] | None = None
+    ) -> list[OutboxEvent]:
+        """Lease up to ``limit`` due events, optionally restricted to ``event_types``.
 
         ``FOR UPDATE SKIP LOCKED`` inside a CTE so that concurrent workers take
         disjoint sets instead of blocking on each other. ``attempts`` is
         incremented at claim time, not at failure time: a worker that dies
         mid-delivery must still consume its budget, or a permanently poisonous
         event would be retried forever.
+
+        A consumer dedicated to one event type (e.g. digest delivery) must
+        pass ``event_types`` so it never leases work it does not know how to
+        handle, leaving other types for their own consumers.
         """
-        statement = sa.text("""
+        type_filter = "AND event_type = ANY(:event_types)" if event_types is not None else ""
+        statement = sa.text(f"""
             WITH claimable AS (
                 SELECT id
                 FROM outbox_events
@@ -77,6 +85,7 @@ class PostgresOutbox:
                   AND available_at <= now()
                   AND attempts < max_attempts
                   AND (leased_until IS NULL OR leased_until < now())
+                  {type_filter}
                 ORDER BY available_at, id
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
@@ -90,13 +99,12 @@ class PostgresOutbox:
          RETURNING o.id, o.workspace_id, o.event_type, o.aggregate_id, o.payload, o.attempts
         """)
 
+        params: dict[str, Any] = {"limit": limit, "lease": self._lease, "owner": self._lease_owner}
+        if event_types is not None:
+            params["event_types"] = list(event_types)
+
         async with self._session_factory() as session, session.begin():
-            rows = (
-                await session.execute(
-                    statement,
-                    {"limit": limit, "lease": self._lease, "owner": self._lease_owner},
-                )
-            ).all()
+            rows = (await session.execute(statement, params)).all()
 
         return [
             OutboxEvent(

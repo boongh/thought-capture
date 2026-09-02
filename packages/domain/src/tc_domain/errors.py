@@ -57,3 +57,7 @@ class InvalidCaptureCommand(CaptureRejected):
 
 class InvalidThresholds(DomainError):
     """A configured pair of thresholds is not a valid ordering (docs/DESIGN.md 6.4)."""
+
+
+class DigestNotFound(DomainError):
+    """A ``digest.ready`` event points at a document revision that no longer resolves."""
