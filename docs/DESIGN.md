@@ -1,7 +1,7 @@
 # Thought Capture AI - System Design
 
 - **Status:** Accepted implementation anchor
-- **Version:** 1.6
+- **Version:** 1.7
 - **Date:** 2026-09-02
 - **Audience:** Small experienced engineering team
 - **Owner:** Project owner
@@ -53,7 +53,7 @@ The product goal is to make capture nearly effortless while moving structure, en
 
 - Multi-user authentication, collaboration, or sharing in production.
 - A custom browser UI. (`docs/adr/0009` adds a minimal, loopback-only, read-only
-  operator debug view - three plain HTML pages behind the existing bearer
+  operator debug view - four plain HTML pages behind the existing bearer
   token - which this non-goal does not cover; it is not a step toward 4.4's
   future unified interface.)
 - Voice capture or transcription.

@@ -9,6 +9,7 @@ from tc_api import debug_templates
 from tc_domain.capture import ThoughtId
 from tc_infrastructure.db.document_reader import DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
+from tc_infrastructure.db.llm_call_reader import LlmCallRecord
 from tc_infrastructure.db.thought_reader import ThoughtRecord
 
 CREATED_AT = dt.datetime(2026, 8, 31, 12, tzinfo=dt.UTC)
@@ -95,3 +96,53 @@ def test_a_digest_body_is_escaped_inside_the_preformatted_block() -> None:
     assert "<script>evil()</script>" not in html
     assert "&lt;script&gt;evil()&lt;/script&gt;" in html
     assert "## Summary" in html
+
+
+def a_call(*, reasoning_effort: str | None = None, error_code: str | None = None) -> LlmCallRecord:
+    return LlmCallRecord(
+        id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        step="organize",
+        sequence=1,
+        model_requested="vendor/pinned-model",
+        model_served="vendor/pinned-model",
+        provider="synthetic-provider",
+        request_params={"reasoning_effort": reasoning_effort},
+        input_tokens=100,
+        output_tokens=50,
+        estimated_cost_usd=None,
+        latency_ms=250,
+        error_code=error_code,
+        created_at=CREATED_AT,
+    )
+
+
+def test_runs_page_shows_the_reasoning_effort_that_was_sent() -> None:
+    html = debug_templates.runs_page([a_call(reasoning_effort="none")], next_cursor=None)
+    assert "<td>none</td>" in html
+
+
+def test_runs_page_shows_a_blank_reasoning_effort_cell_when_unset() -> None:
+    html = debug_templates.runs_page([a_call(reasoning_effort=None)], next_cursor=None)
+    assert "vendor/pinned-model" in html
+
+
+def test_runs_page_shows_a_placeholder_when_there_are_none() -> None:
+    html = debug_templates.runs_page([], next_cursor=None)
+    assert "No LLM calls journaled yet." in html
+
+
+def test_runs_page_includes_a_next_link_only_when_there_is_a_cursor() -> None:
+    with_cursor = debug_templates.runs_page([a_call()], next_cursor="abc.1:2")
+    without_cursor = debug_templates.runs_page([a_call()], next_cursor=None)
+
+    assert "cursor=abc.1:2" in with_cursor
+    assert "Next page" not in without_cursor
+
+
+def test_a_run_error_code_is_escaped() -> None:
+    html = debug_templates.runs_page(
+        [a_call(error_code="<script>evil()</script>")], next_cursor=None
+    )
+    assert "<script>evil()</script>" not in html
+    assert "&lt;script&gt;evil()&lt;/script&gt;" in html

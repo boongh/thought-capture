@@ -191,6 +191,15 @@ class OpenRouterProvider:
         }
         if response_format is not None:
             params["response_format"] = response_format
+        if request.reasoning_effort is not None:
+            # OpenRouter's unified reasoning-control extension
+            # (https://openrouter.ai/docs/use-cases/reasoning-tokens), sent
+            # via `extra_body` for the same reason `provider` routing is: the
+            # OpenAI SDK's typed `create()` has no parameter for it. Omitted
+            # entirely rather than sent as e.g. `{"effort": null}` when
+            # unset, so a model with no notion of reasoning is not asked
+            # about it at all.
+            params["extra_body"]["reasoning"] = {"effort": request.reasoning_effort}
 
         started = time.perf_counter()
         # Each failure is re-raised `from None`, deliberately. Chaining with
@@ -282,5 +291,10 @@ class OpenRouterProvider:
                 # was asked for, since REVIEWED_MODELS and Settings can both
                 # change after the call that used them was journaled.
                 "provider_routing": provider_routing,
+                # None when unset, matching the request - a historical run
+                # needs to distinguish "reasoning wasn't controlled" from
+                # "reasoning was explicitly disabled" the same way it needs
+                # to distinguish those two states for provider routing.
+                "reasoning_effort": request.reasoning_effort,
             },
         )

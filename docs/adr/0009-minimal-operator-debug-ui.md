@@ -1,6 +1,7 @@
 # ADR-0009: A minimal, loopback-only operator debug UI
 
-- **Status:** Accepted (auth mechanism corrected before merge - see Amendment)
+- **Status:** Accepted (auth mechanism corrected before merge - see Amendment;
+  scope extended to a fourth, read-only page - see Amendment 2)
 - **Date:** 2026-09-02
 - **Design anchor:** clarifies `docs/DESIGN.md` 2.2, 4.4; extends 4.4's `/v1` gateway
 - **First implemented in:** the debug-UI slice (`apps/api/src/tc_api/routers/debug.py`)
@@ -30,12 +31,15 @@ surfaced here rather than resolved silently.
 Build a minimal, read-only, loopback-only operator inspection tool, not the
 4.4 UI:
 
-- **Scope.** Three server-rendered HTML pages - `/debug/thoughts`,
-  `/debug/entities`, `/debug/digests` - and the JSON endpoints they call
+- **Scope.** Four server-rendered HTML pages - `/debug/thoughts`,
+  `/debug/entities`, `/debug/digests`, `/debug/runs` (added by Amendment 2) -
+  and the JSON endpoints they call
   (`GET /v1/documents`, `GET /v1/documents/{id}`, `GET /v1/entities`,
   `GET /v1/entities/{id}`, alongside the existing `GET /v1/thoughts`). No
-  search, no Ask, no Settings, no revision diffing, no run history screen, no
-  write operations of any kind.
+  search, no Ask, no Settings, no revision diffing, no write operations of
+  any kind. `/debug/runs` is call-metadata inspection, not the "run history
+  screen" this ADR originally excluded - see Amendment 2 for why that
+  distinction holds.
 - **Where it lives.** Inside the existing `apps/api` gateway, on the same
   loopback-bound port as everything else (`docs/DESIGN.md` 12.2), following
   the exact router/reader pattern `routers/thoughts.py` already established
@@ -116,6 +120,47 @@ also accepted on `/debug/*` - the two surfaces use distinct schemes on
 purpose, so a change to one's auth handling can never silently widen the
 other's.
 
+## Amendment 2: `/debug/runs` - call-metadata inspection, not the excluded "run history screen"
+
+Added 2026-09-02, alongside `reasoning_effort` support in `LLMRequest`/
+`OpenRouterProvider` (a model can spend its whole output budget on hidden
+reasoning and return nothing at all - see
+`docs/model-evaluation-organize-select.md`'s GLM 5.3 Flash finding). The
+owner asked to be able to see which models were tested with which
+reasoning-control setting, from the debug UI, without needing `psql`.
+
+**The conflict.** This ADR's original Scope explicitly lists "no run history
+screen" among what a future 4.4-style UI would add, and its Consequences
+warn against extending these three pages instead of building 4.4's real
+thing. A fourth page is scope growth this ADR deliberately bounded against.
+Per this repository's process for a request that touches accepted
+architecture (`CLAUDE.md`), that conflict was surfaced to the owner rather
+than resolved silently - the owner chose to add a **read-only** view and
+explicitly declined a write/settings control (a `reasoning_effort` override
+UI), keeping ADR-0009's "no Settings, no write operations of any kind"
+intact.
+
+**Why this is not the excluded "run history screen."** 4.4's future "Runs"
+item (`docs/DESIGN.md` 4.4) is a product surface: revision history, diffing,
+presumably re-running or annotating a run. `/debug/runs` does none of that -
+it is one more read-only table over one more existing reader, following the
+exact pattern the other three pages already established (`PostgresLlmCallReader`
+mirrors `PostgresThoughtReader`'s keyset-pagination shape; `debug_templates.runs_page`
+mirrors `thoughts_page`'s hand-built, `html.escape`-everywhere HTML). What it
+adds is visibility into *request-shape metadata* - which model was asked,
+what reasoning control was sent, cost, latency, error code - the same
+category of "verify pipeline correctness without `psql`" this ADR's Context
+already accepted for thoughts/entities/digests, extended to the calls that
+produced them. It deliberately excludes `request_messages` and
+`response_raw` (raw prompt/completion content - personal memory text) from
+what it renders, for the same disclosure reasons the other three pages exist
+in the first place.
+
+**What was *not* added.** No control to set or change `reasoning_effort` (or
+any other request parameter) from this UI. No page lets an operator trigger,
+retry, or annotate a run. `Cache-Control: no-store` applies to `/debug/runs`
+too, same rationale as the other three pages.
+
 ## Verification
 
 `tests/unit/test_debug_templates.py` and `tests/integration/test_document_reader.py`
@@ -130,3 +175,12 @@ against a rebuilt `api` container: a wrong or missing credential returns
 line (only an attempted `?token=` request - itself now always `401` -
 would still write its value to the log, which is exactly the scenario this
 amendment removes as a valid way to authenticate at all).
+
+`/debug/runs` (Amendment 2): `tests/unit/test_debug_templates.py` covers
+`runs_page` directly (reasoning-effort display, the empty-state placeholder,
+error-code escaping, pagination link presence); `tests/integration/test_api_debug.py`
+seeds a real journaled call via `PostgresRunLedger` + `PostgresLLMJournal`
+and asserts it renders end to end, plus the shared auth/no-store assertions
+reused from the other three pages. `tests/unit/test_openrouter_provider.py`
+covers `reasoning_effort` being omitted by default, sent when set, and
+journaled into `request_params` either way.
