@@ -29,7 +29,7 @@ from tc_domain.khoj_export import DocumentExport
 from tc_domain.khoj_ports import KhojIndexFile, KhojSearchResult
 from tc_domain.khoj_sync_ports import PendingKhojSync
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
-from tc_domain.search import SearchPage, SearchQuery
+from tc_domain.search import SearchPage, SearchQuery, SearchResult
 
 
 class FakeThoughtRepository:
@@ -390,3 +390,19 @@ class FakeKhojForceSync:
     async def enqueue_all(self, workspace_id: uuid.UUID) -> int:
         self.calls.append(workspace_id)
         return self.count
+
+
+class FakeSemanticHydrator:
+    """Resolves a fixed filename -> ``SearchResult`` mapping rather than
+    querying PostgreSQL - a filename absent from the mapping is simply
+    dropped, matching ``SemanticHydrator``'s contract."""
+
+    def __init__(self, by_filename: dict[str, SearchResult] | None = None) -> None:
+        self.by_filename = by_filename or {}
+        self.calls: list[tuple[WorkspaceId, tuple[str, ...]]] = []
+
+    async def hydrate(
+        self, workspace_id: WorkspaceId, filenames: tuple[str, ...]
+    ) -> dict[str, SearchResult]:
+        self.calls.append((workspace_id, filenames))
+        return {name: self.by_filename[name] for name in filenames if name in self.by_filename}

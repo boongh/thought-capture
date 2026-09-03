@@ -1,9 +1,13 @@
 """Exact, semantic, and hybrid search over generated documents (docs/DESIGN.md 9, 10).
 
-Only ``mode=exact`` (the default) is implemented so far. ``semantic`` and
-``hybrid`` return a 501 problem document rather than silently falling back to
-exact-only results - docs/DESIGN.md 7.5 requires that a degraded or missing
-channel is always explicit, never an implied "no memory exists".
+``mode=exact`` (the default), ``semantic``, and ``hybrid`` are all
+implemented; an unrecognized mode string still returns a 501 problem document
+rather than silently falling back to exact-only results - docs/DESIGN.md 7.5
+requires that a degraded or missing channel is always explicit, never an
+implied "no memory exists". ``cursor``/keyset pagination applies to
+``mode=exact`` only - Khoj's own search API has no equivalent, so
+``semantic``/``hybrid`` always return a single page (``next_cursor`` is
+always ``null`` for those two modes).
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ router = APIRouter(prefix="/v1/search", tags=["search"], dependencies=[Authentic
 async def search(
     context: Context,
     q: Annotated[str | None, Query(description="Free text, English full-text, ranked")] = None,
-    mode: Annotated[str, Query(description="Only 'exact' is available so far")] = "exact",
+    mode: Annotated[str, Query(description="'exact' (default), 'semantic', or 'hybrid'")] = "exact",
     phrase: Annotated[str | None, Query(description="Exact, case-insensitive substring")] = None,
     include: Annotated[list[str], Query(description="Required words")] = [],  # noqa: B006
     exclude: Annotated[list[str], Query(description="Forbidden words")] = [],  # noqa: B006

@@ -119,8 +119,46 @@ async def test_search_finds_a_written_document_by_q(
     assert match["channels"] == ["exact"]
 
 
-async def test_search_rejects_an_unimplemented_mode(api_fresh: httpx.AsyncClient) -> None:
+async def test_search_rejects_an_unknown_mode(api_fresh: httpx.AsyncClient) -> None:
+    response = await api_fresh.get(
+        "/v1/search", headers=AUTH, params={"q": "anything", "mode": "quantum"}
+    )
+    assert response.status_code == 501
+
+
+async def test_semantic_mode_degrades_explicitly_when_khoj_is_unreachable(
+    api_fresh: httpx.AsyncClient,
+) -> None:
+    """No ``--profile ai`` is running in this test environment, so this
+    exercises the real production degrade path (docs/DESIGN.md 7.5, 14.1),
+    not a mocked one - see conftest.py's ``_api_client`` docstring."""
     response = await api_fresh.get(
         "/v1/search", headers=AUTH, params={"q": "anything", "mode": "semantic"}
     )
-    assert response.status_code == 501
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["degraded"] is True
+    assert body["items"] == []
+
+
+async def test_hybrid_mode_degrades_to_exact_only_when_khoj_is_unreachable(
+    api_fresh: httpx.AsyncClient,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+    unique_message_id: str,
+) -> None:
+    workspace_id, user_id = fresh_identity
+    document_id = await _seed_document(
+        app_session_factory, workspace_id, user_id, unique=unique_message_id
+    )
+
+    response = await api_fresh.get(
+        "/v1/search", headers=AUTH, params={"q": unique_message_id, "mode": "hybrid"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["degraded"] is True
+    match = next(item for item in body["items"] if item["document_id"] == str(document_id))
+    assert match["channels"] == ["exact"]
