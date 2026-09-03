@@ -49,12 +49,15 @@ def make_pipeline(
     writer: FakeOrganizeWriter | None = None,
     run_ledger: FakeRunLedger | None = None,
     max_window_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[OrganizeWindow, FakeOrganizeWriter, FakeRunLedger]:
     writer = writer or FakeOrganizeWriter()
     run_ledger = run_ledger or FakeRunLedger()
     kwargs: dict[str, object] = {}
     if max_window_tokens is not None:
         kwargs["max_window_tokens"] = max_window_tokens
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
     pipeline = OrganizeWindow(
         thoughts=FakeThoughtWindowReader(thoughts),
         context_index=context_index or FakeContextIndex(),
@@ -200,6 +203,67 @@ async def test_the_select_call_uses_the_dedicated_select_provider() -> None:
 
     assert [r.step for r in select_provider.calls] == [LLMStep.SELECT]
     assert [r.step for r in organize_provider.calls] == [LLMStep.ORGANIZE]
+
+
+async def test_reasoning_effort_is_threaded_into_the_organize_request() -> None:
+    """docs/adr/0006 / round 8: a reviewed reasoning model's cost-safe
+    `reasoning_effort` (e.g. x-ai/grok-4.3's "none") must actually reach the
+    outgoing request, not just live in Settings/REVIEWED_MODELS unused."""
+    organize_reply = json.dumps(
+        {
+            "documents": [
+                {
+                    "stable_key": "daily_digest:2026-08-31",
+                    "kind": "daily_digest",
+                    "title": "Daily digest",
+                    "body_markdown": "## Summary\n\nWalked.\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- walked",
+                    "source_thought_ids": [1],
+                    "mentioned_entities": [],
+                    "change_summary": "first digest",
+                    "confidence": 1.0,
+                }
+            ],
+            "unorganized_thought_ids": [],
+            "referenced_document_keys": [],
+        }
+    )
+    provider = OfflineLLMProvider(responder=lambda _req: organize_reply)
+    pipeline, _writer, _run_ledger = make_pipeline(
+        thoughts=[a_thought(1)], provider=provider, reasoning_effort="none"
+    )
+
+    await pipeline(WORKSPACE, WINDOW)
+
+    assert [r.reasoning_effort for r in provider.calls if r.step == LLMStep.ORGANIZE] == ["none"]
+
+
+async def test_reasoning_effort_defaults_to_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-reasoning organize model (or the offline adapter) must not have
+    a reasoning_effort silently forced on it - unset is the correct default."""
+    organize_reply = json.dumps(
+        {
+            "documents": [
+                {
+                    "stable_key": "daily_digest:2026-08-31",
+                    "kind": "daily_digest",
+                    "title": "Daily digest",
+                    "body_markdown": "## Summary\n\nWalked.\n\n## Current state\n\n-\n\n## Open threads\n\n-\n\n## Timeline\n\n- walked",
+                    "source_thought_ids": [1],
+                    "mentioned_entities": [],
+                    "change_summary": "first digest",
+                    "confidence": 1.0,
+                }
+            ],
+            "unorganized_thought_ids": [],
+            "referenced_document_keys": [],
+        }
+    )
+    provider = OfflineLLMProvider(responder=lambda _req: organize_reply)
+    pipeline, _writer, _run_ledger = make_pipeline(thoughts=[a_thought(1)], provider=provider)
+
+    await pipeline(WORKSPACE, WINDOW)
+
+    assert [r.reasoning_effort for r in provider.calls if r.step == LLMStep.ORGANIZE] == [None]
 
 
 async def test_the_select_call_falls_back_to_the_organize_provider_when_unset() -> None:

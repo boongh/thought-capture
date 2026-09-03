@@ -218,6 +218,33 @@ class Settings(BaseSettings):
         reviewed = REVIEWED_MODELS.get(model_id)
         return reviewed.supports_strict_schema if reviewed is not None else False
 
+    def reasoning_effort_for(
+        self, model_id: str
+    ) -> Literal["none", "low", "medium", "high"] | None:
+        """The reviewed ``reasoning_effort`` to request for ``model_id``, or ``None``.
+
+        Same reasoning as `strict_schema_supported`: a reasoning model's safe
+        cost profile is itself a reviewed fact (docs/model-evaluation-organize-select.md
+        round 8's finding that `reasoning_effort="none"` is close to a
+        requirement, not an optional optimization, for `x-ai/grok-4.3` -
+        leaving it uncontrolled risks the entire monthly operational cap on
+        one candidate), not a mutable operator-set knob. Custom mode has no
+        registry entry to consult and always returns `None` (uncontrolled),
+        matching every other reviewed-only derivation in this class -
+        an operator in custom mode who wants a specific effort level pins it
+        themselves via a future request-level override, not through this
+        safe-mode-only mechanism.
+
+        `_safe_mode_restricts_to_reviewed_models` already guarantees a
+        non-empty slug reaching here in safe mode is a `REVIEWED_MODELS` key,
+        so the `None` branch below is unreachable in practice - same
+        defensive shape as `openrouter_only_providers`/`strict_schema_supported`.
+        """
+        if self.model_selection_mode != "safe":
+            return None
+        reviewed = REVIEWED_MODELS.get(model_id)
+        return reviewed.reasoning_effort if reviewed is not None else None
+
     @property
     def openrouter_deny_data_collection(self) -> bool:
         """Whether to tell OpenRouter to route only through non-retaining providers.

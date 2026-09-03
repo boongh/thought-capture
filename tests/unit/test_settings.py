@@ -326,3 +326,50 @@ def test_custom_mode_ignores_the_registry_for_strict_schema(
     stub_reviewed_model(monkeypatch, "test/reviewed-model")
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
     assert settings.strict_schema_supported("test/reviewed-model", custom_flag=False) is False
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort_for (docs/model-evaluation-organize-select.md round 8: a
+# reasoning model's safe cost profile is a reviewed fact, same shape as
+# strict_schema_supported)
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_for_a_reviewed_model_with_no_recorded_effort_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-reasoning reviewed model (the synthetic stub, matching
+    upstage/solar-pro4) has no reasoning_effort to control."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("test/reviewed-model") is None
+
+
+def test_reasoning_effort_for_grok_4_3_is_none_by_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real registry entry, not a synthetic stub: round 8 found
+    reasoning_effort="none" close to a requirement for x-ai/grok-4.3 to fit
+    the operational cost cap, so it is recorded on the entry itself."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("x-ai/grok-4.3") == "none"
+
+
+def test_reasoning_effort_for_a_model_not_looked_up_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a realistic call in practice - the validator already rejects an
+    unreviewed pin - but the lookup itself must not fabricate a value for a
+    model it doesn't recognize, same defensive shape as the other two
+    registry-derived methods."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("an/unreviewed-model") is None
+
+
+def test_custom_mode_ignores_the_registry_for_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom mode's promise is freedom from the allowlist entirely, even for
+    a slug that happens to also be reviewed with a recorded effort level."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.reasoning_effort_for("x-ai/grok-4.3") is None

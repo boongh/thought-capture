@@ -26,16 +26,17 @@ def test_every_entry_records_at_least_one_reviewed_provider() -> None:
         assert entry.providers, f"{entry.model_id} has no reviewed provider recorded"
 
 
-def test_organize_has_no_reviewed_candidate() -> None:
-    """Round 4's organize recommendation did not survive round 5's higher-N retest.
+def test_ruled_out_organize_candidates_are_not_reviewed() -> None:
+    """Round 4/5/12's organize candidates that did not survive evaluation.
 
     ``meta-llama/llama-4-maverick`` (docs/model-evaluation-organize-select.md)
-    surfaced a reproducible structural defect under higher-N testing and was
-    not added to the registry pending further evidence or an owner decision.
-    Safe mode with no reviewed organize candidate runs organize on the
-    offline adapter rather than admit an unresolved candidate on trust.
+    surfaced a reproducible structural defect under higher-N testing;
+    ``x-ai/grok-build-0.1`` (round 12) asserted the fabrication-A planted
+    claim as confirmed fact, a worse safety showing than the reviewed
+    ``x-ai/grok-4.3`` at higher cost. Neither was added to the registry.
     """
     assert "meta-llama/llama-4-maverick" not in REVIEWED_MODELS
+    assert "x-ai/grok-build-0.1" not in REVIEWED_MODELS
 
 
 def test_select_has_exactly_one_reviewed_candidate() -> None:
@@ -45,10 +46,31 @@ def test_select_has_exactly_one_reviewed_candidate() -> None:
     docs/model-evaluation-organize-select.md for the five-round evaluation
     this entry is based on.
     """
-    assert set(REVIEWED_MODELS) == {"upstage/solar-pro4"}
     entry = REVIEWED_MODELS["upstage/solar-pro4"]
     assert entry.supports_strict_schema is True
     assert entry.providers == frozenset({"upstage/zdr"})
+    assert entry.reasoning_effort is None
+
+
+def test_organize_has_exactly_one_reviewed_candidate() -> None:
+    """x-ai/grok-4.3 is the first organize model to pass all three review bars.
+
+    See ``reviewed_models.py``'s module docstring and
+    docs/model-evaluation-organize-select.md rounds 8-13 for the evaluation
+    this entry is based on. ``reasoning_effort="none"`` is recorded on the
+    entry itself, not left to an operator flag - round 8 found it close to
+    a requirement, not an optional optimization, for this candidate's cost
+    to fit the project's operational cap.
+    """
+    entry = REVIEWED_MODELS["x-ai/grok-4.3"]
+    assert entry.supports_strict_schema is True
+    assert entry.providers == frozenset({"xai/zdr"})
+    assert entry.reasoning_effort == "none"
+
+
+def test_the_registry_has_exactly_these_two_entries() -> None:
+    """Guards against a future addition landing without an accompanying test."""
+    assert set(REVIEWED_MODELS) == {"upstage/solar-pro4", "x-ai/grok-4.3"}
 
 
 def test_a_reviewed_model_records_all_required_fields() -> None:
