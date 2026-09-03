@@ -52,6 +52,13 @@ TEST_DATABASE_NAME = "thought_capture_test"
 
 API_TOKEN = "test-bearer-token-value"
 
+# Port 1 is reserved/privileged and never has a listener in practice, so a
+# connection to it fails fast and deterministically - unlike relying on
+# whatever TC_KHOJ_BASE_URL/its default happens to resolve to, which may or
+# may not have a real Khoj behind it depending on the developer's own local
+# setup. See _api_client's docstring for why this matters.
+UNREACHABLE_KHOJ_URL = "http://127.0.0.1:1"
+
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Refuse to report success when required integration tests were skipped.
@@ -288,13 +295,17 @@ async def _api_client(
     The lifespan is replaced so the test does not depend on a seeded Discord
     identity or a live HTTP client for capture/attachments (a
     ``FakeAttachmentArchive`` stands in there); the Khoj client, however, is
-    real (unlike attachments, there is no fake standing in for it) - by
-    default it points at an unreachable loopback address in a test
-    environment with no ``--profile ai`` up, which is exactly the production
-    "Khoj unavailable" path (docs/DESIGN.md 14.1), exercised for real rather
-    than mocked whenever a test calls ``mode=semantic``/``hybrid``. A test
-    that needs live semantic results instead uses the contract-marked suite
-    against a real pinned Khoj.
+    real (unlike attachments, there is no fake standing in for it) - it is
+    deliberately pointed at ``UNREACHABLE_KHOJ_URL``, not ``settings.khoj_base_url``
+    (which resolves from ``TC_KHOJ_BASE_URL``/its default if set - a developer
+    who normally keeps a real Khoj running locally for other work would
+    otherwise make every "Khoj unavailable" test here silently start passing
+    for the wrong reason, or failing, depending on ambient state that has
+    nothing to do with this test's own correctness). This exercises the real
+    production "Khoj unavailable" path (docs/DESIGN.md 14.1, 7.5) for real
+    rather than mocked, deterministically, regardless of what else is running
+    on the host. A test that needs live semantic results instead uses the
+    contract-marked suite against a real pinned Khoj.
     """
     workspace_id, user_id = identity
     settings = Settings(
@@ -314,7 +325,7 @@ async def _api_client(
             entities=PostgresEntityReader(app_session_factory),
             search=Search(
                 PostgresExactSearch(app_session_factory),
-                HttpKhojClient(khoj_http, settings.khoj_base_url),
+                HttpKhojClient(khoj_http, UNREACHABLE_KHOJ_URL),
                 PostgresSemanticHydrator(app_session_factory),
             ),
             llm_calls=PostgresLlmCallReader(app_session_factory),
