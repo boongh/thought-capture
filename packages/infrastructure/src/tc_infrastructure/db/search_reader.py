@@ -136,12 +136,15 @@ def _filter_conditions(
     requires the combined ``q``/``include``/``exclude`` text to literally
     match via full-text search - exact search has nothing else to go on.
     ``require_text_match=False`` (semantic hydration,
-    ``PostgresSemanticHydrator``) skips that positive match, since a semantic
-    hit is allowed to be relevant without literally containing ``q``/
-    ``include``, but still enforces ``exclude`` as its own negative match:
-    Khoj's embedding similarity gives no guarantee a forbidden word is
-    actually absent, so a semantic channel must not be trusted to have
-    honored it (docs/DESIGN.md 7.5 P1).
+    ``PostgresSemanticHydrator``) skips only ``q``'s positive match, since a
+    semantic hit is allowed to be relevant without literally containing
+    ``q`` - that is what makes it semantic rather than exact. ``include`` and
+    ``exclude`` are not relevance hints, though: docs/DESIGN.md 9.1 documents
+    them as hard word-presence/absence constraints, and Khoj's embedding
+    similarity gives no guarantee either is actually honored, so both are
+    still enforced here exactly as exact search enforces them - ``include``
+    words required present, ``exclude`` words required absent
+    (docs/DESIGN.md 7.5 P1).
     """
     conditions: list[sa.ColumnElement[bool]] = []
 
@@ -153,13 +156,14 @@ def _filter_conditions(
                     sa.func.websearch_to_tsquery("english", text)
                 )
             )
-    elif query.exclude:
-        exclude_text = " ".join(f"-{word}" for word in query.exclude)
-        conditions.append(
-            document_revisions.c.body_tsv.op("@@")(
-                sa.func.websearch_to_tsquery("english", exclude_text)
+    else:
+        include_exclude_text = " ".join((*query.include, *(f"-{word}" for word in query.exclude)))
+        if include_exclude_text:
+            conditions.append(
+                document_revisions.c.body_tsv.op("@@")(
+                    sa.func.websearch_to_tsquery("english", include_exclude_text)
+                )
             )
-        )
 
     if query.phrase:
         escaped = _escape_like(query.phrase)
