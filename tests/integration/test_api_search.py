@@ -142,6 +142,21 @@ async def test_semantic_mode_degrades_explicitly_when_khoj_is_unreachable(
     assert body["items"] == []
 
 
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+async def test_a_cursor_is_rejected_for_a_mode_that_cannot_honor_it(
+    api_fresh: httpx.AsyncClient, mode: str
+) -> None:
+    response = await api_fresh.get(
+        "/v1/search",
+        headers=AUTH,
+        params={"q": "anything", "mode": mode, "cursor": "opaque"},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["type"].endswith("cursor-unsupported-for-mode")
+
+
 async def test_hybrid_mode_degrades_to_exact_only_when_khoj_is_unreachable(
     api_fresh: httpx.AsyncClient,
     app_session_factory: async_sessionmaker[AsyncSession],

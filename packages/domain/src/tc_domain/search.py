@@ -94,16 +94,25 @@ class ExactSearchPort(Protocol):
 @runtime_checkable
 class SemanticHydrator(Protocol):
     async def hydrate(
-        self, workspace_id: WorkspaceId, filenames: tuple[str, ...]
+        self, workspace_id: WorkspaceId, query: SearchQuery, filenames: tuple[str, ...]
     ) -> dict[str, SearchResult]:
         """Resolve Khoj search-result filenames back to normalized ``SearchResult``s.
 
         Keyed by filename (not ``document_id``) so the caller can re-attach
-        each result's own Khoj score without a second lookup. A filename that
-        does not parse, belongs to a different workspace, or no longer
-        resolves to a current revision is simply absent from the returned
-        dict - never raised - matching ``ExactSearchPort``'s "no results is a
-        valid answer" contract.
+        each result's own Khoj score without a second lookup. ``query`` is the
+        original request's structured filters (kind, source, date/time,
+        entity, phrase, exclusion) - a semantic hit's relevance score never
+        implies it satisfies any of them, so every one of them must be
+        re-checked here in trusted PostgreSQL, the same way ``ExactSearchPort``
+        enforces them for its own channel (docs/DESIGN.md 7.5: filters are
+        honored or rejected explicitly, never silently bypassed by a channel
+        that cannot itself evaluate them). A filename that does not parse,
+        belongs to a different workspace, does not satisfy ``query``'s
+        filters, or is no longer Khoj's own acknowledged current revision
+        (docs/DESIGN.md 7.5: a stale synced revision must never be relabeled
+        as the current one) is simply absent from the returned dict - never
+        raised - matching ``ExactSearchPort``'s "no results is a valid answer"
+        contract.
         """
         ...
 

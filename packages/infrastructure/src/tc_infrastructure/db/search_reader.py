@@ -128,14 +128,37 @@ def _rank_expression(query: SearchQuery) -> sa.ColumnElement[Any]:
 
 
 def _filter_conditions(
-    query: SearchQuery, workspace_id: WorkspaceId
+    query: SearchQuery, workspace_id: WorkspaceId, *, require_text_match: bool = True
 ) -> list[sa.ColumnElement[bool]]:
+    """Structural filters shared by exact search and semantic hydration.
+
+    ``require_text_match=True`` (exact search, the default) additionally
+    requires the combined ``q``/``include``/``exclude`` text to literally
+    match via full-text search - exact search has nothing else to go on.
+    ``require_text_match=False`` (semantic hydration,
+    ``PostgresSemanticHydrator``) skips that positive match, since a semantic
+    hit is allowed to be relevant without literally containing ``q``/
+    ``include``, but still enforces ``exclude`` as its own negative match:
+    Khoj's embedding similarity gives no guarantee a forbidden word is
+    actually absent, so a semantic channel must not be trusted to have
+    honored it (docs/DESIGN.md 7.5 P1).
+    """
     conditions: list[sa.ColumnElement[bool]] = []
 
     text = text_query_string(query)
-    if text is not None:
+    if require_text_match:
+        if text is not None:
+            conditions.append(
+                document_revisions.c.body_tsv.op("@@")(
+                    sa.func.websearch_to_tsquery("english", text)
+                )
+            )
+    elif query.exclude:
+        exclude_text = " ".join(f"-{word}" for word in query.exclude)
         conditions.append(
-            document_revisions.c.body_tsv.op("@@")(sa.func.websearch_to_tsquery("english", text))
+            document_revisions.c.body_tsv.op("@@")(
+                sa.func.websearch_to_tsquery("english", exclude_text)
+            )
         )
 
     if query.phrase:

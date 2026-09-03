@@ -1,12 +1,23 @@
 """Search use case (docs/DESIGN.md 7.5, 10).
 
 ``mode="exact"`` delegates to PostgreSQL alone. ``mode="semantic"`` delegates
-to Khoj alone, hydrated back into normalized ``SearchResult``s.
-``mode="hybrid"`` runs both concurrently and fuses them by Reciprocal Rank
-Fusion (``tc_domain.search_fusion.fuse_rrf``). Khoj being unreachable never
-raises past this use case: docs/DESIGN.md 7.5 requires an explicit
-``degraded=True`` rather than an empty success that implies no memory
-exists - semantic degrades to an empty page, hybrid degrades to exact-only.
+to Khoj alone, hydrated back into normalized ``SearchResult``s - hydration
+also re-enforces every structured filter in trusted PostgreSQL
+(``SemanticHydrator.hydrate``'s own contract), since a semantic hit's
+relevance score never implies it satisfies them. ``mode="hybrid"`` runs both
+concurrently and fuses them by Reciprocal Rank Fusion
+(``tc_domain.search_fusion.fuse_rrf``). Khoj being unreachable never raises
+past this use case: docs/DESIGN.md 7.5 requires an explicit ``degraded=True``
+rather than an empty success that implies no memory exists - semantic
+degrades to an empty page, hybrid degrades to exact-only.
+
+Keyset pagination (``query.cursor``) is an exact-search-only concern: Khoj has
+no equivalent, so a cursor threaded through hybrid would advance the exact
+channel to a later page while semantic silently restarted at its first page
+every time, fusing two pages that were never aligned. Rather than allow that
+silently, a cursor supplied for ``semantic``/``hybrid`` is rejected outright
+(``UnsupportedCursorError``) - docs/DESIGN.md 7.5's filters are "honored or
+rejected explicitly", never silently reinterpreted.
 """
 
 from __future__ import annotations
@@ -34,6 +45,11 @@ class UnsupportedSearchModeError(Exception):
     """Raised for a search mode this application does not implement."""
 
 
+class UnsupportedCursorError(Exception):
+    """Raised when a pagination cursor is supplied for a mode that cannot
+    honor it (``semantic``/``hybrid`` - see module docstring)."""
+
+
 class Search:
     def __init__(self, exact: ExactSearchPort, khoj: KhojPort, hydrate: SemanticHydrator) -> None:
         self._exact = exact
@@ -46,6 +62,11 @@ class Search:
         if mode not in SUPPORTED_MODES:
             raise UnsupportedSearchModeError(
                 f"mode={mode!r} is not implemented; available modes are {SUPPORTED_MODES!r}"
+            )
+        if mode != "exact" and query.cursor is not None:
+            raise UnsupportedCursorError(
+                f"mode={mode!r} does not support pagination; a cursor is only valid for "
+                "mode='exact'"
             )
         if mode == "exact":
             return await self._exact.search(workspace_id, query)
@@ -61,7 +82,7 @@ class Search:
             # not a degradation.
             return SearchPage(items=(), next_cursor=None, degraded=False)
         try:
-            items = await self._semantic_results(workspace_id, text, query.limit)
+            items = await self._semantic_results(workspace_id, query, text)
         except KhojUnavailableError:
             return SearchPage(items=(), next_cursor=None, degraded=True)
         return SearchPage(items=items, next_cursor=None, degraded=False)
@@ -71,7 +92,7 @@ class Search:
 
         exact_task = asyncio.ensure_future(self._exact.search(workspace_id, query))
         semantic_task = asyncio.ensure_future(
-            self._semantic_results_or_none(workspace_id, text, query.limit)
+            self._semantic_results_or_none(workspace_id, query, text)
         )
         exact_page, semantic_items = await asyncio.gather(exact_task, semantic_task)
 
@@ -89,7 +110,7 @@ class Search:
         return SearchPage(items=fused[:limit], next_cursor=None, degraded=semantic_items is None)
 
     async def _semantic_results_or_none(
-        self, workspace_id: WorkspaceId, text: str | None, limit: int
+        self, workspace_id: WorkspaceId, query: SearchQuery, text: str | None
     ) -> tuple[SearchResult, ...] | None:
         """``None`` distinguishes "Khoj was unreachable" (degraded) from "no
         free text to search on" / "no matches" (both a valid empty tuple) -
@@ -99,15 +120,17 @@ class Search:
         if text is None:
             return ()
         try:
-            return await self._semantic_results(workspace_id, text, limit)
+            return await self._semantic_results(workspace_id, query, text)
         except KhojUnavailableError:
             return None
 
     async def _semantic_results(
-        self, workspace_id: WorkspaceId, text: str, limit: int
+        self, workspace_id: WorkspaceId, query: SearchQuery, text: str
     ) -> tuple[SearchResult, ...]:
-        results = await self._khoj.search(text, limit=limit)
-        hydrated = await self._hydrate.hydrate(workspace_id, tuple(r.filename for r in results))
+        results = await self._khoj.search(text, limit=query.limit)
+        hydrated = await self._hydrate.hydrate(
+            workspace_id, query, tuple(r.filename for r in results)
+        )
         items: list[SearchResult] = []
         for result in results:
             match = hydrated.get(result.filename)
