@@ -33,8 +33,10 @@ from tc_infrastructure.db.khoj_force_sync import PostgresKhojForceSync
 from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.search_reader import PostgresExactSearch
+from tc_infrastructure.db.semantic_hydrator import PostgresSemanticHydrator
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
 
@@ -70,7 +72,11 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         reader=PostgresThoughtReader(sessions),
         documents=PostgresDocumentReader(sessions),
         entities=PostgresEntityReader(sessions),
-        search=Search(PostgresExactSearch(sessions)),
+        search=Search(
+            PostgresExactSearch(sessions),
+            HttpKhojClient(http, settings.khoj_base_url),
+            PostgresSemanticHydrator(sessions),
+        ),
         llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(sessions)),
