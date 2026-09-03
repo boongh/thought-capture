@@ -34,14 +34,24 @@ APP_ROLE = "tc_app"
 
 
 def upgrade() -> None:
+    # Composite FKs against documents(id, workspace_id) and
+    # document_revisions(id, workspace_id) - the same pattern migration 0005
+    # established everywhere else a child row points at a workspace-scoped
+    # parent - so the database itself rejects a row whose document_id or
+    # revision_id belongs to a different workspace than its own workspace_id
+    # column claims, not just application code that happens to pass a
+    # consistent pair.
     op.execute("""
         CREATE TABLE khoj_index_items (
           workspace_id uuid NOT NULL REFERENCES workspaces(id),
-          document_id uuid PRIMARY KEY REFERENCES documents(id),
+          document_id uuid PRIMARY KEY,
           filename text NOT NULL,
-          revision_id uuid NOT NULL REFERENCES document_revisions(id),
+          revision_id uuid NOT NULL,
           body_sha256 char(64) NOT NULL,
-          synced_at timestamptz NOT NULL
+          synced_at timestamptz NOT NULL,
+          FOREIGN KEY (document_id, workspace_id) REFERENCES documents (id, workspace_id),
+          FOREIGN KEY (revision_id, workspace_id)
+            REFERENCES document_revisions (id, workspace_id)
         )
     """)
     op.execute("CREATE UNIQUE INDEX khoj_index_items_filename_idx ON khoj_index_items (filename)")
