@@ -18,6 +18,7 @@ import datetime as dt
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 from tc_application.context_assembly import assemble_context, render_index
 from tc_application.organize_contract import SCHEMA_VERSION, OrganizationResult
@@ -109,6 +110,7 @@ class OrganizeWindow:
         config: ContextAssemblyConfig = DEFAULT_CONTEXT_ASSEMBLY_CONFIG,
         clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
         max_window_tokens: int = DEFAULT_MAX_WINDOW_TOKENS,
+        reasoning_effort: Literal["none", "low", "medium", "high"] | None = None,
     ) -> None:
         self._thoughts = thoughts
         self._context_index = context_index
@@ -121,6 +123,11 @@ class OrganizeWindow:
         self._config = config
         self._clock = clock
         self._max_window_tokens = max_window_tokens
+        # Settings.reasoning_effort_for(settings.model_organize): a reviewed
+        # reasoning model's safe cost profile (docs/adr/0006), not a free
+        # operator knob - unset for a non-reasoning organize model or the
+        # offline adapter, where it has no effect either way.
+        self._reasoning_effort = reasoning_effort
 
     async def __call__(
         self,
@@ -181,7 +188,10 @@ class OrganizeWindow:
             )
 
             request = _organize_request(
-                index=index, full_bodies=full_bodies, window_text=window_text
+                index=index,
+                full_bodies=full_bodies,
+                window_text=window_text,
+                reasoning_effort=self._reasoning_effort,
             )
             result = await complete_structured(
                 self._provider, request, OrganizationResult, journal=journal
@@ -277,7 +287,11 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _organize_request(
-    *, index: tuple[Tier1Row, ...], full_bodies: dict[str, str], window_text: str
+    *,
+    index: tuple[Tier1Row, ...],
+    full_bodies: dict[str, str],
+    window_text: str,
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None,
 ) -> LLMRequest:
     body_section = (
         "\n\n".join(f"### {key}\n{body}" for key, body in full_bodies.items())
@@ -299,6 +313,7 @@ def _organize_request(
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
         max_output_tokens=8192,
+        reasoning_effort=reasoning_effort,
     )
 
 

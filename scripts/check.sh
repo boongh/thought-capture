@@ -140,6 +140,66 @@ if command -v docker >/dev/null 2>&1; then
     rm -f "$core_only_env" "$ai_error_file"
     exit 1
   fi
+
+  # LLM configuration forwarding (independent Codex review): the bot/worker
+  # environment must actually forward TC_OPENROUTER_API_KEY and the model
+  # pins into the rendered container environment, not just accept them at
+  # the top-level interpolation stage - a variable can validate here and
+  # still fail to reach a service if it were only referenced in, say,
+  # `x-service-image` rather than `llm-env`. Just as important: api/migrate
+  # must NOT receive them - `llm-env` is a separate anchor from
+  # `service-env` specifically so a secret (TC_OPENROUTER_API_KEY) and the
+  # model pins reach only the two services with a code path that reads them
+  # (discord-bot's select, worker's organize), not every container in the
+  # shared network.
+  llm_env="$(mktemp)"
+  printf 'POSTGRES_PASSWORD=sanity-check-only\nTC_APP_DB_PASSWORD=sanity-check-only\nTC_OPENROUTER_API_KEY=sanity-check-api-key\nTC_MODEL_ORGANIZE=sanity-check-organize-model\nTC_MODEL_SELECT=sanity-check-select-model\n' >"$llm_env"
+  llm_config="$(docker compose --env-file "$llm_env" -f deploy/compose/docker-compose.yml --profile core config 2>/dev/null)"
+  llm_config_status=$?
+  if [[ $llm_config_status -ne 0 ]]; then
+    printf "FAIL: compose config sanity (rendering 'core' config with LLM variables set failed)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+    exit 1
+  fi
+  service_block() {
+    printf '%s\n' "$llm_config" | awk -v svc="$1" '
+      $0 == "  " svc ":" { in_service = 1; next }
+      in_service && /^  [a-zA-Z]/ { in_service = 0 }
+      in_service { print }
+    '
+  }
+  for service in discord-bot worker; do
+    service_env="$(service_block "$service")"
+    if ! grep -q "TC_OPENROUTER_API_KEY: sanity-check-api-key" <<<"$service_env"; then
+      printf "FAIL: compose config sanity (%s did not receive TC_OPENROUTER_API_KEY)\n" "$service" >&2
+      rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+      exit 1
+    fi
+    if ! grep -q "TC_MODEL_ORGANIZE: sanity-check-organize-model" <<<"$service_env"; then
+      printf "FAIL: compose config sanity (%s did not receive TC_MODEL_ORGANIZE)\n" "$service" >&2
+      rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+      exit 1
+    fi
+    if ! grep -q "TC_MODEL_SELECT: sanity-check-select-model" <<<"$service_env"; then
+      printf "FAIL: compose config sanity (%s did not receive TC_MODEL_SELECT)\n" "$service" >&2
+      rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+      exit 1
+    fi
+  done
+  for service in api migrate; do
+    service_env="$(service_block "$service")"
+    if grep -q "TC_OPENROUTER_API_KEY" <<<"$service_env"; then
+      printf "FAIL: compose config sanity (%s must not receive TC_OPENROUTER_API_KEY, but does)\n" "$service" >&2
+      rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+      exit 1
+    fi
+    if grep -qE "TC_MODEL_(ORGANIZE|SELECT|QUERY_PLAN)" <<<"$service_env"; then
+      printf "FAIL: compose config sanity (%s must not receive model pins, but does)\n" "$service" >&2
+      rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+      exit 1
+    fi
+  done
+  rm -f "$llm_env"
   if docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
     -f deploy/compose/khoj.docker-compose.yml --profile ai config --quiet 2>"$ai_error_file"; then
     printf "FAIL: compose config sanity (expected 'ai' config to fail without TC_KHOJ_* set, but it succeeded)\n" >&2

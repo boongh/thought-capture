@@ -133,6 +133,7 @@ def test_safe_mode_organize_provider_derives_strict_schema_from_the_registry_too
             model_id="test/reviewed-organize-model",
             supports_strict_schema=True,
             providers=frozenset({"test-provider"}),
+            stages=frozenset({"organize"}),
             note="synthetic entry for test use only",
         ),
     )

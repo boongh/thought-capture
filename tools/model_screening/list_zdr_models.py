@@ -23,12 +23,32 @@ bit" band - override with flags for a different pass):
   ``screen_candidate.py``'s capability pre-check is the real check.
 - Prompt/completion price under the given ceilings, context above the given
   floor.
-- Model id does not match a reasoning-branded naming pattern (round 2's
-  DeepSeek finding, round 7's GLM/MiMo findings: hidden reasoning tokens can
-  dominate cost and latency, or consume the entire budget with no visible
-  output, independent of price-per-token). This is a heuristic on the name
-  only - it will both over- and under-exclude - not a substitute for reading
-  ``supported_parameters`` for a ``reasoning`` entry.
+
+Reasoning-branded models (name matches ``REASONING_HINTS``, or
+``supported_parameters`` advertises ``reasoning``) are included by default as
+of the reasoning-model policy update below - pass ``--exclude-reasoning-hinted``
+to filter them back out by name if a session wants a reasoning-free batch.
+
+Policy (round 2's DeepSeek finding, round 7's GLM/MiMo findings: hidden
+reasoning tokens can dominate cost and latency, or consume the entire budget
+with no visible output, independent of price-per-token) used to be a blanket
+name-based exclusion. That was too blunt: round 8-11 found the strongest
+organize candidate to date (``x-ai/grok-4.3``) *is* a reasoning model, made
+viable specifically because ``LLMRequest.reasoning_effort`` (shipped round 7)
+can suppress the tax - and DeepSeek V4 Flash itself was deprioritized in
+round 1-2 for latency/verbosity alone, before that control existed, not for
+an unbounded-cost or safety reason. The policy now is: don't pre-filter
+reasoning models out by name; screen them with
+``screen_candidate.py --reasoning-efforts`` swept across ``unset,none,low``
+(at minimum) and rank on realized average $/call at whichever level is
+accepted, the same way every non-reasoning candidate is judged. A model that
+rejects every controlled value with HTTP 400 (mandatory, uncontrollable
+reasoning - GLM 5.3 Flash, MiniMax M2.7, Reka Flash 3) is still a fast,
+cheap rule-out; that failure mode is what ``--exclude-reasoning-hinted``
+exists to skip pre-emptively when a session doesn't want to spend on it.
+``supports_reasoning`` in each candidate's JSON output flags catalog-declared
+reasoning support directly, independent of the name heuristic - prefer it
+over ``REASONING_HINTS`` when deciding which candidates to run a sweep on.
 """
 
 from __future__ import annotations
@@ -143,7 +163,15 @@ def main() -> None:
         "--max-completion-price", type=float, default=5.00, help="USD per M completion tokens"
     )
     parser.add_argument("--min-context", type=int, default=32_000)
-    parser.add_argument("--include-reasoning-hinted", action="store_true")
+    parser.add_argument(
+        "--exclude-reasoning-hinted",
+        action="store_true",
+        help=(
+            "filter out reasoning-branded model ids by name (REASONING_HINTS). "
+            "Included by default since the reasoning-model policy update - see "
+            "this module's docstring."
+        ),
+    )
     parser.add_argument(
         "--limit", type=int, default=None, help="keep only the N cheapest after filtering"
     )
@@ -159,7 +187,7 @@ def main() -> None:
         max_prompt_price=args.max_prompt_price,
         max_completion_price=args.max_completion_price,
         min_context=args.min_context,
-        exclude_reasoning_hinted=not args.include_reasoning_hinted,
+        exclude_reasoning_hinted=args.exclude_reasoning_hinted,
     )
     if args.limit:
         candidates = candidates[: args.limit]

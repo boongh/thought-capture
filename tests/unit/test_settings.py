@@ -29,15 +29,17 @@ def stub_reviewed_model(
     monkeypatch: pytest.MonkeyPatch,
     model_id: str,
     providers: frozenset[str] = frozenset({"test-provider"}),
+    stages: frozenset[str] = frozenset({"organize", "select", "query_plan"}),
 ) -> None:
     """Inject a synthetic allowlist entry.
 
-    The real registry (``REVIEWED_MODELS``) is empty as of 2026-09-01 - its
-    one candidate failed the private bar on review, see
-    ``reviewed_models.py``. Tests of the safe-mode *mechanism* (accepts a
-    reviewed slug, restricts to its recorded providers) must not depend on
-    any specific model actually being reviewed, so they inject their own
-    entry directly into the shared dict rather than naming a real slug.
+    Tests of the safe-mode *mechanism* (accepts a reviewed slug, restricts to
+    its recorded providers/stage) must not depend on any specific model
+    actually being reviewed, so they inject their own entry directly into the
+    shared dict rather than naming a real slug. Defaults to every stage so
+    that tests exercising the generic allowlist mechanism (not the
+    stage-restriction itself) aren't tripped up by it - see
+    ``stub_reviewed_model``'s ``stages`` override for tests that are.
     """
     monkeypatch.setitem(
         REVIEWED_MODELS,
@@ -46,6 +48,7 @@ def stub_reviewed_model(
             model_id=model_id,
             supports_strict_schema=True,
             providers=providers,
+            stages=frozenset(stages),
             note="synthetic entry for test use only",
         ),
     )
@@ -171,6 +174,72 @@ def test_offline_select_adapter_is_selected_when_no_slug_is_pinned(
     stub_reviewed_model(monkeypatch, "test/reviewed-model")
     pinned = build(monkeypatch, TC_MODEL_SELECT="test/reviewed-model")
     assert pinned.uses_offline_select_adapter is False
+
+
+# ---------------------------------------------------------------------------
+# Stage restriction: a model reviewed for one stage must not be usable in
+# another, even though it is a REVIEWED_MODELS key (Codex PR review finding -
+# safe mode previously accepted TC_MODEL_SELECT=x-ai/grok-4.3 and
+# TC_MODEL_ORGANIZE=upstage/solar-pro4 despite both being registered
+# select-only/organize-only respectively).
+# ---------------------------------------------------------------------------
+
+
+def test_safe_mode_rejects_the_real_select_only_model_pinned_to_organize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """upstage/solar-pro4 is reviewed for select only (reviewed_models.py)."""
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_ORGANIZE="upstage/solar-pro4")
+
+
+def test_safe_mode_rejects_the_real_organize_only_model_pinned_to_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """x-ai/grok-4.3 is reviewed for organize only (reviewed_models.py)."""
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_SELECT="x-ai/grok-4.3")
+
+
+def test_safe_mode_rejects_the_real_organize_only_model_pinned_to_query_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(monkeypatch, TC_MODEL_SELECTION_MODE="safe", TC_MODEL_QUERY_PLAN="x-ai/grok-4.3")
+
+
+def test_safe_mode_rejects_a_stage_crossed_synthetic_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mechanism-level proof, independent of which real slugs are currently
+    registered: a model reviewed only for ``select`` must be rejected for
+    ``organize``."""
+    stub_reviewed_model(monkeypatch, "test/select-only-model", stages=frozenset({"select"}))
+    with pytest.raises(ValidationError, match="docs/adr/0006"):
+        build(
+            monkeypatch,
+            TC_MODEL_SELECTION_MODE="safe",
+            TC_MODEL_ORGANIZE="test/select-only-model",
+        )
+
+
+def test_safe_mode_accepts_a_stage_crossed_synthetic_model_for_its_own_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub_reviewed_model(monkeypatch, "test/select-only-model", stages=frozenset({"select"}))
+    settings = build(
+        monkeypatch,
+        TC_MODEL_SELECTION_MODE="safe",
+        TC_MODEL_SELECT="test/select-only-model",
+    )
+    assert settings.model_select == "test/select-only-model"
+
+
+def test_custom_mode_ignores_stage_restriction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The escape hatch still applies: custom mode accepts any slug for any
+    field, stage-crossed or not."""
+    settings = build(
+        monkeypatch, TC_MODEL_SELECTION_MODE="custom", TC_MODEL_ORGANIZE="upstage/solar-pro4"
+    )
+    assert settings.model_organize == "upstage/solar-pro4"
 
 
 def test_safe_mode_permits_an_empty_slug(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,3 +395,50 @@ def test_custom_mode_ignores_the_registry_for_strict_schema(
     stub_reviewed_model(monkeypatch, "test/reviewed-model")
     settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
     assert settings.strict_schema_supported("test/reviewed-model", custom_flag=False) is False
+
+
+# ---------------------------------------------------------------------------
+# reasoning_effort_for (docs/model-evaluation-organize-select.md round 8: a
+# reasoning model's safe cost profile is a reviewed fact, same shape as
+# strict_schema_supported)
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_for_a_reviewed_model_with_no_recorded_effort_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-reasoning reviewed model (the synthetic stub, matching
+    upstage/solar-pro4) has no reasoning_effort to control."""
+    stub_reviewed_model(monkeypatch, "test/reviewed-model")
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("test/reviewed-model") is None
+
+
+def test_reasoning_effort_for_grok_4_3_is_none_by_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real registry entry, not a synthetic stub: round 8 found
+    reasoning_effort="none" close to a requirement for x-ai/grok-4.3 to fit
+    the operational cost cap, so it is recorded on the entry itself."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("x-ai/grok-4.3") == "none"
+
+
+def test_reasoning_effort_for_a_model_not_looked_up_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not a realistic call in practice - the validator already rejects an
+    unreviewed pin - but the lookup itself must not fabricate a value for a
+    model it doesn't recognize, same defensive shape as the other two
+    registry-derived methods."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="safe")
+    assert settings.reasoning_effort_for("an/unreviewed-model") is None
+
+
+def test_custom_mode_ignores_the_registry_for_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom mode's promise is freedom from the allowlist entirely, even for
+    a slug that happens to also be reviewed with a recorded effort level."""
+    settings = build(monkeypatch, TC_MODEL_SELECTION_MODE="custom")
+    assert settings.reasoning_effort_for("x-ai/grok-4.3") is None

@@ -1,7 +1,7 @@
 # ADR-0006: OpenRouter behind a provider port, with safe and custom model-selection modes
 
 - **Status:** Accepted
-- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01; `model_select` added and gated by safe mode, `upstage/solar-pro4` added to the registry for `select`, 2026-09-02; `Settings.strict_schema_supported` closes a gap where the composition root trusted the mutable `model_supports_strict_schema`/`model_select_supports_strict_schema` flags directly in safe mode instead of `REVIEWED_MODELS`, 2026-09-02)
+- **Date:** 2026-08-31 (request-side provider routing added 2026-09-01; provider-endpoint pinning and `require_parameters` added 2026-09-01; `qwen/qwen3.8-flash` removed from the registry 2026-09-01; `provider.zdr` enforcement added 2026-09-01; `model_select` added and gated by safe mode, `upstage/solar-pro4` added to the registry for `select`, 2026-09-02; `Settings.strict_schema_supported` closes a gap where the composition root trusted the mutable `model_supports_strict_schema`/`model_select_supports_strict_schema` flags directly in safe mode instead of `REVIEWED_MODELS`, 2026-09-02; `x-ai/grok-4.3` added to the registry for `organize` after rounds 8-13's evaluation, and `ReviewedModel.stages` added so safe mode rejects a reviewed slug used outside the stage it was actually reviewed for, 2026-09-03)
 - **Design anchor:** extends `docs/DESIGN.md` 11, 12.1, 12.2
 - **First implemented in:** `packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`, `packages/infrastructure/src/tc_infrastructure/config.py`
 
@@ -137,14 +137,29 @@ default):
   bar (see Context). The registry stayed empty until 2026-09-02, when
   `upstage/solar-pro4` was added for `select` after a five-round live
   evaluation (`docs/model-evaluation-organize-select.md`) - the first entry
-  to actually pass all three bars. `organize` still has no reviewed
-  candidate: a promising round-4 candidate did not hold up under round 5's
-  higher-N retest and was not added (see that document's "What this does not
-  settle"), so `model_organize` in safe mode is still always rejected if
-  non-empty, and organize runs on the deterministic offline adapter. Adding a
-  model means adding an entry after doing the review above - a code change
-  and a commit, not a config edit, which is the point: the review has to
-  have actually happened.
+  to actually pass all three bars. `organize` had no reviewed candidate
+  through round 7: a promising round-4 candidate did not hold up under
+  round 5's higher-N retest and was not added (see that document's "What
+  this does not settle"). Rounds 8-13 continued the organize search and
+  found `x-ai/grok-4.3`, the first organize candidate to pass every probe
+  across an N=5 confirmation and to survive a round-13 broad re-search for a
+  cheaper alternative; the owner approved wiring it in on 2026-09-03, and it
+  is now `organize`'s reviewed entry.
+
+  A review is stage-specific, not just model-specific: `ReviewedModel.stages`
+  records which of `organize`/`select`/`query_plan` a slug was actually
+  checked for, and `upstage/solar-pro4`/`x-ai/grok-4.3` are recorded as
+  `select`-only/`organize`-only respectively - each was reviewed against
+  that one step's own prompt shape and cost profile, not the other's. Safe
+  mode rejects a slug pinned to a field whose stage is not in its recorded
+  set, even though the slug is otherwise a `REVIEWED_MODELS` key (independent
+  Codex review, 2026-09-03: safe mode previously accepted
+  `TC_MODEL_SELECT=x-ai/grok-4.3` and `TC_MODEL_ORGANIZE=upstage/solar-pro4`
+  on registry membership alone). Adding a model, or a new stage to an
+  existing model's entry, means adding it after doing the review above for
+  that stage specifically - a code change and a commit, not a config edit,
+  which is the point: the review has to have actually happened, for the step
+  it is being used in.
 
 - **Custom mode.** `TC_MODEL_SELECTION_MODE=custom` lifts the allowlist. Any
   non-empty slug is accepted, including `nvidia/nemotron-3.5-lightning:free`
@@ -340,12 +355,16 @@ safe mode (and optionally in custom mode, via `model_require_zdr`), giving the
 zero-data-retention endpoint list, rather than relying solely on the
 registry's point-in-time claim.
 
-**Negative.** With the registry empty, safe mode - the default - has no
-provider-backed model to organize or answer queries with; both run on the
-deterministic offline adapter until a model is added. This is the direct
-cost of treating "private" as a checked fact rather than a plausible one:
-Release 1's safe-mode LLM path is blocked on finding a model with a
-confirmed-eligible endpoint, not merely a plausible one.
+**Negative.** With the registry empty (as it was through this ADR's first
+several amendments), safe mode - the default - had no provider-backed model
+to organize, select context for, or answer queries with; all three ran on
+the deterministic offline adapter until a stage-reviewed model was added.
+This was the direct cost of treating "private" as a checked fact rather than
+a plausible one: Release 1's safe-mode LLM path was blocked on finding a
+model with a confirmed-eligible endpoint, not merely a plausible one.
+`select` and `organize` now each have one reviewed entry
+(`upstage/solar-pro4`, `x-ai/grok-4.3`); `query_plan` remains unreviewed and
+still runs on the offline adapter in safe mode.
 
 **Negative.** Every new model requires a code change to adopt in safe mode.
 This is deliberate friction, not an oversight: it is what makes "reviewed"
@@ -417,15 +436,27 @@ provider with `supports_strict_schema=True`; the same setup driven through a
 stub OpenAI client asserts the actual outgoing `chat.completions.create`
 call carries `response_format: {"type": "json_schema", "strict": true}` and
 `extra_body["provider"]["require_parameters"] is True`, not just the
-internal flag; a parallel test proves `build_organize_provider` derives the
-same way via a synthetic registry entry, since the real registry has no
-reviewed `organize` candidate yet.
+internal flag; a parallel test proved `build_organize_provider` derives the
+same way via a synthetic registry entry, at the time written before the real
+registry had a reviewed `organize` candidate.
 
 `tests/unit/test_reviewed_models.py` asserts every registry entry records at
-least one provider, that the registry is currently empty (documenting why,
-so a future entry is a deliberate change to that test rather than a silent
-diff), and guards `ReviewedModel`'s field shape with a synthetic entry
-independent of the registry's actual contents. Because the real registry is
-empty, `tests/unit/test_settings.py`'s safe-mode-accepts/restricts-providers
-tests inject their own synthetic `REVIEWED_MODELS` entry via `monkeypatch`
-rather than depend on a specific model having been reviewed.
+least one provider and at least one reviewed stage, pins the registry's
+current contents to exactly `upstage/solar-pro4` (`select`) and
+`x-ai/grok-4.3` (`organize`) so a future addition is a deliberate change to
+that test rather than a silent diff, and guards `ReviewedModel`'s field
+shape with a synthetic entry independent of the registry's actual contents.
+`tests/unit/test_settings.py`'s safe-mode-accepts/restricts-providers tests
+still inject their own synthetic `REVIEWED_MODELS` entry via `monkeypatch`
+rather than depend on either real slug, so the allowlist *mechanism* stays
+covered independent of which specific models are currently reviewed.
+
+`tests/unit/test_settings.py` additionally asserts the stage restriction
+(independent Codex review, 2026-09-03): `TC_MODEL_ORGANIZE=upstage/solar-pro4`
+and `TC_MODEL_SELECT=x-ai/grok-4.3` are each rejected in safe mode - the real
+registry entries, not synthetic ones, to prove the exact reported bypass is
+closed - alongside a synthetic-entry version of the same check (a
+`select`-only stub rejected for `TC_MODEL_ORGANIZE`, accepted for
+`TC_MODEL_SELECT`) that stays valid independent of which real models are
+currently reviewed, and confirms custom mode still ignores the restriction
+entirely.

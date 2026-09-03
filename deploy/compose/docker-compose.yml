@@ -47,6 +47,27 @@ x-service-env: &service-env
   TC_ATTACHMENT_ROOT: /data/attachments
   TC_ATTACHMENT_MAX_BYTES: ${TC_ATTACHMENT_MAX_BYTES:-26214400}
 
+# LLM configuration (docs/adr/0006). Deliberately a SEPARATE anchor from
+# `service-env`, not folded into it: TC_OPENROUTER_API_KEY is a secret, and
+# api/migrate have no code path that reads any of these (`apps/api`,
+# `tc_worker.bootstrap` never call `tc_infrastructure.llm.factory`) - only
+# discord-bot (select, at capture time) and worker (organize, at digest time)
+# actually build a provider. Giving the key to containers that cannot use it
+# widens the blast radius of a compromised api/migrate container for no
+# benefit, so only discord-bot/worker merge this in below.
+x-llm-env: &llm-env
+  TC_OPENROUTER_API_KEY: ${TC_OPENROUTER_API_KEY:-}
+  TC_OPENROUTER_BASE_URL: ${TC_OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+  TC_MODEL_SELECTION_MODE: ${TC_MODEL_SELECTION_MODE:-safe}
+  TC_MODEL_ORGANIZE: ${TC_MODEL_ORGANIZE:-}
+  TC_MODEL_SELECT: ${TC_MODEL_SELECT:-}
+  TC_MODEL_QUERY_PLAN: ${TC_MODEL_QUERY_PLAN:-}
+  TC_MODEL_SUPPORTS_STRICT_SCHEMA: ${TC_MODEL_SUPPORTS_STRICT_SCHEMA:-false}
+  TC_MODEL_SELECT_SUPPORTS_STRICT_SCHEMA: ${TC_MODEL_SELECT_SUPPORTS_STRICT_SCHEMA:-false}
+  TC_MODEL_ALLOW_FALLBACK: ${TC_MODEL_ALLOW_FALLBACK:-true}
+  TC_MODEL_REQUIRE_ZDR: ${TC_MODEL_REQUIRE_ZDR:-false}
+  TC_MONTHLY_BUDGET_USD: ${TC_MONTHLY_BUDGET_USD:-5.00}
+
 services:
   postgres:
     # Pinned to a full minor. PostgreSQL recommends always running the current
@@ -150,7 +171,10 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      <<: *service-env
+      # select (docs/DESIGN.md 7.3.2) runs at capture time, from this
+      # service - see the LLM configuration block's anchor comment above for
+      # why api/migrate do not also get `llm-env`.
+      <<: [*service-env, *llm-env]
     volumes:
       - attachments:/data/attachments
 
@@ -169,7 +193,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      <<: *service-env
+      # organize (docs/DESIGN.md 7.4) runs at digest time, from this service.
+      <<: [*service-env, *llm-env]
 
 volumes:
   postgres-data:

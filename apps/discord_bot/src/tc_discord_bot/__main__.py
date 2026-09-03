@@ -161,6 +161,7 @@ async def serve(settings: Settings) -> None:
                 max_selected_documents=settings.context_max_selected_documents,
                 recency_days=settings.context_recency_days,
             ),
+            reasoning_effort=settings.reasoning_effort_for(settings.model_organize),
         )
         admin_commands = build_admin_commands(
             organize=organize,

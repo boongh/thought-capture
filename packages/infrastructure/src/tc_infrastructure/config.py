@@ -144,17 +144,40 @@ class Settings(BaseSettings):
         this fails at process start, the same way an unknown timezone does,
         rather than at the first organize call. An empty slug is exempt: it
         selects the deterministic offline adapter, not a provider call.
+
+        Registry membership alone is not enough: a model's review is
+        stage-specific (``ReviewedModel.stages``) - ``upstage/solar-pro4`` was
+        checked for ``select``'s prompt shape and cost profile, not
+        ``organize``'s, and vice versa for ``x-ai/grok-4.3``. A slug pinned to
+        a field whose stage it was never reviewed for is rejected exactly like
+        an unreviewed slug, even though it is a ``REVIEWED_MODELS`` key.
         """
         if self.model_selection_mode != "safe":
             return self
-        for field_name in ("model_organize", "model_select", "model_query_plan"):
+        field_stages: dict[str, str] = {
+            "model_organize": "organize",
+            "model_select": "select",
+            "model_query_plan": "query_plan",
+        }
+        for field_name, stage in field_stages.items():
             slug = getattr(self, field_name)
-            if slug and slug not in REVIEWED_MODELS:
+            if not slug:
+                continue
+            reviewed = REVIEWED_MODELS.get(slug)
+            if reviewed is None:
                 raise ValueError(
                     f"{field_name}={slug!r} is not in the reviewed-models allowlist "
                     "required by safe mode (docs/adr/0006). Either have it reviewed "
                     "and added to tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS, "
                     "or set TC_MODEL_SELECTION_MODE=custom to select models freely."
+                )
+            if stage not in reviewed.stages:
+                raise ValueError(
+                    f"{field_name}={slug!r} was not reviewed for the {stage!r} stage "
+                    f"(reviewed for {sorted(reviewed.stages)!r} only) and cannot be used "
+                    "there under safe mode (docs/adr/0006). Either have it reviewed for "
+                    f"{stage!r} and add that stage to its ReviewedModel.stages entry, or "
+                    "set TC_MODEL_SELECTION_MODE=custom to select models freely."
                 )
         return self
 
@@ -217,6 +240,33 @@ class Settings(BaseSettings):
             return custom_flag
         reviewed = REVIEWED_MODELS.get(model_id)
         return reviewed.supports_strict_schema if reviewed is not None else False
+
+    def reasoning_effort_for(
+        self, model_id: str
+    ) -> Literal["none", "low", "medium", "high"] | None:
+        """The reviewed ``reasoning_effort`` to request for ``model_id``, or ``None``.
+
+        Same reasoning as `strict_schema_supported`: a reasoning model's safe
+        cost profile is itself a reviewed fact (docs/model-evaluation-organize-select.md
+        round 8's finding that `reasoning_effort="none"` is close to a
+        requirement, not an optional optimization, for `x-ai/grok-4.3` -
+        leaving it uncontrolled risks the entire monthly operational cap on
+        one candidate), not a mutable operator-set knob. Custom mode has no
+        registry entry to consult and always returns `None` (uncontrolled),
+        matching every other reviewed-only derivation in this class -
+        an operator in custom mode who wants a specific effort level pins it
+        themselves via a future request-level override, not through this
+        safe-mode-only mechanism.
+
+        `_safe_mode_restricts_to_reviewed_models` already guarantees a
+        non-empty slug reaching here in safe mode is a `REVIEWED_MODELS` key,
+        so the `None` branch below is unreachable in practice - same
+        defensive shape as `openrouter_only_providers`/`strict_schema_supported`.
+        """
+        if self.model_selection_mode != "safe":
+            return None
+        reviewed = REVIEWED_MODELS.get(model_id)
+        return reviewed.reasoning_effort if reviewed is not None else None
 
     @property
     def openrouter_deny_data_collection(self) -> bool:
