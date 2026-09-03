@@ -17,6 +17,7 @@ import dataclasses
 from tc_domain.capture import WorkspaceId
 from tc_domain.khoj_ports import KhojPort, KhojUnavailableError
 from tc_domain.search import (
+    MAX_LIMIT,
     ExactSearchPort,
     SearchPage,
     SearchQuery,
@@ -79,7 +80,13 @@ class Search:
             semantic_items or (),
             has_phrase_match=query.phrase is not None,
         )
-        return SearchPage(items=fused, next_cursor=None, degraded=semantic_items is None)
+        # Each channel is independently capped to query.limit, but the fused
+        # union (deduplicated by revision_id, not truncated by fuse_rrf
+        # itself) can hold up to twice that many items when the two channels
+        # barely overlap - a realistic case, not an edge case. The page's
+        # own limit must still hold after fusion.
+        limit = max(1, min(query.limit, MAX_LIMIT))
+        return SearchPage(items=fused[:limit], next_cursor=None, degraded=semantic_items is None)
 
     async def _semantic_results_or_none(
         self, workspace_id: WorkspaceId, text: str | None, limit: int

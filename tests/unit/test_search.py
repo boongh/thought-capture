@@ -187,3 +187,22 @@ async def test_hybrid_mode_with_no_free_text_is_exact_only_and_not_degraded() ->
     assert page.degraded is False
     assert [r.revision_id for r in page.items] == [exact_result.revision_id]
     assert khoj.search_queries == []
+
+
+async def test_hybrid_mode_truncates_the_fused_union_to_the_requested_limit() -> None:
+    """Each channel is independently capped to query.limit, so when the two
+    channels barely overlap (a realistic case, not an edge case) the fused
+    union can hold up to twice that many items before this truncation."""
+    exact_results = tuple(_result() for _ in range(3))
+    semantic_results = tuple(_result(channels=("semantic",)) for _ in range(3))
+    exact = FakeExactSearch(SearchPage(items=exact_results, next_cursor=None))
+    khoj_results = tuple(
+        KhojSearchResult(entry="...", score=0.5, filename=f"ws/project/{i}.md") for i in range(3)
+    )
+    khoj = FakeKhojPort(search_results=khoj_results)
+    hydrate = FakeSemanticHydrator({f"ws/project/{i}.md": semantic_results[i] for i in range(3)})
+    search = _search(exact=exact, khoj=khoj, hydrate=hydrate)
+
+    page = await search(WORKSPACE, SearchQuery(q="aurora", limit=3), mode="hybrid")
+
+    assert len(page.items) == 3
