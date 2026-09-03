@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from tc_application.search import Search, UnsupportedSearchModeError
+from tc_application.search import Search, UnsupportedCursorError, UnsupportedSearchModeError
 from tc_domain.capture import WorkspaceId
 from tc_domain.khoj_ports import KhojSearchResult, KhojUnavailableError
 from tc_domain.search import SearchPage, SearchQuery, SearchResult
@@ -80,6 +80,32 @@ async def test_an_unknown_mode_raises() -> None:
         await search(WORKSPACE, SearchQuery(), mode="quantum")
 
 
+async def test_a_cursor_is_accepted_for_exact_mode() -> None:
+    exact = FakeExactSearch()
+    search = _search(exact=exact)
+
+    await search(WORKSPACE, SearchQuery(q="hello", cursor="opaque"), mode="exact")
+
+    assert len(exact.calls) == 1
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+async def test_a_cursor_is_rejected_for_a_mode_that_cannot_honor_it(mode: str) -> None:
+    """A cursor threaded through hybrid would advance only the exact channel
+    to a later page while semantic silently restarted at page one every time
+    - rather than fuse two misaligned pages, this must be an explicit error
+    (docs/DESIGN.md 7.5 P1)."""
+    exact = FakeExactSearch()
+    khoj = FakeKhojPort()
+    search = _search(exact=exact, khoj=khoj)
+
+    with pytest.raises(UnsupportedCursorError):
+        await search(WORKSPACE, SearchQuery(q="aurora", cursor="opaque"), mode=mode)
+
+    assert exact.calls == []
+    assert khoj.search_queries == []
+
+
 # ---------------------------------------------------------------------------
 # Semantic mode
 # ---------------------------------------------------------------------------
@@ -92,14 +118,20 @@ async def test_semantic_mode_hydrates_khoj_results_and_carries_their_score() -> 
     )
     hydrate = FakeSemanticHydrator({"ws/project/x.md": hydrated})
     search = _search(khoj=khoj, hydrate=hydrate)
+    query = SearchQuery(q="aurora", kind="project")
 
-    page = await search(WORKSPACE, SearchQuery(q="aurora"), mode="semantic")
+    page = await search(WORKSPACE, query, mode="semantic")
 
     assert page.degraded is False
     assert len(page.items) == 1
     assert page.items[0].revision_id == hydrated.revision_id
     assert page.items[0].rank == pytest.approx(0.42)
     assert khoj.search_queries == ["aurora"]
+    # The full query - not just the free text sent to Khoj - must reach
+    # hydration, so its structured filters can be enforced there too
+    # (docs/DESIGN.md 7.5 P1: a semantic hit's score never implies it
+    # satisfies a filter Khoj cannot itself evaluate).
+    assert hydrate.calls == [(WORKSPACE, query, ("ws/project/x.md",))]
 
 
 async def test_semantic_mode_drops_a_result_that_does_not_hydrate() -> None:

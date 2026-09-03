@@ -7,7 +7,11 @@ requires that a degraded or missing channel is always explicit, never an
 implied "no memory exists". ``cursor``/keyset pagination applies to
 ``mode=exact`` only - Khoj's own search API has no equivalent, so
 ``semantic``/``hybrid`` always return a single page (``next_cursor`` is
-always ``null`` for those two modes).
+always ``null`` for those two modes); a ``cursor`` supplied together with
+``semantic``/``hybrid`` is rejected with a 400 problem document rather than
+silently ignored, since ``tc_application.search.Search`` would otherwise
+advance only the exact channel to a later page while semantic silently
+restarted at page one.
 """
 
 from __future__ import annotations
@@ -19,9 +23,9 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 
 from tc_api.dependencies import Authenticated, Context
-from tc_api.problems import not_implemented
+from tc_api.problems import bad_request, not_implemented
 from tc_api.schemas import SearchResponse
-from tc_application.search import UnsupportedSearchModeError
+from tc_application.search import UnsupportedCursorError, UnsupportedSearchModeError
 from tc_domain.search import DEFAULT_LIMIT, MAX_LIMIT, SearchQuery
 
 router = APIRouter(prefix="/v1/search", tags=["search"], dependencies=[Authenticated])
@@ -66,4 +70,6 @@ async def search(
         page = await context.search(context.workspace_id, query, mode=mode)
     except UnsupportedSearchModeError as exc:
         raise not_implemented("unsupported-search-mode", str(exc)) from exc
+    except UnsupportedCursorError as exc:
+        raise bad_request("cursor-unsupported-for-mode", str(exc)) from exc
     return SearchResponse.of(page)
