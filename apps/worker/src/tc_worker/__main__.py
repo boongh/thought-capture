@@ -17,6 +17,9 @@ import logging
 import sys
 import uuid
 
+import httpx
+
+from tc_application.khoj_sync import DeliverKhojSync
 from tc_application.organize import JournalFactory, OrganizeWindow
 from tc_application.structured import JournalWriter
 from tc_domain.capture import WorkspaceId
@@ -24,16 +27,21 @@ from tc_domain.context import ContextAssemblyConfig
 from tc_domain.llm import LLMRequest, LLMResponse
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.context_index import PostgresContextIndex
+from tc_infrastructure.db.document_reader import PostgresDocumentReader
 from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.entity_repository import PostgresEntityRepository
 from tc_infrastructure.db.identity import resolve_identity
+from tc_infrastructure.db.khoj_index_recorder import PostgresKhojIndexRecorder
+from tc_infrastructure.db.khoj_sync_outbox import PostgresKhojSyncOutbox
 from tc_infrastructure.db.llm_journal import PostgresLLMJournal
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.windows import PostgresCaptureWindows
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.llm.factory import build_organize_provider, build_select_provider
 from tc_infrastructure.runtime import run
+from tc_worker.khoj_sync_loop import KhojSyncLoop
 from tc_worker.scheduler import OrganizeScheduler
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,7 @@ def _journal_factory(journal: PostgresLLMJournal) -> JournalFactory:
 
 async def serve(settings: Settings) -> None:
     engine = create_engine(settings)
+    http = httpx.AsyncClient()
     try:
         sessions = create_session_factory(engine)
 
@@ -98,16 +107,32 @@ async def serve(settings: Settings) -> None:
             timezone=settings.workspace_timezone,
         )
 
+        # docs/DESIGN.md 5.1: the worker owns Khoj sync. An unreachable Khoj
+        # (core-only deployment) just means every poll cycle's events retry
+        # with backoff (docs/DESIGN.md 14.1) - canonical documents are
+        # already committed by the time any event exists.
+        khoj_sync_loop = KhojSyncLoop(
+            DeliverKhojSync(
+                outbox=PostgresKhojSyncOutbox(sessions, lease_owner="worker"),
+                source=PostgresDocumentReader(sessions),
+                khoj=HttpKhojClient(http, settings.khoj_base_url),
+                recorder=PostgresKhojIndexRecorder(sessions),
+            )
+        )
+
         await scheduler.catch_up()
         scheduler.start()
         scheduler.schedule_next()
+        khoj_sync_loop.start()
 
         logger.info("worker.ready", extra={"workspace_id": str(identity.workspace_id)})
         try:
             await asyncio.Event().wait()
         finally:
+            khoj_sync_loop.stop()
             scheduler.shutdown()
     finally:
+        await http.aclose()
         await engine.dispose()
 
 

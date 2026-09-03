@@ -373,7 +373,7 @@ async def test_a_daily_digest_document_enqueues_the_digest_outbox_event(
     assert event.payload["document_id"] == str(result.digest_document_id)
 
 
-async def test_a_non_digest_only_write_enqueues_no_outbox_event(
+async def test_a_non_digest_only_write_enqueues_no_digest_outbox_event(
     app_session_factory: async_sessionmaker[AsyncSession],
     workspace: WorkspaceId,
     user_id: uuid.UUID,
@@ -408,10 +408,138 @@ async def test_a_non_digest_only_write_enqueues_no_outbox_event(
     async with app_session_factory() as session:
         events = (
             await session.execute(
-                sa.select(outbox_events).where(outbox_events.c.aggregate_id == str(run_id))
+                sa.select(outbox_events).where(
+                    outbox_events.c.aggregate_id == str(run_id),
+                    outbox_events.c.event_type == "digest.ready",
+                )
             )
         ).all()
     assert events == []
+
+
+async def test_writing_a_document_enqueues_a_khoj_sync_event_for_it(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """docs/DESIGN.md 7.2 step 11: every document written this run gets an
+    index-sync event, not just a daily digest."""
+    run_id = await _run_id(app_session_factory, workspace)
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=f"project:khoj-sync-{unique}",
+                kind="project",
+                title="Khoj sync",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+
+    writer = PostgresOrganizeWriter(app_session_factory)
+    result = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=request, outcome=_outcome()
+    )
+
+    document_id = result.document_ids[f"project:khoj-sync-{unique}"]
+    async with app_session_factory() as session:
+        event = (
+            await session.execute(
+                sa.select(outbox_events).where(
+                    outbox_events.c.event_type == "khoj.sync_requested",
+                    outbox_events.c.aggregate_id == str(document_id),
+                )
+            )
+        ).one()
+    assert event.payload == {"document_id": str(document_id)}
+
+
+async def test_an_untouched_document_gets_no_khoj_sync_event_on_a_later_write(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    workspace: WorkspaceId,
+    user_id: uuid.UUID,
+    unique: str,
+) -> None:
+    """docs/DESIGN.md invariant 5: only touched documents are regenerated -
+    an untouched one must not be re-synced either."""
+    run_id = await _run_id(app_session_factory, workspace)
+    thought_id = await _thought_id(
+        app_session_factory, workspace, user_id, source_message_id=unique
+    )
+    touched_key = f"project:touched-{unique}"
+    untouched_key = f"project:untouched-{unique}"
+    writer = PostgresOrganizeWriter(app_session_factory)
+
+    first_request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=touched_key,
+                kind="project",
+                title="Touched",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+            DocumentWrite(
+                stable_key=untouched_key,
+                kind="project",
+                title="Untouched",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="created",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+    first = await writer.write(
+        workspace_id=workspace, run_id=run_id, request=first_request, outcome=_outcome()
+    )
+    untouched_document_id = first.document_ids[untouched_key]
+
+    second_run = await _run_id(app_session_factory, workspace)
+    second_request = OrganizeWriteRequest(
+        documents=(
+            DocumentWrite(
+                stable_key=touched_key,
+                kind="project",
+                title="Touched",
+                body_markdown=BODY,
+                source_thought_ids=(thought_id,),
+                mentioned_entities=(),
+                change_summary="updated again",
+            ),
+        ),
+        context_selections=(),
+        unorganized_thought_ids=(),
+    )
+    await writer.write(
+        workspace_id=workspace, run_id=second_run, request=second_request, outcome=_outcome()
+    )
+
+    async with app_session_factory() as session:
+        events = (
+            await session.execute(
+                sa.select(outbox_events).where(
+                    outbox_events.c.event_type == "khoj.sync_requested",
+                    outbox_events.c.aggregate_id == str(untouched_document_id),
+                )
+            )
+        ).all()
+    # Exactly one event: from the first write, none from the second (the
+    # untouched document was not part of that request).
+    assert len(events) == 1
 
 
 async def test_write_marks_the_run_succeeded_in_the_same_transaction(
