@@ -3,9 +3,13 @@ search -> hydrated back to a ``SearchResult`` (docs/DESIGN.md 7.5, 9.2).
 
 Same rationale and placement as ``test_khoj_index_sync_contract.py``: lives
 under ``tests/integration`` (needs the disposable-database fixtures) but
-carries ``pytest.mark.contract`` too, so a full run's ``TC_REQUIRE_CONTRACT=1``
-gate still treats a skip here as a failure. Requires both a live PostgreSQL
-(``--profile core``) and a live pinned Khoj (``--profile ai``).
+carries only ``pytest.mark.contract``, not ``pytest.mark.integration`` - CI's
+"Integration tests" step runs ``pytest -m integration`` *before* Khoj is
+started at all, so this must opt out of that step and run only in "Contract
+tests", the later step that starts Khoj first. A full run's
+``TC_REQUIRE_CONTRACT=1`` gate still treats a skip here as a failure.
+Requires both a live PostgreSQL (``--profile core``) and a live pinned Khoj
+(``--profile ai``).
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from tests.integration.test_search_reader import (
     workspace,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.contract]
+pytestmark = pytest.mark.contract
 
 __all__ = ["unique", "user_id", "workspace"]  # re-exported fixtures
 
