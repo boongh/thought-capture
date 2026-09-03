@@ -9,11 +9,15 @@ case (slice 18)" depends on.
 Lives under ``tests/integration`` (not ``tests/contract/khoj``) because it
 needs the disposable-database fixtures from ``tests/integration/conftest.py``,
 which are not shared across that directory boundary; it still carries
-``pytest.mark.contract`` so a full run's ``TC_REQUIRE_CONTRACT=1`` gate (a
-session-wide hook, loaded once ``tests/contract/khoj/conftest.py`` is
-collected at all) treats a skip here as a failure too, same as any other
-contract test. Requires both a live PostgreSQL (``--profile core``) and a live
-pinned Khoj (``--profile ai``, `docs/adr/0003`).
+``pytest.mark.contract`` (not ``pytest.mark.integration`` - CI's "Integration
+tests" step runs ``pytest -m integration`` *before* Khoj is started at all,
+so a test needing both must opt out of that step and run only in "Contract
+tests", the later step that actually starts Khoj first) so a full run's
+``TC_REQUIRE_CONTRACT=1`` gate (a session-wide hook, loaded once
+``tests/contract/khoj/conftest.py`` is collected at all) treats a skip here
+as a failure too, same as any other contract test. Requires both a live
+PostgreSQL (``--profile core``) and a live pinned Khoj (``--profile ai``,
+`docs/adr/0003`).
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.tables import khoj_index_items, thoughts
 from tc_infrastructure.khoj.client import HttpKhojClient
 
-pytestmark = [pytest.mark.integration, pytest.mark.contract]
+pytestmark = pytest.mark.contract
 
 KHOJ_BASE_URL = os.environ.get("TC_KHOJ_BASE_URL", "http://127.0.0.1:42110")
 BODY = (
