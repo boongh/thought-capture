@@ -398,14 +398,18 @@ class FakeKhojForceSync:
 class FakeSemanticHydrator:
     """Resolves a fixed filename -> ``SearchResult`` mapping rather than
     querying PostgreSQL - a filename absent from the mapping is simply
-    dropped, matching ``SemanticHydrator``'s contract."""
+    dropped, matching ``SemanticHydrator``'s contract. Real filter/staleness
+    enforcement is PostgreSQL's job (``PostgresSemanticHydrator``, proven by
+    integration tests); this fake exists to drive the ``Search`` use case's
+    orchestration, not to re-prove the query - it still records the ``query``
+    it was given so a test can assert it was passed through."""
 
     def __init__(self, by_filename: dict[str, SearchResult] | None = None) -> None:
         self.by_filename = by_filename or {}
-        self.calls: list[tuple[WorkspaceId, tuple[str, ...]]] = []
+        self.calls: list[tuple[WorkspaceId, SearchQuery, tuple[str, ...]]] = []
 
     async def hydrate(
-        self, workspace_id: WorkspaceId, filenames: tuple[str, ...]
+        self, workspace_id: WorkspaceId, query: SearchQuery, filenames: tuple[str, ...]
     ) -> dict[str, SearchResult]:
-        self.calls.append((workspace_id, filenames))
+        self.calls.append((workspace_id, query, filenames))
         return {name: self.by_filename[name] for name in filenames if name in self.by_filename}

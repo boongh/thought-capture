@@ -1,10 +1,13 @@
 """Resolves Khoj search-result filenames back to normalized ``SearchResult``s
 (docs/DESIGN.md 7.5, 9.2).
 
-Reuses ``search_reader.py``'s own thought/entity join helpers rather than
-duplicating the query shape - both read the same current-revision-only join
-(docs/DESIGN.md 8.3: only the current revision is ever indexed, in Khoj or in
-this hydrator's own PostgreSQL read).
+Reuses ``search_reader.py``'s own thought/entity join helpers and structural
+filter predicates rather than duplicating the query shape - both read the
+same current-revision-only join (docs/DESIGN.md 8.3: only the current
+revision is ever indexed, in Khoj or in this hydrator's own PostgreSQL read),
+and both must enforce the same kind/source/date/time/entity/phrase/exclusion
+filters (docs/DESIGN.md 7.5 P1) so a semantic hit can never bypass a filter
+its own channel has no way to evaluate.
 """
 
 from __future__ import annotations
@@ -16,9 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
 from tc_domain.khoj_export import parse_khoj_filename
-from tc_domain.search import SearchResult
-from tc_infrastructure.db.search_reader import _entity_names_for, _thought_ids_for
-from tc_infrastructure.db.tables import document_revisions, documents
+from tc_domain.search import SearchQuery, SearchResult
+from tc_infrastructure.db.search_reader import (
+    _entity_names_for,
+    _filter_conditions,
+    _thought_ids_for,
+)
+from tc_infrastructure.db.tables import document_revisions, documents, khoj_index_items
 
 _SNIPPET_RADIUS = 160
 
@@ -28,7 +35,7 @@ class PostgresSemanticHydrator:
         self._session_factory = session_factory
 
     async def hydrate(
-        self, workspace_id: WorkspaceId, filenames: tuple[str, ...]
+        self, workspace_id: WorkspaceId, query: SearchQuery, filenames: tuple[str, ...]
     ) -> dict[str, SearchResult]:
         document_id_by_filename: dict[str, uuid.UUID] = {}
         for filename in filenames:
@@ -45,6 +52,22 @@ class PostgresSemanticHydrator:
             return {}
 
         document_ids = list(set(document_id_by_filename.values()))
+        conditions: list[sa.ColumnElement[bool]] = [
+            documents.c.workspace_id == workspace_id,
+            documents.c.id.in_(document_ids),
+            # Khoj's own last-acknowledged sync must still name the current
+            # revision - otherwise Khoj is still holding a superseded body
+            # under this filename, and joining straight to
+            # `documents.current_revision_id` (as below, for the columns this
+            # query actually returns) would silently relabel that stale
+            # content as if it were the current revision, carrying its own
+            # semantic score (docs/DESIGN.md 7.5 P1). A document that has
+            # never finished a sync at all has no `khoj_index_items` row and
+            # is excluded by this inner join the same way.
+            khoj_index_items.c.revision_id == documents.c.current_revision_id,
+        ]
+        conditions.extend(_filter_conditions(query, workspace_id, require_text_match=False))
+
         statement = (
             sa.select(
                 documents.c.id.label("document_id"),
@@ -57,9 +80,9 @@ class PostgresSemanticHydrator:
             .select_from(
                 documents.join(
                     document_revisions, document_revisions.c.id == documents.c.current_revision_id
-                )
+                ).join(khoj_index_items, khoj_index_items.c.document_id == documents.c.id)
             )
-            .where(documents.c.workspace_id == workspace_id, documents.c.id.in_(document_ids))
+            .where(*conditions)
         )
         async with self._session_factory() as session:
             rows = (await session.execute(statement)).all()
