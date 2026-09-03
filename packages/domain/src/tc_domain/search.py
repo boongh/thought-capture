@@ -101,8 +101,11 @@ class SemanticHydrator(Protocol):
         Keyed by filename (not ``document_id``) so the caller can re-attach
         each result's own Khoj score without a second lookup. ``query`` is the
         original request's structured filters (kind, source, date/time,
-        entity, phrase, exclusion) - a semantic hit's relevance score never
-        implies it satisfies any of them, so every one of them must be
+        entity, phrase, required word ``include``, forbidden word
+        ``exclude``) - a semantic hit's relevance score never implies it
+        satisfies any of them, so every one of them (``q`` alone excepted -
+        a semantic hit need not literally contain it, that is what makes
+        this search semantic rather than exact) must be
         re-checked here in trusted PostgreSQL, the same way ``ExactSearchPort``
         enforces them for its own channel (docs/DESIGN.md 7.5: filters are
         honored or rejected explicitly, never silently bypassed by a channel

@@ -5,9 +5,11 @@ Reuses ``search_reader.py``'s own thought/entity join helpers and structural
 filter predicates rather than duplicating the query shape - both read the
 same current-revision-only join (docs/DESIGN.md 8.3: only the current
 revision is ever indexed, in Khoj or in this hydrator's own PostgreSQL read),
-and both must enforce the same kind/source/date/time/entity/phrase/exclusion
-filters (docs/DESIGN.md 7.5 P1) so a semantic hit can never bypass a filter
-its own channel has no way to evaluate.
+and both must enforce the same kind/source/date/time/entity/phrase/include/
+exclude filters (docs/DESIGN.md 7.5 P1) so a semantic hit can never bypass a
+filter its own channel has no way to evaluate. Only ``q`` is exempted from a
+literal-match requirement here - that is what makes this search semantic
+rather than exact.
 """
 
 from __future__ import annotations
