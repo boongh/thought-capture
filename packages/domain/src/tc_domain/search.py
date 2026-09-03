@@ -89,3 +89,37 @@ class ExactSearchPort(Protocol):
         non-degraded answer.
         """
         ...
+
+
+@runtime_checkable
+class SemanticHydrator(Protocol):
+    async def hydrate(
+        self, workspace_id: WorkspaceId, filenames: tuple[str, ...]
+    ) -> dict[str, SearchResult]:
+        """Resolve Khoj search-result filenames back to normalized ``SearchResult``s.
+
+        Keyed by filename (not ``document_id``) so the caller can re-attach
+        each result's own Khoj score without a second lookup. A filename that
+        does not parse, belongs to a different workspace, or no longer
+        resolves to a current revision is simply absent from the returned
+        dict - never raised - matching ``ExactSearchPort``'s "no results is a
+        valid answer" contract.
+        """
+        ...
+
+
+def text_query_string(query: SearchQuery) -> str | None:
+    """One combined query string from ``q``, ``include``, and ``exclude``.
+
+    Shared by the exact-search full-text query (``websearch_to_tsquery``
+    understands the same ``-word`` exclusion syntax) and the semantic-search
+    text sent to Khoj, so both channels search for the same thing. ``None``
+    when the query carries no free text at all (a pure filter/phrase-only
+    query) - a caller must not send an empty string to either channel.
+    """
+    parts: list[str] = []
+    if query.q:
+        parts.append(query.q)
+    parts.extend(query.include)
+    parts.extend(f"-{word}" for word in query.exclude)
+    return " ".join(parts) if parts else None

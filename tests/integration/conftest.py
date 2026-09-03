@@ -40,8 +40,10 @@ from tc_infrastructure.db.khoj_force_sync import PostgresKhojForceSync
 from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.search_reader import PostgresExactSearch
+from tc_infrastructure.db.semantic_hydrator import PostgresSemanticHydrator
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tests.integration.support import CONNECT_ARGS
 from tests.unit.fakes import FakeAttachmentArchive
 
@@ -284,43 +286,56 @@ async def _api_client(
     ``ApiContext`` needs updating in every copy.
 
     The lifespan is replaced so the test does not depend on a seeded Discord
-    identity or a live HTTP client; everything else is the production code path.
+    identity or a live HTTP client for capture/attachments (a
+    ``FakeAttachmentArchive`` stands in there); the Khoj client, however, is
+    real (unlike attachments, there is no fake standing in for it) - by
+    default it points at an unreachable loopback address in a test
+    environment with no ``--profile ai`` up, which is exactly the production
+    "Khoj unavailable" path (docs/DESIGN.md 14.1), exercised for real rather
+    than mocked whenever a test calls ``mode=semantic``/``hybrid``. A test
+    that needs live semantic results instead uses the contract-marked suite
+    against a real pinned Khoj.
     """
     workspace_id, user_id = identity
     settings = Settings(
         _env_file=None, api_bearer_token=API_TOKEN, workspace_timezone="Asia/Bangkok"
     )
 
-    context = ApiContext(
-        settings=settings,
-        capture=CaptureThought(
-            PostgresThoughtRepository(app_session_factory),
-            FakeAttachmentArchive(),
-            AttachmentPolicy(max_bytes=1024),
-        ),
-        reader=PostgresThoughtReader(app_session_factory),
-        documents=PostgresDocumentReader(app_session_factory),
-        entities=PostgresEntityReader(app_session_factory),
-        search=Search(PostgresExactSearch(app_session_factory)),
-        llm_calls=PostgresLlmCallReader(app_session_factory),
-        outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
-        force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(app_session_factory)),
-        session_factory=app_session_factory,
-        workspace_id=WorkspaceId(workspace_id),
-        user_id=UserId(user_id),
-    )
+    async with httpx.AsyncClient() as khoj_http:
+        context = ApiContext(
+            settings=settings,
+            capture=CaptureThought(
+                PostgresThoughtRepository(app_session_factory),
+                FakeAttachmentArchive(),
+                AttachmentPolicy(max_bytes=1024),
+            ),
+            reader=PostgresThoughtReader(app_session_factory),
+            documents=PostgresDocumentReader(app_session_factory),
+            entities=PostgresEntityReader(app_session_factory),
+            search=Search(
+                PostgresExactSearch(app_session_factory),
+                HttpKhojClient(khoj_http, settings.khoj_base_url),
+                PostgresSemanticHydrator(app_session_factory),
+            ),
+            llm_calls=PostgresLlmCallReader(app_session_factory),
+            outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
+            force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(app_session_factory)),
+            session_factory=app_session_factory,
+            workspace_id=WorkspaceId(workspace_id),
+            user_id=UserId(user_id),
+        )
 
-    @asynccontextmanager
-    async def no_startup(_: object) -> AsyncIterator[None]:
-        """Skip the production lifespan; the context is injected above."""
-        yield
+        @asynccontextmanager
+        async def no_startup(_: object) -> AsyncIterator[None]:
+            """Skip the production lifespan; the context is injected above."""
+            yield
 
-    app = create_app(lifespan_handler=no_startup)
-    app.state.context = context
+        app = create_app(lifespan_handler=no_startup)
+        app.state.context = context
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
 
 
 @pytest.fixture

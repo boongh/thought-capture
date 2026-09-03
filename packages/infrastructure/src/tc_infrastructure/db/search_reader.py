@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import ThoughtId, WorkspaceId
-from tc_domain.search import MAX_LIMIT, SearchPage, SearchQuery, SearchResult
+from tc_domain.search import MAX_LIMIT, SearchPage, SearchQuery, SearchResult, text_query_string
 from tc_infrastructure.db.tables import (
     document_revisions,
     documents,
@@ -107,18 +107,6 @@ class PostgresExactSearch:
         return SearchPage(items=items, next_cursor=next_cursor, degraded=False)
 
 
-def _text_query_string(query: SearchQuery) -> str | None:
-    """One ``websearch_to_tsquery`` string combining ``q``, ``include``, and
-    ``exclude`` - Postgres's own ``-word`` exclusion syntax means ``exclude``
-    needs no separate NOT-clause construction."""
-    parts: list[str] = []
-    if query.q:
-        parts.append(query.q)
-    parts.extend(query.include)
-    parts.extend(f"-{word}" for word in query.exclude)
-    return " ".join(parts) if parts else None
-
-
 _RANK_PRECISION = sa.Numeric(10, 6)
 
 
@@ -132,7 +120,7 @@ def _rank_expression(query: SearchQuery) -> sa.ColumnElement[Any]:
     numeric compares exactly on both sides, which keyset pagination's tie
     handling (rank equal, break by id) depends on.
     """
-    text = _text_query_string(query)
+    text = text_query_string(query)
     if text is None:
         return sa.cast(sa.literal(0.0), _RANK_PRECISION)
     tsquery = sa.func.websearch_to_tsquery("english", text)
@@ -144,7 +132,7 @@ def _filter_conditions(
 ) -> list[sa.ColumnElement[bool]]:
     conditions: list[sa.ColumnElement[bool]] = []
 
-    text = _text_query_string(query)
+    text = text_query_string(query)
     if text is not None:
         conditions.append(
             document_revisions.c.body_tsv.op("@@")(sa.func.websearch_to_tsquery("english", text))
