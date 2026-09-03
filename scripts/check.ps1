@@ -174,6 +174,68 @@ try {
             if ($aiError -notmatch "TC_KHOJ_") {
                 throw "FAIL: compose config sanity ('ai' failed, but not for a missing TC_KHOJ_* variable: $aiError)"
             }
+
+            # LLM configuration forwarding (independent Codex review): the
+            # bot/worker environment must actually forward
+            # TC_OPENROUTER_API_KEY and the model pins into the rendered
+            # container environment, not just accept them at the top-level
+            # interpolation stage - a variable can validate here and still
+            # fail to reach a service if it were only referenced in, say,
+            # `x-service-image` rather than `llm-env`. Just as important:
+            # api/migrate must NOT receive them - `llm-env` is a separate
+            # anchor from `service-env` specifically so a secret
+            # (TC_OPENROUTER_API_KEY) and the model pins reach only the two
+            # services with a code path that reads them (discord-bot's
+            # select, worker's organize), not every container in the shared
+            # network.
+            $llmEnv = Join-Path ([System.IO.Path]::GetTempPath()) "tc-compose-sanity-llm.env"
+            "POSTGRES_PASSWORD=sanity-check-only`nTC_APP_DB_PASSWORD=sanity-check-only`nTC_OPENROUTER_API_KEY=sanity-check-api-key`nTC_MODEL_ORGANIZE=sanity-check-organize-model`nTC_MODEL_SELECT=sanity-check-select-model`n" |
+                Set-Content -LiteralPath $llmEnv -Encoding utf8 -NoNewline
+            try {
+                $llmConfig = & docker compose --env-file $llmEnv -f deploy/compose/docker-compose.yml --profile core config 2>$null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "FAIL: compose config sanity (rendering 'core' config with LLM variables set failed)"
+                }
+                $llmConfigText = $llmConfig -join "`n"
+                $lines = $llmConfigText -split "`n"
+
+                function Get-ServiceBlock([string[]] $Lines, [string] $Service) {
+                    $startIndex = [array]::IndexOf($Lines, "  ${Service}:")
+                    if ($startIndex -lt 0) {
+                        throw "FAIL: compose config sanity (service '$Service' not found in rendered config)"
+                    }
+                    $endIndex = $Lines.Length - 1
+                    for ($i = $startIndex + 1; $i -lt $Lines.Length; $i++) {
+                        if ($Lines[$i] -match "^  [a-zA-Z]") { $endIndex = $i - 1; break }
+                    }
+                    return ($Lines[$startIndex..$endIndex]) -join "`n"
+                }
+
+                foreach ($service in @("discord-bot", "worker")) {
+                    $serviceBlock = Get-ServiceBlock $lines $service
+                    if ($serviceBlock -notmatch "TC_OPENROUTER_API_KEY: sanity-check-api-key") {
+                        throw "FAIL: compose config sanity ($service did not receive TC_OPENROUTER_API_KEY)"
+                    }
+                    if ($serviceBlock -notmatch "TC_MODEL_ORGANIZE: sanity-check-organize-model") {
+                        throw "FAIL: compose config sanity ($service did not receive TC_MODEL_ORGANIZE)"
+                    }
+                    if ($serviceBlock -notmatch "TC_MODEL_SELECT: sanity-check-select-model") {
+                        throw "FAIL: compose config sanity ($service did not receive TC_MODEL_SELECT)"
+                    }
+                }
+                foreach ($service in @("api", "migrate")) {
+                    $serviceBlock = Get-ServiceBlock $lines $service
+                    if ($serviceBlock -match "TC_OPENROUTER_API_KEY") {
+                        throw "FAIL: compose config sanity ($service must not receive TC_OPENROUTER_API_KEY, but does)"
+                    }
+                    if ($serviceBlock -match "TC_MODEL_(ORGANIZE|SELECT|QUERY_PLAN)") {
+                        throw "FAIL: compose config sanity ($service must not receive model pins, but does)"
+                    }
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $llmEnv -ErrorAction SilentlyContinue
+            }
         }
         finally {
             $ErrorActionPreference = $previousEap

@@ -27,8 +27,10 @@
   `tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS`, and
   `Settings.model_select` (new field) plus a dedicated `build_select_provider`
   factory give `select` its own provider, independent of `organize`'s
-  (`docs/adr/0006`, amended 2026-09-02). **Organize remains undecided and
-  unwired.** Round 4 recommended `meta-llama/llama-4-maverick`; round 5's
+  (`docs/adr/0006`, amended 2026-09-02). **Organize is now decided, confirmed,
+  and wired too** (see the end of this Status bullet for the round-8-13
+  evidence trail and 2026-09-03 wiring) - the rounds below record how that
+  conclusion was reached. Round 4 recommended `meta-llama/llama-4-maverick`; round 5's
   higher-N rerun of the fabrication-B probe surfaced a reproducible (3/3)
   structural defect (empty document bodies missing three of four required
   sections). **The owner decided (2026-09-02, round 6) not to pursue
@@ -83,6 +85,19 @@
   run. See Round 10 for the full reasoning and what's still open (no new
   paid screening happened this round - this was a methodology/tooling
   update, not new evidence).
+  **Rounds 11-13 confirmed `x-ai/grok-4.3` at N=5 and re-searched the broader
+  reasoning-model landscape (26 additional candidates) for anything cheaper
+  that also clears the fabrication bar; none did.** The owner ended the
+  search there ("Honestly yea let's stop here at Grok 4.3" - see Round 13)
+  and approved wiring it in on 2026-09-03: `x-ai/grok-4.3` is now in
+  `tc_infrastructure.llm.reviewed_models.REVIEWED_MODELS` for `organize`
+  (`reasoning_effort="none"`, `docs/adr/0006` amended 2026-09-03), and
+  `build_organize_provider` uses it - an operator who sets
+  `TC_MODEL_ORGANIZE=x-ai/grok-4.3` now gets a live, reviewed organize
+  provider in safe mode instead of the deterministic offline adapter, the
+  same as `select` above once `TC_MODEL_SELECT=upstage/solar-pro4` is set;
+  `TC_MODEL_ORGANIZE` itself still defaults to blank (offline) until an
+  operator opts in.
 - **Scope:** Candidates for the `organize` step (`docs/DESIGN.md` 7.4,
   `OrganizationResult`) and the `select` step (`docs/DESIGN.md` 7.3.2,
   `SelectedContext`), narrowed from OpenRouter's live zero-data-retention
@@ -1632,9 +1647,11 @@ production cap in a single afternoon of evaluation.
   project's `list_zdr_models.py` output, or an account/API-key scoping
   issue - undetermined, and worth a narrow follow-up before concluding
   major-lab organize candidates are unavailable rather than untested.
-- **`grok-4.3` adoption itself is still not wired into
-  `REVIEWED_MODELS`/`config.py`** - screening evidence only, per
-  `docs/adr/0006`; that step remains a separate owner-approved change.
+- ~~**`grok-4.3` adoption itself is still not wired into
+  `REVIEWED_MODELS`/`config.py`**~~ - resolved 2026-09-03: the owner approved
+  wiring it in (see the Status bullet above), and it is now `organize`'s
+  entry in `REVIEWED_MODELS`, gated by `Settings`/`docs/adr/0006` the same
+  way `upstage/solar-pro4` gates `select`.
 - **The search is closed by owner decision, not by exhausting the
   candidate space** - untested reasoning-hinted candidates still remain in
   the >$1/M-token band (`z-ai/glm-5.1`/`5.3`, `x-ai/grok-4.20`,

@@ -26,6 +26,15 @@ def test_every_entry_records_at_least_one_reviewed_provider() -> None:
         assert entry.providers, f"{entry.model_id} has no reviewed provider recorded"
 
 
+def test_every_entry_records_at_least_one_reviewed_stage() -> None:
+    """A model's review is stage-specific (docs/DESIGN.md 7.3.2, 7.4) - an
+    entry with no recorded stage would be usable nowhere, which almost
+    certainly means the stage was simply forgotten when the entry was added.
+    """
+    for entry in REVIEWED_MODELS.values():
+        assert entry.stages, f"{entry.model_id} has no reviewed stage recorded"
+
+
 def test_ruled_out_organize_candidates_are_not_reviewed() -> None:
     """Round 4/5/12's organize candidates that did not survive evaluation.
 
@@ -49,6 +58,7 @@ def test_select_has_exactly_one_reviewed_candidate() -> None:
     entry = REVIEWED_MODELS["upstage/solar-pro4"]
     assert entry.supports_strict_schema is True
     assert entry.providers == frozenset({"upstage/zdr"})
+    assert entry.stages == frozenset({"select"})
     assert entry.reasoning_effort is None
 
 
@@ -65,6 +75,7 @@ def test_organize_has_exactly_one_reviewed_candidate() -> None:
     entry = REVIEWED_MODELS["x-ai/grok-4.3"]
     assert entry.supports_strict_schema is True
     assert entry.providers == frozenset({"xai/zdr"})
+    assert entry.stages == frozenset({"organize"})
     assert entry.reasoning_effort == "none"
 
 
@@ -79,10 +90,12 @@ def test_a_reviewed_model_records_all_required_fields() -> None:
         model_id="test/synthetic-model",
         supports_strict_schema=True,
         providers=frozenset({"test-provider"}),
+        stages=frozenset({"organize"}),
         note="synthetic entry for shape testing only",
     )
     assert entry.model_id == "test/synthetic-model"
     assert entry.providers == frozenset({"test-provider"})
+    assert entry.stages == frozenset({"organize"})
 
 
 def test_the_rejected_free_tier_candidate_is_not_reviewed() -> None:

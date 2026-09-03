@@ -88,12 +88,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+# The pipeline stage(s) a reviewed slug for TC_MODEL_ORGANIZE/TC_MODEL_SELECT/
+# TC_MODEL_QUERY_PLAN may be pinned to (docs/DESIGN.md 7.3.2, 7.4). A model's
+# review is stage-specific: the safety/injection probes, prompt shape, and
+# cost profile that earned it a place here were run against one step's actual
+# task, not the others - see e.g. upstage/solar-pro4 (select-only) and
+# x-ai/grok-4.3 (organize-only) below. `Settings._safe_mode_restricts_to_reviewed_models`
+# rejects a slug pinned to a field whose stage is not in this set, even if the
+# slug is REVIEWED_MODELS-adjacent for a different stage.
+Stage = Literal["organize", "select", "query_plan"]
+
 
 @dataclass(frozen=True, slots=True)
 class ReviewedModel:
     model_id: str
     supports_strict_schema: bool
     providers: frozenset[str]
+    stages: frozenset[Stage]
     note: str
     # Unset for a non-reasoning reviewed model (e.g. upstage/solar-pro4).
     # Recorded here, not left to an operator-set flag, for the same reason
@@ -108,6 +119,7 @@ _ENTRIES: tuple[ReviewedModel, ...] = (
         model_id="upstage/solar-pro4",
         supports_strict_schema=True,
         providers=frozenset({"upstage/zdr"}),
+        stages=frozenset({"select"}),
         note=(
             "Reviewed for select only (docs/DESIGN.md 7.3.2), not organize. "
             "Zero confirmed safety failures across 5 evaluation rounds "
@@ -123,6 +135,7 @@ _ENTRIES: tuple[ReviewedModel, ...] = (
         model_id="x-ai/grok-4.3",
         supports_strict_schema=True,
         providers=frozenset({"xai/zdr"}),
+        stages=frozenset({"organize"}),
         reasoning_effort="none",
         note=(
             "Reviewed for organize only (docs/DESIGN.md 7.4), not select. "
