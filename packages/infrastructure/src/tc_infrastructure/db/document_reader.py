@@ -21,7 +21,16 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
-from tc_infrastructure.db.tables import document_revisions, documents, revision_sources
+from tc_domain.errors import KhojExportNotFound
+from tc_domain.khoj_export import DocumentExport
+from tc_infrastructure.db.tables import (
+    document_revisions,
+    documents,
+    entities,
+    entity_mentions,
+    revision_sources,
+    runs,
+)
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 200
@@ -132,6 +141,76 @@ class PostgresDocumentReader:
             body_markdown=row.body_markdown,
             change_summary=row.change_summary,
             updated_at=row.created_at,
+            source_thought_ids=tuple(r.thought_id for r in source_rows),
+        )
+
+    async def get_export(
+        self, *, workspace_id: uuid.UUID, document_id: uuid.UUID
+    ) -> DocumentExport:
+        """The current revision's full Khoj-export payload (docs/DESIGN.md 8.3).
+
+        Raises ``KhojExportNotFound`` rather than returning ``None`` -
+        ``KhojExportSource``'s contract (documents are append-only and never
+        deleted, so an unresolvable id here means a malformed or miswired
+        event, not a legitimate "not found").
+        """
+        statement = (
+            sa.select(
+                documents.c.id,
+                documents.c.kind,
+                documents.c.stable_key,
+                documents.c.title,
+                document_revisions.c.id.label("revision_id"),
+                document_revisions.c.body_markdown,
+                runs.c.window_start,
+                runs.c.window_end,
+            )
+            .select_from(
+                documents.join(
+                    document_revisions, document_revisions.c.id == documents.c.current_revision_id
+                ).join(runs, runs.c.id == document_revisions.c.run_id)
+            )
+            .where(documents.c.id == document_id, documents.c.workspace_id == workspace_id)
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(statement)).first()
+            if row is None:
+                raise KhojExportNotFound(f"no document {document_id} in workspace {workspace_id}")
+
+            source_rows = (
+                await session.execute(
+                    sa.select(revision_sources.c.thought_id)
+                    .where(revision_sources.c.revision_id == row.revision_id)
+                    .order_by(revision_sources.c.thought_id)
+                )
+            ).all()
+            entity_rows = (
+                await session.execute(
+                    sa.select(entities.c.canonical_name)
+                    .select_from(
+                        entity_mentions.join(entities, entities.c.id == entity_mentions.c.entity_id)
+                    )
+                    .where(
+                        entity_mentions.c.revision_id == row.revision_id,
+                        entity_mentions.c.workspace_id == workspace_id,
+                        entities.c.workspace_id == workspace_id,
+                    )
+                    .distinct()
+                    .order_by(entities.c.canonical_name)
+                )
+            ).all()
+
+        return DocumentExport(
+            document_id=row.id,
+            revision_id=row.revision_id,
+            workspace_id=workspace_id,
+            kind=row.kind,
+            stable_key=row.stable_key,
+            title=row.title,
+            body_markdown=row.body_markdown,
+            window_start=row.window_start,
+            window_end=row.window_end,
+            entities=tuple(r.canonical_name for r in entity_rows),
             source_thought_ids=tuple(r.thought_id for r in source_rows),
         )
 

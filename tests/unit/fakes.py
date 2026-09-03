@@ -24,7 +24,10 @@ from tc_domain.capture import (
 from tc_domain.context import Tier1Row
 from tc_domain.digest import DigestContent
 from tc_domain.digest_ports import PendingDigest
-from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound
+from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound, KhojExportNotFound
+from tc_domain.khoj_export import DocumentExport
+from tc_domain.khoj_ports import KhojIndexFile, KhojSearchResult
+from tc_domain.khoj_sync_ports import PendingKhojSync
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
 from tc_domain.search import SearchPage, SearchQuery
 
@@ -277,3 +280,113 @@ class FakeDigestSender:
             raise self.raises
         self.sent.append(chunks)
         return self.succeed
+
+
+class FakeKhojSyncOutbox:
+    """Records claims and settlements rather than touching a real outbox."""
+
+    def __init__(self, pending: list[PendingKhojSync] | None = None) -> None:
+        self._pending = pending or []
+        self.delivered: list[uuid.UUID] = []
+        self.failed: list[dict[str, object]] = []
+
+    async def claim(self, limit: int) -> tuple[PendingKhojSync, ...]:
+        claimed = tuple(self._pending[:limit])
+        self._pending = self._pending[limit:]
+        return claimed
+
+    async def mark_delivered(self, event_id: uuid.UUID) -> None:
+        self.delivered.append(event_id)
+
+    async def mark_failed(self, event_id: uuid.UUID, *, attempts: int, error: str) -> None:
+        self.failed.append({"event_id": event_id, "attempts": attempts, "error": error})
+
+
+class FakeKhojExportSource:
+    """Returns a fixed export for any document, unless told to fail."""
+
+    def __init__(
+        self, export: DocumentExport | None = None, *, missing: set[uuid.UUID] | None = None
+    ) -> None:
+        self.export = export
+        self.missing = missing or set()
+        self.calls: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def get_export(
+        self, *, workspace_id: uuid.UUID, document_id: uuid.UUID
+    ) -> DocumentExport:
+        self.calls.append((workspace_id, document_id))
+        if document_id in self.missing:
+            raise KhojExportNotFound(f"no such document: {document_id}")
+        assert self.export is not None
+        return self.export
+
+
+class FakeKhojPort:
+    """Records every index/search call; can be told to fail on demand."""
+
+    def __init__(
+        self,
+        *,
+        search_results: tuple[KhojSearchResult, ...] = (),
+        raises: Exception | None = None,
+    ) -> None:
+        self.indexed: list[tuple[KhojIndexFile, ...]] = []
+        self.deleted: list[tuple[str, ...]] = []
+        self.search_results = search_results
+        self.search_queries: list[str] = []
+        self.raises = raises
+
+    async def index(self, files: tuple[KhojIndexFile, ...]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.indexed.append(files)
+
+    async def delete(self, filenames: tuple[str, ...]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.deleted.append(filenames)
+
+    async def search(self, q: str, *, limit: int = 5) -> tuple[KhojSearchResult, ...]:
+        if self.raises is not None:
+            raise self.raises
+        self.search_queries.append(q)
+        return self.search_results
+
+
+class FakeKhojIndexRecorder:
+    """Records every ``khoj_index_items`` write rather than touching a real table."""
+
+    def __init__(self) -> None:
+        self.recorded: list[dict[str, object]] = []
+
+    async def record_synced(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        document_id: uuid.UUID,
+        filename: str,
+        revision_id: uuid.UUID,
+        body_sha256: str,
+    ) -> None:
+        self.recorded.append(
+            {
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "filename": filename,
+                "revision_id": revision_id,
+                "body_sha256": body_sha256,
+            }
+        )
+
+
+class FakeKhojForceSync:
+    """Records the workspace it was asked to enqueue for; returns a fixed count."""
+
+    def __init__(self, count: int = 0) -> None:
+        self.count = count
+        self.calls: list[uuid.UUID] = []
+
+    async def enqueue_all(self, workspace_id: uuid.UUID) -> int:
+        self.calls.append(workspace_id)
+        return self.count

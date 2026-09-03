@@ -242,6 +242,17 @@ run_context_selections = sa.Table(
     sa.Column("referenced_in_output", sa.Boolean, nullable=False),
 )
 
+khoj_index_items = sa.Table(
+    "khoj_index_items",
+    metadata,
+    sa.Column("workspace_id", pg.UUID(as_uuid=True), nullable=False),
+    sa.Column("document_id", pg.UUID(as_uuid=True), primary_key=True),
+    sa.Column("filename", sa.Text, nullable=False),
+    sa.Column("revision_id", pg.UUID(as_uuid=True), nullable=False),
+    sa.Column("body_sha256", sa.CHAR(64), nullable=False),
+    sa.Column("synced_at", sa.DateTime(timezone=True), nullable=False),
+)
+
 outbox_events = sa.Table(
     "outbox_events",
     metadata,

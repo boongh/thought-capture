@@ -250,6 +250,16 @@ class SearchResponse(BaseModel):
         )
 
 
+class KhojSyncResponse(BaseModel):
+    enqueued: int = Field(
+        description=(
+            "Documents just enqueued for Khoj index sync. Delivery happens on the "
+            "worker's next sync-loop poll, not inline - this is a trigger, not a "
+            "blocking full reindex."
+        )
+    )
+
+
 class HealthResponse(BaseModel):
     status: str
 

@@ -61,3 +61,12 @@ class InvalidThresholds(DomainError):
 
 class DigestNotFound(DomainError):
     """A ``digest.ready`` event points at a document revision that no longer resolves."""
+
+
+class KhojExportNotFound(DomainError):
+    """A ``khoj.sync_requested`` event points at a document that no longer resolves.
+
+    Should not happen - documents are never deleted (docs/DESIGN.md 6.3) - but
+    the sync consumer must still fail this event explicitly rather than crash
+    if it ever does.
+    """
