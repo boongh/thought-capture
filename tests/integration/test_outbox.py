@@ -2,6 +2,18 @@
 
 Delivery is at-least-once. What must never happen is an event being lost, or two
 workers delivering the same event concurrently (docs/DESIGN.md 6.5).
+
+Every ``claim`` call below is scoped to ``event_types=("thought.captured",)`` -
+the type this file's own ``enqueue`` helper defaults to - rather than left
+unfiltered. This suite shares one database across every integration test file
+in the run, and nothing in a plain ``pytest`` invocation ever drains
+``khoj.sync_requested`` events (only the dedicated Khoj-sync tests do, and
+only when a real Khoj is reachable): every other file's
+``PostgresOrganizeWriter.write`` calls leave a growing, permanently-pending
+backlog of that type for the rest of the session. An unfiltered
+``claim(limit=N)`` here would silently start missing its own just-enqueued
+event once that backlog exceeds ``N`` due, earlier-queued events - exactly
+what broke this file before this scoping was added.
 """
 
 from __future__ import annotations
@@ -76,7 +88,7 @@ async def test_claim_returns_due_events(
     event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    claimed = await outbox.claim(limit=50)
+    claimed = await outbox.claim(limit=50, event_types=("thought.captured",))
 
     assert event_id in {event.id for event in claimed}
 
@@ -96,7 +108,7 @@ async def test_claim_skips_events_that_are_not_due_yet(
     )
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    claimed = await outbox.claim(limit=50)
+    claimed = await outbox.claim(limit=50, event_types=("thought.captured",))
 
     assert event_id not in {event.id for event in claimed}
 
@@ -113,8 +125,12 @@ async def test_a_leased_event_is_not_claimed_twice(
     first = PostgresOutbox(app_session_factory, lease_owner="worker-a")
     second = PostgresOutbox(app_session_factory, lease_owner="worker-b")
 
-    claimed_by_first = {event.id for event in await first.claim(limit=50)}
-    claimed_by_second = {event.id for event in await second.claim(limit=50)}
+    claimed_by_first = {
+        event.id for event in await first.claim(limit=50, event_types=("thought.captured",))
+    }
+    claimed_by_second = {
+        event.id for event in await second.claim(limit=50, event_types=("thought.captured",))
+    }
 
     assert event_id in claimed_by_first
     assert event_id not in claimed_by_second
@@ -130,7 +146,11 @@ async def test_claiming_increments_attempts(
     event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    claimed = [e for e in await outbox.claim(limit=50) if e.id == event_id]
+    claimed = [
+        e
+        for e in await outbox.claim(limit=50, event_types=("thought.captured",))
+        if e.id == event_id
+    ]
 
     assert claimed[0].attempts == 1
 
@@ -173,9 +193,9 @@ async def test_an_exhausted_event_is_no_longer_claimed(
     )
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    first = {e.id for e in await outbox.claim(limit=50)}
+    first = {e.id for e in await outbox.claim(limit=50, event_types=("thought.captured",))}
     await outbox.mark_failed(event_id, attempts=1, error="synthetic")
-    second = {e.id for e in await outbox.claim(limit=50)}
+    second = {e.id for e in await outbox.claim(limit=50, event_types=("thought.captured",))}
 
     assert event_id in first
     assert event_id not in second
@@ -195,7 +215,7 @@ async def test_delivered_events_are_not_claimed_again(
     event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    await outbox.claim(limit=50)
+    await outbox.claim(limit=50, event_types=("thought.captured",))
     await outbox.mark_delivered(event_id)
 
     async with app_session_factory() as session:
@@ -203,7 +223,9 @@ async def test_delivered_events_are_not_claimed_again(
             sa.select(outbox_events.c.delivered_at).where(outbox_events.c.id == event_id)
         )
     assert delivered_at is not None
-    assert event_id not in {e.id for e in await outbox.claim(limit=50)}
+    assert event_id not in {
+        e.id for e in await outbox.claim(limit=50, event_types=("thought.captured",))
+    }
 
 
 async def test_failure_reschedules_with_backoff_and_records_the_error(
@@ -215,7 +237,7 @@ async def test_failure_reschedules_with_backoff_and_records_the_error(
     event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
 
     outbox = PostgresOutbox(app_session_factory, lease_owner="test")
-    await outbox.claim(limit=50)
+    await outbox.claim(limit=50, event_types=("thought.captured",))
     await outbox.mark_failed(event_id, attempts=3, error="HTTPStatusError")
 
     async with app_session_factory() as session:
@@ -231,7 +253,9 @@ async def test_failure_reschedules_with_backoff_and_records_the_error(
 
     assert row.last_error == "HTTPStatusError"
     assert row.leased_until is None, "a failed event must release its lease"
-    assert event_id not in {e.id for e in await outbox.claim(limit=50)}
+    assert event_id not in {
+        e.id for e in await outbox.claim(limit=50, event_types=("thought.captured",))
+    }
 
 
 async def test_find_pending_locates_an_undelivered_acknowledgement(
