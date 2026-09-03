@@ -50,12 +50,33 @@ class DeliverKhojSync:
         return synced
 
     async def _sync_one(self, event: PendingKhojSync) -> bool:
+        # record_synced/mark_delivered live inside this same try, not after
+        # it: HttpKhojClient.index() is proven idempotent for a given
+        # filename (tests/contract/khoj/test_khoj_client.py), so a failure in
+        # either of those two steps - after Khoj already has the content -
+        # is safe to retry the same way an upstream failure is. Leaving them
+        # unprotected would instead let an exception there escape _sync_one
+        # entirely: the event would be neither delivered nor failed, and any
+        # other already-claimed event later in this batch would sit leased
+        # until its lease expires rather than being retried next poll.
         try:
             export = await self._source.get_export(
                 workspace_id=event.workspace_id, document_id=event.document_id
             )
             body = render_document_markdown(export)
             await self._khoj.index((KhojIndexFile(filename=export.filename, content=body),))
+            await self._recorder.record_synced(
+                workspace_id=event.workspace_id,
+                document_id=export.document_id,
+                filename=export.filename,
+                revision_id=export.revision_id,
+                # Hashes the same bytes just sent to Khoj, front matter
+                # included - not ``body_markdown`` alone - so
+                # ``khoj_index_items.body_sha256`` reflects exactly what is
+                # indexed.
+                body_sha256=hashlib.sha256(body).hexdigest(),
+            )
+            await self._outbox.mark_delivered(event.event_id)
         except Exception as exc:
             # Sanitized: the exception class only, never the message (docs/DESIGN.md
             # 14.2) - a Khoj HTTP error can carry response bodies, a database
@@ -68,18 +89,6 @@ class DeliverKhojSync:
                 event.event_id, attempts=event.attempts, error=type(exc).__name__
             )
             return False
-
-        await self._recorder.record_synced(
-            workspace_id=event.workspace_id,
-            document_id=export.document_id,
-            filename=export.filename,
-            revision_id=export.revision_id,
-            # Hashes the same bytes just sent to Khoj, front matter included -
-            # not ``body_markdown`` alone - so ``khoj_index_items.body_sha256``
-            # reflects exactly what is indexed.
-            body_sha256=hashlib.sha256(body).hexdigest(),
-        )
-        await self._outbox.mark_delivered(event.event_id)
         return True
 
 

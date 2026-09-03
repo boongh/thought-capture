@@ -1,8 +1,8 @@
 # Thought Capture AI - System Design
 
 - **Status:** Accepted implementation anchor
-- **Version:** 1.7
-- **Date:** 2026-09-02
+- **Version:** 1.8
+- **Date:** 2026-09-03
 - **Audience:** Small experienced engineering team
 - **Owner:** Project owner
 
@@ -365,7 +365,7 @@ Automatic alias merges are forbidden below a configurable confidence threshold. 
 
 Use a transactional outbox so a database commit and Discord acknowledgement/digest intent cannot diverge. `outbox_events` contains event type, aggregate ID, JSON payload, attempt count, lease, next attempt, and delivery timestamp. Workers use `FOR UPDATE SKIP LOCKED`.
 
-`capture_windows` records cutoff boundaries and the successful organize run. `khoj_index_items` maps each exported Markdown filename and SHA-256 to document/revision, last synced time, and Khoj response. A revision becomes searchable only after successful index acknowledgement. `run_context_selections` (section 7.3.5) records per-run organize context assembly and is diagnostic, not canonical.
+`capture_windows` records cutoff boundaries and the successful organize run. `khoj_index_items` maps each exported Markdown filename and SHA-256 to document/revision and last synced time - the *last successful* sync only (migration 0007); Khoj's own `PUT /api/content` response carries nothing worth persisting beyond that (`docs/adr/0003`'s contract-spike findings), and a failed sync attempt stays on the triggering outbox event's own `attempts`/`last_error` rather than this table, since a document's very first attempt could fail before any filename/revision/sha is even known. A revision becomes searchable only after successful index acknowledgement. `run_context_selections` (section 7.3.5) records per-run organize context assembly and is diagnostic, not canonical.
 
 ## 7. Core workflows
 
@@ -401,7 +401,7 @@ If blob storage succeeds and the database transaction fails, a garbage-collectio
 8. Verify every referenced thought belongs to the window/workspace and every input thought is either covered or explicitly classified `unorganized`. Record context recall for the run.
 9. Write full document revisions and provenance in one transaction. Never write a partial document set after validation failure.
 10. Export changed revisions to deterministic Markdown files.
-11. Index changed files in Khoj and record item hashes. Failure marks the run `partial`; canonical revisions remain valid and sync retries independently.
+11. Index changed files in Khoj and record item hashes, decoupled from this run entirely (`docs/adr/0003`'s "Index sync run-tracking scope" addendum): one `khoj.sync_requested` outbox event per document, delivered by an independent worker poller. Canonical revisions remain valid and sync retries independently; failure never touches this run's own status.
 12. Enqueue the Discord digest and mark success only after canonical commit. Discord delivery can retry without rerunning the LLM.
 
 ### 7.3 Context assembly for organization

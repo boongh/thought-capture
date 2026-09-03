@@ -123,6 +123,25 @@ async def test_a_khoj_unavailable_error_marks_the_event_failed_and_records_nothi
     assert recorder.recorded == []
 
 
+async def test_a_recorder_failure_after_a_successful_index_still_fails_the_event() -> None:
+    """Khoj already has the content by this point (index() succeeded) - the
+    event must still be marked failed and retried, not silently dropped,
+    since a retry is safe: HttpKhojClient.index() is idempotent by filename
+    (tests/contract/khoj/test_khoj_client.py)."""
+    event = a_pending(document_id=EXPORT.document_id, attempts=1)
+    outbox = FakeKhojSyncOutbox([event])
+    khoj = FakeKhojPort()
+    recorder = FakeKhojIndexRecorder(raises=RuntimeError("db statement: ..."))
+    deliver = _deliver(outbox, khoj=khoj, recorder=recorder)
+
+    synced = await deliver()
+
+    assert synced == 0
+    assert len(khoj.indexed) == 1  # Khoj was actually called before the failure
+    assert outbox.delivered == []
+    assert outbox.failed == [{"event_id": event.event_id, "attempts": 1, "error": "RuntimeError"}]
+
+
 async def test_multiple_events_are_each_synced_independently() -> None:
     good = a_pending(document_id=EXPORT.document_id)
     bad = a_pending()

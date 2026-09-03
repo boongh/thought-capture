@@ -304,3 +304,66 @@ confirmed all four of those and raised one new **P1, blocking merge**:
    Every doc/script/test that referenced the old single-file `--profile ai`
    invocation (`env.example`, `tests/contract/khoj/conftest.py`, the CI
    workflow, both check scripts) was updated to the two-file form.
+
+## Index sync run-tracking scope (2026-09-03, slice 18)
+
+`docs/DESIGN.md` 7.2 step 11 reads: "Index changed files in Khoj and record
+item hashes. Failure marks the run `partial`; canonical revisions remain
+valid and sync retries independently." Read most literally, this implies
+Khoj indexing happens synchronously inside the organize run itself, with a
+failure flipping that run's own `runs.status` to `partial` - a status value,
+and the `runs.kind = 'khoj_sync'` enum member (`docs/DESIGN.md` 6.3), that
+existed in the schema from `docs/adr/0004` onward but had no code path ever
+setting either one.
+
+**Decision, put to the owner directly during slice 18's implementation
+planning and confirmed:** index sync is fully decoupled from the organize
+run and from `runs` entirely - the same outbox-consumer shape already
+established for digest delivery (`tc_application.digest_delivery.DeliverDigests`
+/ `tc_infrastructure.db.digest_outbox.PostgresDigestOutbox` /
+`tc_discord_bot.digest_loop.DigestDeliveryLoop`, none of which touch `runs`
+either). `PostgresOrganizeWriter.write` enqueues one `khoj.sync_requested`
+outbox event per document written, in the same transaction as the revision;
+a worker-side poller (`tc_worker.khoj_sync_loop.KhojSyncLoop`, identical
+shape to the bot's digest loop) drives `tc_application.khoj_sync.DeliverKhojSync`
+on a fixed interval. The organize run itself is marked `succeeded` purely on
+the LLM-and-write step completing, exactly as it already was before this
+slice - a downstream Khoj sync failure never touches it. Per-document sync
+health is observable through `khoj_index_items` (last *successful* sync
+only: filename, revision, sha256, timestamp - see migration `0007`'s own
+docstring for why a failed attempt is deliberately not recorded there) and
+through the `khoj.sync_requested` outbox event's own `attempts`/`last_error`
+for anything still failing.
+
+**Why not the literal reading.** Two considered alternatives were rejected:
+
+1. Flip the *organize* run's own `status` to `partial` on a Khoj failure.
+   Rejected because Khoj indexing is asynchronous by design (docs/DESIGN.md
+   14.1: "Khoj unavailable: canonical documents commit; sync retries; exact
+   search remains available") - the organize run has typically already
+   returned success to its caller (`/organize`, the scheduler) well before a
+   sync event is even claimed, so retroactively downgrading a already-reported
+   `succeeded` run to `partial` minutes or hours later has no consumer that
+   would ever see it happen, and would make `runs.status` mean two different
+   things depending on how much time has passed since it was read.
+2. A dedicated `runs` row per sync attempt (`kind='khoj_sync'`), giving
+   `GET /v1/runs/{id}`-style observability for sync specifically. Rejected as
+   unnecessary machinery for what this slice actually needs: `docs/DESIGN.md`
+   14.2 lists "Khoj sync lag" as an observability target, which
+   `khoj_index_items.synced_at` compared against `document_revisions.created_at`
+   already answers without a `RunLedger` integration, additional tests, and a
+   second status-transition surface to keep consistent with the outbox's own.
+
+**Consequence.** `runs.kind = 'khoj_sync'` and `runs.status = 'partial'`
+remain reserved-but-unused after this slice, matching their state before it.
+If a future need for run-level sync observability emerges (e.g. an operator
+wants "list every sync attempt for window X" the way `/v1/runs/{id}` already
+does for organize), that is new work requiring its own decision, not an
+oversight in this one.
+
+This section is the ADR update `docs/DESIGN.md` 16 and CLAUDE.md require
+for a deviation from an already-accepted pipeline step's stated behavior;
+`docs/DESIGN.md` 7.2 step 11's own text is intentionally left as written
+(matching this document's own precedent of not silently rewriting
+accepted design text) with this ADR as the authoritative gloss on what "the
+run" refers to and how failure is actually tracked.

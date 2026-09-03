@@ -357,8 +357,9 @@ class FakeKhojPort:
 class FakeKhojIndexRecorder:
     """Records every ``khoj_index_items`` write rather than touching a real table."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, raises: Exception | None = None) -> None:
         self.recorded: list[dict[str, object]] = []
+        self.raises = raises
 
     async def record_synced(
         self,
@@ -369,6 +370,8 @@ class FakeKhojIndexRecorder:
         revision_id: uuid.UUID,
         body_sha256: str,
     ) -> None:
+        if self.raises is not None:
+            raise self.raises
         self.recorded.append(
             {
                 "workspace_id": workspace_id,
