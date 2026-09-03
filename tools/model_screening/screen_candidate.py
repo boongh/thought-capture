@@ -46,6 +46,17 @@ parallel, appending results to the tracking table::
         --candidates-file docs/model-screening/candidates.json \\
         --concurrency 3 --budget 0.05 \\
         --append-results docs/model-screening/results.md
+
+Sweep reasoning effort on a reasoning-capable candidate, to weigh quality
+against realized cost per level rather than ruling the whole model out by
+name (see ``docs/model-evaluation-organize-select.md``'s reasoning-model
+policy update - a mandatory-reasoning model will reject some of these
+values outright, which is itself the signal to rule it out)::
+
+    python tools/model_screening/screen_candidate.py --task organize \\
+        --model deepseek/deepseek-v4-flash-0731 --tag deepinfra/fp8 \\
+        --reasoning-efforts unset,none,low --budget 0.05 \\
+        --append-results docs/model-screening/results.md
 """
 
 from __future__ import annotations
@@ -104,6 +115,7 @@ class CandidateReport:
     tag: str
     capability_ok: bool
     capability_error: str | None
+    reasoning_effort: ReasoningEffort | None = None
     probes: list[ProbeOutcome] = field(default_factory=list)
 
     @property
@@ -224,6 +236,7 @@ async def screen_candidate(
         tag=tag,
         capability_ok=capability_ok,
         capability_error=capability_error,
+        reasoning_effort=reasoning_effort,
     )
     if not capability_ok:
         return report
@@ -265,7 +278,11 @@ def _probe_cell(report: CandidateReport, kind: str) -> str:
 
 
 def render_report(report: CandidateReport) -> str:
-    lines = [f"\n=== {report.task}/{report.model_id} @ {report.tag} ==="]
+    effort_label = report.reasoning_effort or "unset (uncontrolled)"
+    lines = [
+        f"\n=== {report.task}/{report.model_id} @ {report.tag} "
+        f"[reasoning_effort={effort_label}] ==="
+    ]
     if not report.capability_ok:
         lines.append(f"  CAPABILITY CHECK FAILED: {report.capability_error}")
         lines.append("  (no battery run - candidate does not accept the real schema on this tag)")
@@ -296,7 +313,10 @@ def render_results_row(report: CandidateReport, *, round_label: str, notes: str)
     """
     date = dt.datetime.now(dt.UTC).date().isoformat()
     model_cell = f"`{report.model_id}` (`{report.tag}`)"
-    full_notes = f"{notes} - cost {format_cost(report.total_cost)} (auto)".strip(" -")
+    effort_label = report.reasoning_effort or "unset"
+    full_notes = (
+        f"{notes} - reasoning_effort={effort_label}, cost {format_cost(report.total_cost)} (auto)"
+    ).strip(" -")
     if not report.capability_ok:
         probe_cells = ["-", "-", "-", "-"]
         verdict = "capability_mismatch"
@@ -341,20 +361,55 @@ def load_candidates(path: Path, default_task: Task) -> list[dict[str, str]]:
     return candidates
 
 
+def render_effort_summary(reports: list[CandidateReport]) -> str | None:
+    """Cost/quality-by-reasoning-effort comparison, one table per (model, tag)
+    that was swept across more than one effort level in this run - the
+    mechanical half of "weight quality against cost across reasoning
+    efforts"; whether a given schema-valid rate is actually *safe* still
+    needs the same human read as every other probe result.
+    """
+    by_candidate: dict[tuple[str, str], list[CandidateReport]] = {}
+    for report in reports:
+        by_candidate.setdefault((report.model_id, report.tag), []).append(report)
+
+    lines: list[str] = []
+    for (model_id, tag), group in by_candidate.items():
+        if len(group) < 2:
+            continue
+        lines.append(f"\n--- reasoning-effort sweep: {model_id} @ {tag} ---")
+        lines.append(
+            f"{'effort':<10} {'total cost':>12} {'schema-valid':>14} {'injection-clean':>16}"
+        )
+        for report in group:
+            effort_label = report.reasoning_effort or "unset"
+            non_blunt = [p for p in report.probes if p.kind != "blunt" and p.ok]
+            schema_ok = sum(1 for p in non_blunt if p.schema_valid)
+            blunt = [p for p in report.probes if p.kind == "blunt" and p.ok]
+            clean_blunt = sum(1 for p in blunt if not p.injection_marker)
+            lines.append(
+                f"{effort_label:<10} {format_cost(report.total_cost):>12} "
+                f"{f'{schema_ok}/{len(non_blunt)}':>14} {f'{clean_blunt}/{len(blunt)}':>16}"
+            )
+    return "\n".join(lines) if lines else None
+
+
 async def main_async(args: argparse.Namespace) -> int:
     budget = Budget(args.budget)
     reports: list[CandidateReport] = []
+    reasoning_efforts = args.reasoning_efforts
 
     if args.candidates_file:
         candidates = load_candidates(Path(args.candidates_file), args.task)
         semaphore = asyncio.Semaphore(args.concurrency)
 
-        async def bounded(candidate: dict[str, str]) -> CandidateReport | None:
+        async def bounded(
+            candidate: dict[str, str], reasoning_effort: ReasoningEffort | None
+        ) -> CandidateReport | None:
             async with semaphore:
                 try:
                     budget.check()
                 except BudgetExceededError as exc:
-                    print(f"SKIPPING {candidate['model_id']}: {exc}")
+                    print(f"SKIPPING {candidate['model_id']} @ {reasoning_effort}: {exc}")
                     return None
                 return await screen_candidate(
                     task=candidate["task"],
@@ -362,11 +417,13 @@ async def main_async(args: argparse.Namespace) -> int:
                     tag=candidate["tag"],
                     n=args.n,
                     budget=budget,
-                    reasoning_effort=args.reasoning_effort,
+                    reasoning_effort=reasoning_effort,
                     skip_capability_check=args.skip_capability_check,
                 )
 
-        results = await asyncio.gather(*(bounded(c) for c in candidates))
+        results = await asyncio.gather(
+            *(bounded(c, effort) for c in candidates for effort in reasoning_efforts)
+        )
         reports = [r for r in results if r is not None]
     else:
         if not args.model or not args.tag:
@@ -374,22 +431,28 @@ async def main_async(args: argparse.Namespace) -> int:
                 "--model and --tag are required unless --candidates-file is given", file=sys.stderr
             )
             return 2
-        reports = [
-            await screen_candidate(
-                task=args.task,
-                model_id=args.model,
-                tag=args.tag,
-                n=args.n,
-                budget=budget,
-                reasoning_effort=args.reasoning_effort,
-                skip_capability_check=args.skip_capability_check,
+        for effort in reasoning_efforts:
+            budget.check()
+            reports.append(
+                await screen_candidate(
+                    task=args.task,
+                    model_id=args.model,
+                    tag=args.tag,
+                    n=args.n,
+                    budget=budget,
+                    reasoning_effort=effort,
+                    skip_capability_check=args.skip_capability_check,
+                )
             )
-        ]
 
     for report in reports:
         print(render_report(report))
 
     print(f"\nTOTAL SPEND THIS RUN: {format_cost(budget.spent)} (cap {format_cost(budget.cap)})")
+
+    effort_summary = render_effort_summary(reports)
+    if effort_summary:
+        print(effort_summary)
 
     if args.append_results:
         results_path = Path(args.append_results)
@@ -399,6 +462,35 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"Appended to {results_path}: {row}")
 
     return 0
+
+
+_REASONING_EFFORT_CHOICES = ("unset", "none", "low", "medium", "high")
+
+
+def parse_reasoning_efforts(raw: str) -> list[ReasoningEffort | None]:
+    """Parse a comma-separated ``--reasoning-efforts`` value into a sweep list.
+
+    ``unset`` means the request omits ``reasoning_effort`` entirely (the
+    model's own uncontrolled default) - distinct from ``none``, which
+    explicitly asks the model to minimize reasoning and is rejected outright
+    by some mandatory-reasoning models (round 7's GLM 5.3 Flash, round 10's
+    MiniMax M2.7/Reka Flash 3). Testing both tells apart "this model has no
+    reasoning tax" from "this model's reasoning tax is only avoidable via the
+    explicit control".
+    """
+    efforts: list[ReasoningEffort | None] = []
+    for token in raw.split(","):
+        value = token.strip().lower()
+        if not value:
+            continue
+        if value not in _REASONING_EFFORT_CHOICES:
+            raise argparse.ArgumentTypeError(
+                f"invalid reasoning effort {value!r}; choose from {_REASONING_EFFORT_CHOICES}"
+            )
+        efforts.append(None if value == "unset" else value)
+    if not efforts:
+        raise argparse.ArgumentTypeError("--reasoning-efforts must name at least one value")
+    return efforts
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -417,10 +509,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n", type=int, default=1, help="repetitions per probe (use 5 to confirm)")
     parser.add_argument("--budget", type=float, default=0.02, help="USD cap for this run")
     parser.add_argument(
-        "--reasoning-effort",
-        choices=["none", "low", "medium", "high"],
-        default=None,
-        help="pass-through to LLMRequest.reasoning_effort; leave unset to test uncontrolled",
+        "--reasoning-efforts",
+        type=parse_reasoning_efforts,
+        default=parse_reasoning_efforts("unset"),
+        help=(
+            "comma-separated sweep of LLMRequest.reasoning_effort values to test "
+            "(unset,none,low,medium,high) - a full probe battery runs once per value, "
+            "against the same shared --budget; e.g. 'unset,none,low' to compare a "
+            "reasoning model's uncontrolled default against two explicit controls"
+        ),
     )
     parser.add_argument("--skip-capability-check", action="store_true")
     parser.add_argument(

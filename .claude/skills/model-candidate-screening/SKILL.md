@@ -37,16 +37,31 @@ python tools/model_screening/list_zdr_models.py \
 ```
 
 This fetches OpenRouter's live ZDR endpoint list, filters out anything
-already in `docs/model-screening/results.md`, applies price/context/
-reasoning-name filters (flags to widen or narrow the band - see
-`--help`), and writes a JSON candidate file. Re-run it each session; the ZDR
-list changes over time and a stale one silently hides new options. For
-`select`, pass `--task select`.
+already in `docs/model-screening/results.md`, applies price/context filters
+(flags to widen or narrow the band - see `--help`), and writes a JSON
+candidate file. Re-run it each session; the ZDR list changes over time and a
+stale one silently hides new options. For `select`, pass `--task select`.
 
-Sanity-check the printed list before spending anything on it - a name that's
-obviously a reasoning/thinking variant, or a vendor already ruled out in
-`results.md` for an unrelated model in the same family, is worth dropping by
-hand even if the filters let it through.
+**Reasoning models are candidates, not a pre-filtered-out class.** Round
+2/7's finding that hidden reasoning tokens can dominate cost and latency
+used to be encoded as a blanket name-based exclusion; round 8-11 broke that
+policy in practice (`x-ai/grok-4.3` - a reasoning model - is the strongest
+organize candidate found across 11 rounds, made viable by
+`LLMRequest.reasoning_effort` suppressing the tax) and it is now the
+documented default: `list_zdr_models.py` includes reasoning-branded models
+unless you pass `--exclude-reasoning-hinted`. Judge them the same way as
+every other candidate - realized average $/call at whichever
+`reasoning_effort` level the model actually accepts - not by name. See step
+2a below for the sweep this requires, and
+`docs/model-evaluation-organize-select.md`'s reasoning-model policy section
+for the full reasoning behind this change, including why DeepSeek V4 Flash
+(round 1-2, deprioritized for latency/verbosity alone, before
+`reasoning_effort` existed) is worth a retest before assuming "reasoning
+model" still means "ruled out".
+
+Sanity-check the printed list before spending anything on it - a vendor
+already ruled out in `results.md` for an unrelated model in the same family
+is worth dropping by hand even if the filters let it through.
 
 ### 2. Parallel first screening (N=1)
 
@@ -78,6 +93,48 @@ deliberately does **not** auto-judge fabrication quality (hedged vs. asserted,
 invented-link vs. not) - that read has been the load-bearing judgment call in
 every round so far, and a heuristic here would just make it a worse, silent
 one.
+
+### 2a. Reasoning-effort sweep (candidates with `supports_reasoning: true`)
+
+Step 2's batch pass runs each candidate uncontrolled (no `reasoning_effort`
+set) - fine for a first cut, but not enough to judge a reasoning-capable
+candidate on cost, and not fair grounds to rule one out on an empty-
+completion or full-budget-runaway failure alone (that failure mode is
+consistent with *mandatory* reasoning, but the only way to tell that apart
+from *avoidable* reasoning is to actually try suppressing it). For any
+candidate the JSON output flagged `supports_reasoning: true`, whether it
+passed or failed step 2, run the sweep before moving on:
+
+```bash
+python tools/model_screening/screen_candidate.py --task organize \
+  --model <model_id> --tag <tag> --reasoning-efforts unset,none,low \
+  --budget 0.05 --append-results docs/model-screening/results.md \
+  --round-label "8-reasoning-sweep" --notes "effort sweep"
+```
+
+This runs the full probe battery once per effort level against the same
+shared budget, appends one results-row per level (the level is recorded in
+the row's `Notes` automatically), and prints a cost/quality-by-effort table
+at the end. Read the outcome as:
+
+- **Every controlled value (`none`/`low`/...) rejected with HTTP 400,
+  `unset` alone produces output** - mandatory, uncontrollable reasoning
+  (round 7's GLM 5.3 Flash, round 10's MiniMax M2.7/Reka Flash 3 pattern).
+  Rule out; no further sweep needed, this is a fast, cheap verdict.
+- **A controlled value is accepted and meaningfully cheaper with the same
+  schema-valid/injection-clean rate as `unset`** (round 8's `grok-4.3`:
+  `none` cut cost ~39-65% with safety/quality unchanged) - use the cheapest
+  accepted level's cost figure everywhere downstream (results table,
+  owner-facing cost comparisons), not the uncontrolled figure. `unset`'s
+  cost is not the number that would ship to production if this candidate
+  were adopted.
+- **All values produce similar cost/quality** - the model doesn't have a
+  meaningful reasoning tax on this workload; report the `unset` figure and
+  move on, no reasoning-specific caveat needed.
+
+The fabrication/hedging quality read (step 3's judgment call) still has to
+happen per effort level actually being compared - a cheaper effort level is
+only a real option if its content is still safe, not just schema-valid.
 
 ### 3. Decide: retest at N=5, or move on
 
