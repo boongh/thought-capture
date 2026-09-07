@@ -486,3 +486,188 @@ through the real ASGI app against real PostgreSQL, including a real
 integration`/`pytest -m contract` pass - see the pull request for exact
 counts. Independent review (`.claude/agents/code-reviewer.md`) ran against
 this slice's diff before merge.
+
+## Ask proxy: PR review remediation (2026-09-07)
+
+Independent PR review of slice 20 (above) found five P1s, two P2s, and a P3
+against the design this project actually accepted, not against a different
+design - each is addressed here rather than by amending history above, per
+this repository's convention of appending dated sections.
+
+**P1: buffered, not streamed.** `docs/DESIGN.md` 7.6 ("the gateway streams
+the answer") was not implemented - the first cut sent `stream: false` to
+Khoj and buffered up to 60 seconds before returning a single JSON body.
+Fixed by making streaming the shape everywhere: `KhojPort.chat` is now
+`def chat(...) -> AsyncIterator[KhojChatChunk]` (`packages/domain/src/
+tc_domain/khoj_ports.py`), `HttpKhojClient.chat` sends `stream: true` and
+parses Khoj's `END_EVENT`-delimited wire protocol incrementally
+(`packages/infrastructure/src/tc_infrastructure/khoj/client.py`),
+`AskQuestion.__call__` yields `AskChunk`s instead of returning one
+`AskAnswer` (`packages/application/src/tc_application/ask.py`), and
+`POST /v1/ask` returns `StreamingResponse(..., media_type=
+"application/x-ndjson")` - one `AskEvent` JSON object per line
+(`apps/api/src/tc_api/routers/ask.py`, `apps/api/src/tc_api/schemas.py`).
+Discord `/ask`, which needs one complete answer rather than a live typing
+effect, consumes the same stream through a new `collect_ask_answer`
+adapter (`packages/application/src/tc_application/ask.py`) rather than the
+API and the bot diverging on `KhojPort`'s shape.
+
+**P1: no strict-filter capability fallback.** `docs/DESIGN.md` 551 and 637
+require a clear "filters unsupported" signal plus an exact-search
+substitute when a caller asks for anything Khoj's semantic query cannot
+express - the first cut accepted only `q` and silently ignored every other
+field, which is not the same thing as declaring them unsupported. Fixed by
+`has_strict_filters(query: SearchQuery) -> bool` (`packages/domain/src/
+tc_domain/search.py`, checks every `SearchQuery` field except `q`) gating
+`AskQuestion.__call__`: a structured filter now short-circuits before any
+Khoj call, running `ExactSearchPort` instead and yielding a single
+`AskChunk(strict_unsupported=True, fallback=<SearchPage>)`. `AskRequest`
+gained the same filter fields `SearchRequest` already has
+(`apps/api/src/tc_api/schemas.py`) so the API can actually receive them.
+
+**P1: no pinned-Khoj contract test for the chat interface.** The original
+slice's `/api/chat` request/response shape (previous section, "Not part of
+this ADR's original contract spike") was read from `khoj-ai/khoj` source at
+the pinned tag, never exercised against a real running instance - a weaker
+evidence standard than every other adapter in this ADR, and explicitly
+flagged as such at the time. Closed by building
+`tests/contract/khoj/stub_chat_model.py`, a minimal OpenAI-compatible
+server (`GET /v1/models`, `POST /v1/chat/completions`, both streaming and
+non-streaming), and configuring a real pinned `2.0.0-beta.28` container
+against it at first boot (`TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY`
+pointed at the stub before Khoj's own `--non-interactive` chat-model
+registration ran). Live output against that setup:
+
+```
+{"type": "metadata", "data": {"conversationId": "...", "turnId": "..."}}
+{"type": "status", "data": "**Searching Documents for:** ..."}
+{"type": "status", "data": "**Found 1 Notes Across 1 Files**: ..."}
+{"type": "references", "data": {"inferredQueries": [...], "context": [{"query": "...", "compiled": "...", "file": "test-note.md", "uri": "..."}], "onlineContext": {}, "codeContext": {}}}
+{"type": "status", "data": "**Generating a well-informed response**"}
+{"type": "start_llm_response", "data": ""}
+This is a stub answer                          <- raw text, not JSON: a MESSAGE chunk
+ for contract testing.
+{"type": "end_llm_response", "data": ""}
+{"type": "usage", "data": {...}}
+{"type": "end_response", "data": ""}
+```
+
+This confirms every assumption `_parse_chat_event`/`_parse_chat_references`
+made from source: `metadata`/`references`/raw-text `message` chunks are the
+only three event shapes this adapter needs, `status`/`usage`/
+`start_llm_response`/`end_llm_response`/`end_response` are correctly
+ignored, and a `references` context item carries `compiled`/`file` but
+*not* `heading` (handled by the existing `item.get("heading") or ""`
+fallback - no crash, no test gap). It also surfaced one behavior neither
+source-reading nor the original design anticipated: with nothing indexed
+at all, Khoj answers with a canned "you haven't synced any notes yet"
+message and never calls the configured chat model - a guardrail internal
+to Khoj's own `/notes` command, not something this adapter needs to special
+-case, since the response still arrives as an ordinary raw-text `message`
+chunk. Formalized as `tests/contract/khoj/test_khoj_chat.py`
+(`test_chat_answers_and_references_the_indexed_note`,
+`test_chat_leaves_no_conversation_behind`), wired into CI
+(`.github/workflows/ci.yml`, "Start the stub chat model" step, before "Start
+Khoj") via `extra_hosts: ["host.docker.internal:host-gateway"]` added to the
+`khoj` service (`deploy/compose/khoj.docker-compose.yml`) so a Linux CI
+runner resolves the same hostname Docker Desktop already provides for free
+locally.
+
+**P1: no retention/purge policy for Khoj's own conversation copy.** Each
+`/api/chat` call left a server-side Khoj conversation - a second,
+unaccounted-for copy of personal-memory content this project's own backup/
+export/retention story (`docs/DESIGN.md` 12.3, 14.3) does not cover. Fixed
+by `HttpKhojClient.chat`'s `finally` block calling `_delete_conversation`
+(`DELETE /api/chat/history?conversation_id=...`) immediately after each
+call, using the `conversationId` the streaming `metadata` event surfaces -
+the non-streaming response never exposed this id at all, so this fix was
+only possible once streaming (above) landed. Best-effort: a cleanup failure
+logs (`khoj_chat.conversation_cleanup_failed`) rather than masking the
+answer the caller already received. Live-verified: `GET /api/chat/sessions`
+before and after a real `HttpKhojClient.chat()` call against the
+stub-configured instance above shows no new conversation id surviving the
+call, while a conversation created by a raw `curl` call that bypasses this
+adapter (and therefore never reaches the `finally` block) remains listed -
+confirming the delete is this adapter's behavior, not an artifact of Khoj's
+own conversation lifecycle. Covered by
+`tests/contract/khoj/test_khoj_chat.py::test_chat_leaves_no_conversation_behind`.
+
+**P1: the external chat-model route had no enforceable provider/retention
+policy.** The original two-gate design (`TC_ASK_ENABLED` plus Khoj's own
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`) let an operator point Ask at an
+unreviewed, non-ZDR provider with nothing but a doc comment standing in the
+way - `docs/adr/0006`'s safe-mode reviewed-model/ZDR discipline is
+enforced in code for organize/select but was only encouraged, not required,
+here. Fixed by a third, independent gate:
+**`TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED`** (`Settings
+.ask_provider_retention_acknowledged`, default `false`,
+`packages/infrastructure/src/tc_infrastructure/config.py`). A new
+`@model_validator(mode="after") _ask_requires_provider_acknowledgment`
+raises at startup if `TC_ASK_ENABLED=true` while this is `false` - the same
+fail-fast pattern `_safe_mode_restricts_to_reviewed_models` already uses,
+so a misconfigured deployment refuses to start rather than silently
+exposing notes to an unreviewed model. This does not itself validate *which*
+provider is configured (Khoj's `OPENAI_BASE_URL` remains this project's
+adapter boundary, per this ADR's decision 5's "external services stay
+behind a replaceable adapter"); it forces the operator to affirmatively
+attest they have applied `docs/adr/0006`'s review requirements to whatever
+they pointed `TC_KHOJ_OPENAI_BASE_URL` at, the same way enabling safe-mode
+custom models already requires.
+
+**P2: malformed `references` raised an uncaught `AttributeError`.** A
+response whose `references.context` was not a list (or whose items were not
+dicts) let Python's own `AttributeError`/`TypeError` escape
+`HttpKhojClient.chat` as an unhandled `500`, rather than degrading like
+every other malformed-Khoj-response case (`docs/DESIGN.md` 7.5). Fixed by
+`_parse_chat_references` validating `isinstance(data, dict)` and
+`isinstance(context, list)` explicitly before use, raising
+`KhojUnavailableError` - the same exception type every other malformed-
+shape case in this adapter already raises - instead of letting the
+underlying Python exception surface. Covered by
+`tests/unit/test_khoj_client_chat.py
+::test_chat_raises_khoj_unavailable_on_a_malformed_references_event`,
+parametrized over four malformed shapes (non-dict data, non-list context,
+non-dict item, item missing `compiled`).
+
+**P2: Discord `/ask` had no length bound, rate limit, concurrency limit, or
+cost guard.** `/v1/ask` already rejected a question over 2,000 characters
+(`AskRequest`'s Pydantic constraint); Discord `/ask` had no equivalent, and
+nothing stopped a user from firing overlapping or rapid-fire questions at a
+model that can carry real per-call cost once a provider is configured
+(P1 above). Fixed in `apps/discord_bot/src/tc_discord_bot/commands.py`:
+`_ask_question_too_long` mirrors the API's 2,000-character bound exactly
+(`_ASK_QUESTION_LIMIT`); a mutable `_ask_in_flight` cell rejects a second
+`/ask` while one is already running (single-owner bot, so a simple flag is
+sufficient - no cross-process coordination needed); `_ask_cooldown_remaining_seconds`
+enforces a 15-second cooldown between calls (`_ASK_COOLDOWN_SECONDS`).
+Deliberately *not* `app_commands.checks.cooldown`: this bot's
+`CommandTree` has no `on_error` override, so a failed check would raise
+`AppCommandError` and leave the interaction unanswered ("This interaction
+failed" in Discord) instead of the explicit, testable message these
+hand-written checks send via `interaction.response.send_message`, matching
+the existing `_reject_if_not_owner` pattern rather than introducing a
+second error-handling convention. Covered by `tests/unit/
+test_discord_commands.py`'s length/cooldown/concurrency tests.
+
+**P3: `docs/OPERATING.md` described the wrong degrade behavior.** It
+claimed an unconfigured Khoj chat model makes `/ask`/`/v1/ask` report
+`enabled: false`; the actual (and correct, per this ADR's original
+decision) behavior is `enabled: true, degraded: true` - `enabled` reflects
+only this project's own `TC_ASK_ENABLED` switch, since the code has no way
+to know Khoj's chat model is unconfigured until a call to it actually
+fails. Fixed in `docs/OPERATING.md`'s Ask section, which now also documents
+the third `TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED` gate above.
+
+**Verification.** `tests/unit/test_ask.py` (rewritten for streaming:
+disabled short-circuit, streamed collection, mid-stream partial-answer
+degrade, strict-filter fallback parametrized over every filter field),
+`tests/unit/test_khoj_client_chat.py` (rewritten against `httpx
+.MockTransport` for the streaming wire format, including the malformed-
+references parametrized case), `tests/unit/test_discord_commands.py`
+(length/cooldown/concurrency), `tests/integration/test_api_ask.py`
+(rewritten for NDJSON, including the strict-filter-fallback path against
+real PostgreSQL), `tests/contract/khoj/test_khoj_chat.py` (new, live
+against a real stub-configured pinned Khoj container). All of `ruff format
+--check`/`ruff check`/`mypy`/`pytest -m unit`/`pytest -m integration`/
+`pytest -m contract` pass - see the pull request for exact counts.
+Independent review ran against this remediation's diff before merge.

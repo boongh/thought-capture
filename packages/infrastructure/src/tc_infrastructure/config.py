@@ -112,10 +112,21 @@ class Settings(BaseSettings):
     # OPENAI_BASE_URL/OPENAI_API_KEY in deploy/compose/khoj.docker-compose.yml,
     # entirely the operator's choice and never set by this project's own
     # code) - outside this project's own OpenRouter adapter and
-    # docs/adr/0006's safe/custom mode controls entirely. Two independent
-    # opt-ins (this flag, and Khoj's own chat-model configuration) are
-    # required before any Ask call can reach a live model.
+    # docs/adr/0006's safe/custom mode controls entirely.
     ask_enabled: bool = False
+    # A third, independent gate on top of `ask_enabled` and Khoj's own
+    # chat-model configuration (docs/adr/0003's "Ask proxy" amendment,
+    # "Provider acknowledgment"): this project's code has no hook into
+    # Khoj's own outbound request to whichever provider it is configured
+    # with, so it cannot enforce a reviewed-provider/ZDR policy on that route
+    # the way docs/adr/0006 enforces one for its own OpenRouter calls. What
+    # it *can* enforce is that turning `ask_enabled` on required a deliberate,
+    # separate, greppable acknowledgment that the operator has personally
+    # reviewed that provider's retention/training policy - see
+    # `_ask_requires_provider_acknowledgment` below, which refuses to start
+    # rather than let `ask_enabled=true` alone silently imply that review
+    # happened.
+    ask_provider_retention_acknowledged: bool = False
 
     @field_validator(
         "discord_owner_user_id",
@@ -192,6 +203,34 @@ class Settings(BaseSettings):
                     f"{stage!r} and add that stage to its ReviewedModel.stages entry, or "
                     "set TC_MODEL_SELECTION_MODE=custom to select models freely."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _ask_requires_provider_acknowledgment(self) -> Settings:
+        """Ask's third gate (docs/adr/0003's "Ask proxy" amendment,
+        "Provider acknowledgment") is a startup guarantee, not a hint - the
+        same fail-fast shape as `_safe_mode_restricts_to_reviewed_models`.
+
+        `TC_ASK_ENABLED=true` alone must not be readable as "the operator
+        has reviewed whatever chat model Khoj is configured with" - this
+        project's own code has no hook into that outbound request the way it
+        does for its own OpenRouter calls (docs/adr/0006), so it cannot
+        enforce a provider/retention policy on Khoj's side at the request
+        level. What it can enforce is that the operator said so deliberately:
+        `TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED=true` must also be set, or
+        the process refuses to start with `ask_enabled=true` rather than let
+        the weaker flag alone imply the review happened.
+        """
+        if self.ask_enabled and not self.ask_provider_retention_acknowledged:
+            raise ValueError(
+                "TC_ASK_ENABLED=true requires TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED=true "
+                '(docs/adr/0003\'s "Ask proxy" amendment): before enabling Ask, review the '
+                "retention/training policy of whichever chat model Khoj itself is configured "
+                "with (TC_KHOJ_OPENAI_BASE_URL/TC_KHOJ_OPENAI_API_KEY in env.example) - this "
+                "project's own code cannot enforce that policy on Khoj's outbound request the "
+                "way it enforces one for its own OpenRouter calls (docs/adr/0006), so it "
+                "requires this explicit acknowledgment instead."
+            )
         return self
 
     @property

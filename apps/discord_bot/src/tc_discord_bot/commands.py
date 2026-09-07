@@ -45,7 +45,7 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from tc_application.ask import AskQuestion
+from tc_application.ask import AskQuestion, collect_ask_answer
 from tc_application.organize import OrganizeWindow
 from tc_application.search import Search, UnsupportedSearchModeError
 from tc_domain.ask import AskAnswer
@@ -64,6 +64,15 @@ logger = logging.getLogger(__name__)
 _MESSAGE_LIMIT = 2000
 _SEARCH_RESULT_LIMIT = 5
 _SEARCH_MODES = ("exact", "semantic", "hybrid")
+# Matches `AskRequest.q`'s own bound (apps/api/src/tc_api/schemas.py) - the
+# same question shape, the same limit, so a question rejected by one surface
+# is rejected by the other for the same reason.
+_ASK_QUESTION_LIMIT = 2_000
+# Ask proxies to a live LLM call once configured (docs/adr/0003's "Ask
+# proxy" amendment) with a real cost per call, unlike every other command
+# here - a cooldown is a cost guard, not just an abuse guard, even though
+# every caller of an owner-only command is already the same single person.
+_ASK_COOLDOWN_SECONDS = 15.0
 
 # A DM-usable command must allow the DM context explicitly (discord.py 2.7's
 # default leaves this to the application's Developer Portal installation
@@ -238,15 +247,68 @@ def build_admin_commands(
             return
         await interaction.followup.send(_format_search_page(page, mode), ephemeral=True)
 
+    # Two guards on the same mutable cell, checked explicitly rather than via
+    # `app_commands.checks.cooldown` - a failed `checks` decorator raises an
+    # `AppCommandError` that this project's `CommandTree` has no `on_error`
+    # override for, which would leave the interaction unanswered ("This
+    # interaction failed" in Discord) instead of the same clear, ephemeral
+    # message every other rejection here already gives
+    # (`_reject_if_not_owner`'s pattern). `_ask_in_flight["active"]` blocks a
+    # second call while one is running; `_ask_in_flight["last_started_at"]`
+    # blocks a new call for `_ASK_COOLDOWN_SECONDS` after the previous one
+    # started, so a burst of quick, sequential `/ask`s (no overlap, so the
+    # concurrency guard alone would not catch it) still cannot flood a live
+    # LLM call - both matter because Ask has a real cost per call once
+    # configured, unlike every other command here.
+    _ask_in_flight: dict[str, object] = {"active": False, "last_started_at": None}
+
     async def ask_callback(interaction: discord.Interaction, question: str) -> None:
         if await _reject_if_not_owner(interaction, owner_user_id):
             return
+        if _ask_question_too_long(question):
+            await interaction.response.send_message(
+                f"Question is {len(question)} characters; the limit is "
+                f"{_ASK_QUESTION_LIMIT} (matching `POST /v1/ask`'s own bound).",
+                ephemeral=True,
+            )
+            return
+        if _ask_in_flight["active"]:
+            await interaction.response.send_message(
+                "Another `/ask` is still running; wait for it to finish before asking again.",
+                ephemeral=True,
+            )
+            return
+        last_started_at = _ask_in_flight["last_started_at"]
+        remaining = (
+            _ask_cooldown_remaining_seconds(last_started_at, clock())
+            if isinstance(last_started_at, dt.datetime)
+            else None
+        )
+        if remaining is not None:
+            await interaction.response.send_message(
+                f"`/ask` is on cooldown; wait {remaining:.0f}s before asking again.",
+                ephemeral=True,
+            )
+            return
 
-        # Ask proxies to Khoj's chat model (docs/adr/0003's "Ask proxy"
-        # amendment), which can take longer than the 3-second interaction-
-        # acknowledgement budget - same reasoning as `/organize`'s defer.
-        await interaction.response.defer(ephemeral=True)
-        answer = await ask(workspace_id, question)
+        # Claim the guard *before* the first `await` below, not after -
+        # `defer()` is a real network call that yields control, and two
+        # `/ask` interactions dispatched close enough together would
+        # otherwise both pass every check above and only then race to set
+        # `active`, defeating the guard for exactly the burst it exists to
+        # catch. Setting these two lines synchronously (no `await` between
+        # the last check above and here) closes that window.
+        _ask_in_flight["active"] = True
+        _ask_in_flight["last_started_at"] = clock()
+        try:
+            # Ask proxies to Khoj's chat model (docs/adr/0003's "Ask proxy"
+            # amendment), which can take longer than the 3-second
+            # interaction-acknowledgement budget - same reasoning as
+            # `/organize`'s defer.
+            await interaction.response.defer(ephemeral=True)
+            answer = await collect_ask_answer(ask(workspace_id, SearchQuery(q=question)))
+        finally:
+            _ask_in_flight["active"] = False
         await interaction.followup.send(_format_ask_answer(answer), ephemeral=True)
 
     organize_command: app_commands.Command[Any, ..., Any] = app_commands.Command(
@@ -288,7 +350,9 @@ def build_admin_commands(
         callback=ask_callback,
         allowed_contexts=_OWNER_ONLY_CONTEXTS,
     )
-    app_commands.describe(question="The question to ask")(ask_command)
+    app_commands.describe(question=f"The question to ask (max {_ASK_QUESTION_LIMIT} characters)")(
+        ask_command
+    )
 
     return (organize_command, status_command, search_command, ask_command)
 
@@ -376,6 +440,21 @@ def _format_run(record: RunRecord) -> str:
     return "\n".join(lines)
 
 
+def _ask_question_too_long(question: str) -> bool:
+    """Matches ``AskRequest.q``'s own bound (apps/api/src/tc_api/schemas.py) -
+    a question rejected by one surface is rejected by the other."""
+    return len(question) > _ASK_QUESTION_LIMIT
+
+
+def _ask_cooldown_remaining_seconds(last_started_at: dt.datetime, now: dt.datetime) -> float | None:
+    """Seconds still remaining on the cooldown, or ``None`` if it has
+    elapsed - a pure function so the cooldown math is testable without a
+    real Discord interaction (docs/adr/0003's "Ask proxy" amendment)."""
+    elapsed = (now - last_started_at).total_seconds()
+    remaining = _ASK_COOLDOWN_SECONDS - elapsed
+    return remaining if remaining > 0 else None
+
+
 def _truncate(text: str) -> str:
     if len(text) <= _MESSAGE_LIMIT:
         return text
@@ -404,6 +483,14 @@ def _format_ask_answer(answer: AskAnswer) -> str:
             "Ask is not enabled on this deployment (`TC_ASK_ENABLED=false`, "
             'docs/adr/0003\'s "Ask proxy" amendment). Try `/search` instead.'
         )
+    if answer.strict_unsupported:
+        header = "`/ask` can't honor filters yet (docs/DESIGN.md 7.6) - exact search instead:"
+        body = (
+            _format_search_page(answer.fallback, "exact")
+            if answer.fallback is not None
+            else "No results."
+        )
+        return _truncate(f"{header}\n{body}")
     if answer.degraded:
         return (
             "Ask is enabled, but Khoj could not answer right now - it may be unreachable, "

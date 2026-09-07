@@ -255,11 +255,22 @@ requirements.
 
 **Ask needs explicit setup on top of the `ai` Compose profile actually
 running (`docs/adr/0003`'s "Ask proxy" amendment):** it requires
-`TC_ASK_ENABLED=true` (default `false`) *and* Khoj's own chat model
-configured (`TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY`, blank by
-default) - two independent opt-ins, neither set by this project's own code,
-before any question reaches a live model. Leaving either at its default
-makes `/ask`/`/v1/ask` report `enabled: false` explicitly.
+`TC_ASK_ENABLED=true` (default `false`), `TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED=true`
+(default `false`, an explicit owner acknowledgment that the configured chat
+model's provider/retention policy has been reviewed), *and* Khoj's own chat
+model configured (`TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY`, blank by
+default) - three independent opt-ins, none set by this project's own code,
+before any question reaches a live model.
+
+These are not equivalent failures. `TC_ASK_ENABLED` is this project's own
+switch and is the only thing `enabled` reflects: leaving it at its default
+makes `/ask`/`/v1/ask` report `enabled: false` explicitly, with no request to
+Khoj at all. Leaving `TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED` at its default
+while `TC_ASK_ENABLED=true` fails startup outright (a misconfiguration, not a
+runtime state). Whether Khoj's *own* chat model is configured is not
+something this project's code can check in advance - the API only learns
+that when a chat call actually fails, at which point `TC_ASK_ENABLED=true`
+still reports `enabled: true, degraded: true`, not `enabled: false`.
 
 Backup and restore jobs and the future unified custom UI are not runnable
 yet. The `backup` Compose profile described in the design is likewise not

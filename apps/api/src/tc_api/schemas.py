@@ -11,7 +11,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from tc_domain.ask import AskAnswer, AskReference
+from tc_domain.ask import AskChunk, AskReference
 from tc_domain.search import SearchPage, SearchResult
 from tc_infrastructure.db.document_reader import DocumentDetail, DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
@@ -262,7 +262,25 @@ class KhojSyncResponse(BaseModel):
 
 
 class AskRequest(BaseModel):
+    """docs/DESIGN.md 10's ``POST /v1/ask`` body. Filter fields mirror
+    ``GET /v1/search``'s (docs/adr/0003's "Ask proxy" amendment, "Strict
+    filters"): any of them set means "strict" - Ask cannot honor a
+    structured filter today (Khoj's evidence-injection path is unverified),
+    so it returns the equivalent exact-search results instead of silently
+    querying Khoj's whole corpus (docs/DESIGN.md 7.6).
+    """
+
     q: str = Field(min_length=1, max_length=2_000, description="The question to ask")
+    phrase: str | None = Field(default=None, description="Exact, case-insensitive substring")
+    include: list[str] = Field(default_factory=list, description="Required words")
+    exclude: list[str] = Field(default_factory=list, description="Forbidden words")
+    entity_id: uuid.UUID | None = None
+    kind: str | None = Field(default=None, description="e.g. 'daily_digest', 'project', 'person'")
+    source: str | None = None
+    date_from: dt.date | None = None
+    date_to: dt.date | None = None
+    local_time_from: dt.time | None = None
+    local_time_to: dt.time | None = None
 
 
 class AskReferenceResponse(BaseModel):
@@ -275,23 +293,50 @@ class AskReferenceResponse(BaseModel):
         return cls(document_id=record.document_id, title=record.title, snippet=record.snippet)
 
 
-class AskResponse(BaseModel):
+class AskEvent(BaseModel):
+    """One newline-delimited JSON object of the ``POST /v1/ask`` response
+    stream (docs/DESIGN.md 7.6: "The gateway streams the answer").
+
+    ``enabled``/``degraded``/``strict_unsupported`` are constant across every
+    event of one call. Exactly one of ``delta`` (non-empty), ``references``
+    (not null), or ``fallback`` (not null) is the reason a given event
+    exists; the stream ends with exactly one event carrying ``done: true``.
+    """
+
     enabled: bool = Field(
         description="False when this deployment has not opted into Ask (docs/adr/0003)."
     )
     degraded: bool = Field(
         description="True when Ask is enabled but Khoj could not answer right now."
     )
-    answer: str | None
-    references: list[AskReferenceResponse]
+    strict_unsupported: bool = Field(
+        description="True when structured filters were requested and could not be honored; "
+        "see `fallback`."
+    )
+    delta: str = Field(default="", description="Incremental answer text.")
+    references: list[AskReferenceResponse] | None = Field(
+        default=None, description="The full, deduped citation list - sent once."
+    )
+    fallback: SearchResponse | None = Field(
+        default=None,
+        description="Exact-search results in place of an answer, when strict_unsupported.",
+    )
+    done: bool = Field(default=False, description="True on the final event of the stream.")
 
     @classmethod
-    def of(cls, answer: AskAnswer) -> AskResponse:
+    def of(cls, chunk: AskChunk) -> AskEvent:
         return cls(
-            enabled=answer.enabled,
-            degraded=answer.degraded,
-            answer=answer.answer,
-            references=[AskReferenceResponse.of(r) for r in answer.references],
+            enabled=chunk.enabled,
+            degraded=chunk.degraded,
+            strict_unsupported=chunk.strict_unsupported,
+            delta=chunk.text_delta,
+            references=(
+                [AskReferenceResponse.of(r) for r in chunk.references]
+                if chunk.references is not None
+                else None
+            ),
+            fallback=SearchResponse.of(chunk.fallback) if chunk.fallback is not None else None,
+            done=chunk.done,
         )
 
 

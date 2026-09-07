@@ -15,6 +15,10 @@ import uuid
 import pytest
 
 from tc_discord_bot.commands import (
+    _ASK_COOLDOWN_SECONDS,
+    _ASK_QUESTION_LIMIT,
+    _ask_cooldown_remaining_seconds,
+    _ask_question_too_long,
     _format_ask_answer,
     _format_run,
     _format_search_page,
@@ -251,22 +255,45 @@ def test_format_search_page_flags_degraded() -> None:
 
 
 def test_format_ask_answer_when_not_enabled() -> None:
-    answer = AskAnswer(enabled=False, degraded=False, answer=None, references=())
+    answer = AskAnswer(
+        enabled=False, degraded=False, strict_unsupported=False, answer=None, references=()
+    )
     text = _format_ask_answer(answer)
     assert "not enabled" in text.lower()
     assert "/search" in text
 
 
 def test_format_ask_answer_when_degraded() -> None:
-    answer = AskAnswer(enabled=True, degraded=True, answer=None, references=())
+    answer = AskAnswer(
+        enabled=True, degraded=True, strict_unsupported=False, answer=None, references=()
+    )
     text = _format_ask_answer(answer)
     assert "could not answer" in text.lower()
+
+
+def test_format_ask_answer_when_strict_unsupported_shows_the_fallback() -> None:
+    result = _search_result(title="Fallback Project")
+    answer = AskAnswer(
+        enabled=True,
+        degraded=False,
+        strict_unsupported=True,
+        answer=None,
+        references=(),
+        fallback=SearchPage(items=(result,), next_cursor=None),
+    )
+    text = _format_ask_answer(answer)
+    assert "Fallback Project" in text
+    assert "filters" in text.lower()
 
 
 def test_format_ask_answer_with_references() -> None:
     reference = AskReference(document_id=uuid.uuid4(), title="A Doc", snippet="…")
     answer = AskAnswer(
-        enabled=True, degraded=False, answer="The launch went well.", references=(reference,)
+        enabled=True,
+        degraded=False,
+        strict_unsupported=False,
+        answer="The launch went well.",
+        references=(reference,),
     )
     text = _format_ask_answer(answer)
     assert "The launch went well." in text
@@ -275,7 +302,26 @@ def test_format_ask_answer_with_references() -> None:
 
 
 def test_format_ask_answer_truncates_to_the_discord_message_limit() -> None:
-    answer = AskAnswer(enabled=True, degraded=False, answer="x" * 3000, references=())
+    answer = AskAnswer(
+        enabled=True, degraded=False, strict_unsupported=False, answer="x" * 3000, references=()
+    )
     text = _format_ask_answer(answer)
     assert len(text) <= 2000
     assert text.endswith("(truncated)")
+
+
+def test_ask_question_too_long_matches_the_api_bound() -> None:
+    assert _ask_question_too_long("x" * _ASK_QUESTION_LIMIT) is False
+    assert _ask_question_too_long("x" * (_ASK_QUESTION_LIMIT + 1)) is True
+
+
+def test_ask_cooldown_blocks_a_call_immediately_after_the_previous_one() -> None:
+    started = dt.datetime(2026, 9, 7, 12, 0, 0, tzinfo=dt.UTC)
+    remaining = _ask_cooldown_remaining_seconds(started, started)
+    assert remaining == _ASK_COOLDOWN_SECONDS
+
+
+def test_ask_cooldown_clears_once_the_window_elapses() -> None:
+    started = dt.datetime(2026, 9, 7, 12, 0, 0, tzinfo=dt.UTC)
+    later = started + dt.timedelta(seconds=_ASK_COOLDOWN_SECONDS + 1)
+    assert _ask_cooldown_remaining_seconds(started, later) is None

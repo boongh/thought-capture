@@ -31,7 +31,21 @@ function Invoke-Step {
     )
     Write-Host ""
     Write-Host "--- $Name" -ForegroundColor Cyan
-    & $Action
+    # Same PowerShell 5.1 quirk documented below for the compose config-sanity
+    # calls: a native command's stderr line becomes a terminating
+    # NativeCommandError under $ErrorActionPreference = "Stop", even at exit
+    # code 0 - `uv lock --check` writes its "Resolved N packages" line to
+    # stderr on every run, which was silently aborting this step before
+    # $LASTEXITCODE was ever checked. Relaxed to Continue for exactly the
+    # action's duration; $LASTEXITCODE is still checked explicitly below.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Action
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "FAIL: $Name (exit $LASTEXITCODE)"
     }

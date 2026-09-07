@@ -170,6 +170,7 @@ async def serve(settings: Settings) -> None:
         )
         khoj = HttpKhojClient(http, settings.khoj_base_url)
         hydrator = PostgresSemanticHydrator(sessions)
+        exact_search = PostgresExactSearch(sessions)
         admin_commands = build_admin_commands(
             organize=organize,
             windows=PostgresCaptureWindows(sessions),
@@ -179,8 +180,8 @@ async def serve(settings: Settings) -> None:
             owner_user_id=settings.discord_owner_user_id,
             digest_local_time=settings.digest_local_time,
             timezone=settings.workspace_timezone,
-            search=Search(PostgresExactSearch(sessions), khoj, hydrator),
-            ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
+            search=Search(exact_search, khoj, hydrator),
+            ask=AskQuestion(khoj, hydrator, exact_search, enabled=settings.ask_enabled),
         )
         client.attach_admin_commands(admin_commands, guild_id=settings.discord_guild_id)
 
