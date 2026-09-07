@@ -114,7 +114,36 @@ jobs:
       # TC_REQUIRE_CONTRACT makes the same skip a hard failure here, matching
       # how TC_REQUIRE_INTEGRATION already does for the database above.
       # -----------------------------------------------------------------
+      - name: Start the stub chat model
+        # tests/contract/khoj/stub_chat_model.py: a minimal OpenAI-compatible
+        # server so Khoj's own first-boot chat-model registration has a real
+        # (if fake) target to configure - without it, Khoj's chat interface
+        # stays unconfigured and the chat contract tests below would only be
+        # exercising the "not configured" degraded path, never a real answer.
+        run: |
+          nohup uv run uvicorn tests.contract.khoj.stub_chat_model:app \
+            --host 127.0.0.1 --port 8899 > stub-chat-model.log 2>&1 &
+          for _ in $(seq 1 20); do
+            if curl --silent --fail --max-time 2 http://127.0.0.1:8899/v1/models >/dev/null 2>&1; then
+              echo "Stub chat model is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Stub chat model did not become ready in time" >&2
+          cat stub-chat-model.log >&2
+          exit 1
+
       - name: Start Khoj ('ai' compose profile)
+        # TC_KHOJ_OPENAI_* points Khoj's own first-boot chat-model setup
+        # (khoj.utils.initialization._create_chat_configuration) at the stub
+        # above instead of leaving the chat interface unconfigured -
+        # host-gateway/host.docker.internal is what lets the khoj container
+        # reach a server running on the runner itself (deploy/compose/
+        # khoj.docker-compose.yml's `extra_hosts` on the khoj service).
+        env:
+          TC_KHOJ_OPENAI_BASE_URL: http://host.docker.internal:8899/v1
+          TC_KHOJ_OPENAI_API_KEY: stub-key
         run: |
           docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
             --profile ai up -d khoj-db khoj-init khoj

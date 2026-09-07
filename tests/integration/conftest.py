@@ -317,11 +317,16 @@ async def _api_client(
         api_bearer_token=API_TOKEN,
         workspace_timezone="Asia/Bangkok",
         ask_enabled=ask_enabled,
+        # The startup validator requires this alongside `ask_enabled=True`
+        # (docs/adr/0003's "Ask proxy" amendment, "Provider acknowledgment") -
+        # synthetic, test-only acknowledgment, not a real review.
+        ask_provider_retention_acknowledged=ask_enabled,
     )
 
     async with httpx.AsyncClient() as khoj_http:
         khoj = HttpKhojClient(khoj_http, UNREACHABLE_KHOJ_URL)
         hydrator = PostgresSemanticHydrator(app_session_factory)
+        exact_search = PostgresExactSearch(app_session_factory)
         context = ApiContext(
             settings=settings,
             capture=CaptureThought(
@@ -332,8 +337,8 @@ async def _api_client(
             reader=PostgresThoughtReader(app_session_factory),
             documents=PostgresDocumentReader(app_session_factory),
             entities=PostgresEntityReader(app_session_factory),
-            search=Search(PostgresExactSearch(app_session_factory), khoj, hydrator),
-            ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
+            search=Search(exact_search, khoj, hydrator),
+            ask=AskQuestion(khoj, hydrator, exact_search, enabled=settings.ask_enabled),
             llm_calls=PostgresLlmCallReader(app_session_factory),
             outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
             force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(app_session_factory)),

@@ -120,6 +120,34 @@ class SemanticHydrator(Protocol):
         ...
 
 
+def has_strict_filters(query: SearchQuery) -> bool:
+    """True when ``query`` carries a structured filter beyond free text
+    (docs/DESIGN.md 7.6, docs/adr/0003's "Ask proxy" amendment).
+
+    ``q`` itself is exempt: for Ask, ``q`` *is* the question, which Khoj's
+    chat model must see regardless. Every other field is a precision
+    constraint ("only documents of this kind", "only citing this entity")
+    that Ask cannot honor today - Khoj's evidence-injection path for
+    constraining chat retrieval was never verified (docs/DESIGN.md 7.6,
+    docs/adr/0003 "Contract spike findings" item 3) - so a caller (Ask) that
+    sees any of these set must not silently query Khoj's whole corpus instead
+    (docs/DESIGN.md 7.6: "it does not silently answer from an unconstrained
+    corpus").
+    """
+    return bool(
+        query.phrase
+        or query.include
+        or query.exclude
+        or query.entity_id is not None
+        or query.kind is not None
+        or query.source is not None
+        or query.date_from is not None
+        or query.date_to is not None
+        or query.local_time_from is not None
+        or query.local_time_to is not None
+    )
+
+
 def text_query_string(query: SearchQuery) -> str | None:
     """One combined query string from ``q``, ``include``, and ``exclude``.
 

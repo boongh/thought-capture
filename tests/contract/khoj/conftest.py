@@ -5,6 +5,13 @@ Start the server with:
     docker compose --env-file .env -f deploy/compose/docker-compose.yml \
       -f deploy/compose/khoj.docker-compose.yml --profile ai up -d
 
+`tests/contract/khoj/test_khoj_chat.py` additionally needs Khoj configured
+with a real (if stubbed) chat model - Khoj only registers one at its own
+first `--non-interactive` boot, so a volume that has ever booted without
+`TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY` set has already decided it
+has none. See `tests/contract/khoj/stub_chat_model.py`'s docstring for the
+full up-fresh sequence.
+
 A connection failure is deliberately allowed to propagate as an error, the
 same choice `tests/integration/conftest.py` makes for PostgreSQL: a skip
 would let an unreachable Khoj produce a green run.

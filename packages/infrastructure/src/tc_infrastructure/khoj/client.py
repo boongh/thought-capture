@@ -5,24 +5,45 @@ Endpoints and shapes confirmed against a real running
 spike), not inferred from documentation alone. No auth header is sent: Khoj
 runs ``--anonymous-mode``, loopback-only (docs/adr/0003's auth-mode
 decision) - the base URL is the only configuration this adapter needs.
+
+``chat``'s streaming wire format was read directly from khoj-ai/khoj's source
+at the pinned tag, not observed live (docs/adr/0003's "Ask proxy" amendment
+explains why that is a different, weaker evidence standard than the rest of
+this adapter, and names the follow-up contract test that closes the gap):
+``ChatEvent`` (``src/khoj/processor/conversation/utils.py``) delimits each
+event with ``END_EVENT = "␃🔚␗"``; a ``MESSAGE`` event's payload is the raw
+answer-text delta itself, every other event type is JSON
+``{"type": ..., "data": ...}``. This adapter only needs three of those event
+types: ``metadata`` (carries Khoj's own ``conversationId``, needed for the
+delete-after-use retention fix below), ``references`` (the grounding notes),
+and the un-typed raw-text ``message`` deltas.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import AsyncIterator
+
 import httpx
 
 from tc_domain.khoj_ports import (
+    KhojChatChunk,
     KhojChatReference,
-    KhojChatResult,
     KhojIndexFile,
     KhojSearchResult,
     KhojUnavailableError,
 )
 
+logger = logging.getLogger(__name__)
+
 REQUEST_TIMEOUT_SECONDS = 30.0
 # /api/chat can involve a live LLM call once Khoj has a chat model configured
 # (docs/adr/0003 finding 4 and its "Ask proxy" amendment); generous relative
 # to the search/content endpoints, which never call out to a model at all.
+# Applies per network read while streaming, not to the whole conversation -
+# httpx's default timeout shape (a slow-starting model does not itself time
+# out a call that is otherwise still receiving chunks).
 CHAT_REQUEST_TIMEOUT_SECONDS = 60.0
 
 # Every file this adapter ever sends is our own generated Markdown export
@@ -35,6 +56,11 @@ CONTENT_TYPE = "markdown"
 # undeployed anyway (docs/adr/0003 decision 5), and this makes that explicit
 # at the request level too, not just by omission of those services.
 _NOTES_MODE_PREFIX = "/notes"
+
+# khoj.processor.conversation.utils.ChatEvent.END_EVENT, verified at the
+# pinned tag - a deliberately unusual delimiter unlikely to appear in real
+# answer text.
+_END_EVENT = "␃\U0001f51a␗"
 
 
 class HttpKhojClient:
@@ -104,65 +130,164 @@ class HttpKhojClient:
             # TypeError that a caller's `except KhojUnavailableError` would miss.
             raise KhojUnavailableError(f"Khoj search returned an unexpected shape: {exc}") from exc
 
-    async def chat(self, question: str, *, limit: int = 5) -> KhojChatResult:
-        # Request shape (q/n/stream/create_new) verified against
-        # `ChatRequestBody` and the non-streaming branch of `POST /api/chat`
-        # in khoj's own source at the exact pinned tag (docs/adr/0003's "Ask
-        # proxy" amendment) - `stream=False` returns a plain JSON body
-        # instead of an SSE stream, which this synchronous adapter needs.
+    async def chat(self, question: str, *, limit: int = 5) -> AsyncIterator[KhojChatChunk]:
         # `create_new=True` starts a fresh server-side conversation on every
-        # call: this project does not track `conversation_id` on its own side
+        # call: this project does not track `conversation_id` across calls
         # (Ask is scoped to single-turn Q&A), so reusing Khoj's own
         # anonymous-mode default conversation would silently accumulate
-        # unrelated history across unrelated questions instead.
+        # unrelated history across unrelated questions. `stream=True` is what
+        # the accepted Ask/API contract requires (docs/DESIGN.md 7.6) and is
+        # also the only response shape that surfaces Khoj's own
+        # `conversationId` (the "metadata" event below) - needed to delete
+        # the conversation immediately after use, see `_delete_conversation`.
         payload = {
             "q": f"{_NOTES_MODE_PREFIX} {question}",
             "n": limit,
-            "stream": False,
+            "stream": True,
             "create_new": True,
         }
+        conversation_id: str | None = None
+        buffer = ""
         try:
-            response = await self._http.post(
+            async with self._http.stream(
+                "POST",
                 f"{self._base_url}/api/chat",
                 json=payload,
                 timeout=CHAT_REQUEST_TIMEOUT_SECONDS,
+            ) as response:
+                response.raise_for_status()
+                async for text in response.aiter_text():
+                    buffer += text
+                    while _END_EVENT in buffer:
+                        raw_event, buffer = buffer.split(_END_EVENT, 1)
+                        if not raw_event:
+                            continue
+                        conversation_id, chunk = _parse_chat_event(raw_event, conversation_id)
+                        if chunk is not None:
+                            yield chunk
+                if buffer.strip():
+                    # A stream that ends without a final END_EVENT delimiter
+                    # still has one more event's worth of content to parse -
+                    # matches `read_chat_stream`'s own "process any remaining
+                    # data in the buffer" step.
+                    conversation_id, chunk = _parse_chat_event(buffer, conversation_id)
+                    if chunk is not None:
+                        yield chunk
+        except httpx.HTTPError as exc:
+            raise KhojUnavailableError(f"Khoj chat failed: {exc}") from exc
+        finally:
+            if conversation_id is not None:
+                await self._delete_conversation(conversation_id)
+
+        yield KhojChatChunk(done=True)
+
+    async def _delete_conversation(self, conversation_id: str) -> None:
+        """Ask's own retention policy (docs/adr/0003's "Ask proxy" amendment,
+        "Conversation retention"): leave no server-side conversation behind
+        Khoj's anonymous default user after a single Ask call - an additional
+        copy of personal-memory content this project's own backup/export/
+        retention story (docs/DESIGN.md 12.3, 14.3) does not otherwise cover.
+        Best-effort: a cleanup failure must not mask the answer (or lack of
+        one) the caller already has, so this logs rather than raises.
+        """
+        try:
+            response = await self._http.delete(
+                f"{self._base_url}/api/chat/history",
+                params={"conversation_id": conversation_id},
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise KhojUnavailableError(f"Khoj chat failed: {exc}") from exc
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise KhojUnavailableError(f"Khoj chat returned a non-JSON response: {exc}") from exc
-
-        try:
-            answer = data["response"]
-            context = (data.get("references") or {}).get("context") or []
-            references = tuple(
-                KhojChatReference(
-                    compiled=item["compiled"],
-                    filename=item.get("file", ""),
-                    heading=item.get("heading") or "",
-                )
-                for item in context
-            )
-        except (KeyError, TypeError) as exc:
-            raise KhojUnavailableError(f"Khoj chat returned an unexpected shape: {exc}") from exc
-
-        if not isinstance(answer, str):
-            # khoj's own `MessageProcessor.handle_json_response` returns a
-            # dict rather than text for an image-generation or error-detail
-            # payload. Neither shape is a usable answer for this project's
-            # text-only, notes-only Ask - and what an *unconfigured* chat
-            # model actually returns was live-verified separately (a plain
-            # HTTP 500, already handled by `raise_for_status()` above, not
-            # this branch) - this remains a second, independent defense for
-            # a *configured-but-degenerate* response, deliberately
-            # conservative: any non-string "response" degrades exactly like
-            # an unreachable Khoj, rather than being guessed at.
-            raise KhojUnavailableError(
-                f"Khoj chat returned a non-text response: {type(answer).__name__}"
+            logger.warning(
+                "khoj_chat.conversation_cleanup_failed",
+                extra={"error_class": type(exc).__name__},
             )
 
-        return KhojChatResult(response=answer, references=references)
+
+def _try_parse_json_object(raw: str) -> dict[str, object] | None:
+    """Mirrors khoj's own `MessageProcessor.convert_message_chunk_to_json`
+    heuristic: brace-delimited and JSON-parseable as an object, or this is
+    raw message text, not a typed event."""
+    stripped = raw.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _parse_chat_event(
+    raw_event: str, conversation_id: str | None
+) -> tuple[str | None, KhojChatChunk | None]:
+    """Parse one `END_EVENT`-delimited piece of khoj's streaming response.
+
+    Returns the (possibly updated) `conversation_id` and a chunk to yield, or
+    `None` for an event this adapter does not surface - docs/adr/0003's "Ask
+    proxy" amendment only needs `metadata` (conversation id), `references`
+    (grounding notes), and raw message text; `start_llm_response`,
+    `end_llm_response`, `usage`, `end_response`, `status`, `thought`,
+    `generated_assets`, and `interrupt` carry nothing this project's Ask
+    needs.
+    """
+    parsed = _try_parse_json_object(raw_event)
+    if parsed is None:
+        # Not JSON-shaped at all: khoj's own `send_event` yields a MESSAGE
+        # event's payload unwrapped (unlike every other event type), so an
+        # un-typed chunk is always a raw answer-text delta.
+        return conversation_id, KhojChatChunk(text_delta=raw_event)
+
+    event_type = parsed.get("type")
+    data = parsed.get("data")
+
+    if event_type == "metadata":
+        if isinstance(data, dict):
+            candidate = data.get("conversationId")
+            if isinstance(candidate, str) and candidate:
+                conversation_id = candidate
+        return conversation_id, None
+
+    if event_type == "references":
+        return conversation_id, KhojChatChunk(references=_parse_chat_references(data))
+
+    if event_type == "message":
+        # A JSON-shaped message chunk happens too (the answer text itself
+        # starts with "{" and ends with "}") - use `data` as the text delta
+        # the same way khoj's own MessageProcessor does, rather than
+        # silently dropping it.
+        text = data if isinstance(data, str) else json.dumps(data)
+        return conversation_id, KhojChatChunk(text_delta=text)
+
+    return conversation_id, None
+
+
+def _parse_chat_references(data: object) -> tuple[KhojChatReference, ...]:
+    if not isinstance(data, dict):
+        raise KhojUnavailableError(
+            f"Khoj chat 'references' event had an unexpected shape: {type(data).__name__}"
+        )
+    context = data.get("context")
+    if context is None:
+        return ()
+    if not isinstance(context, list):
+        # The exact malformed shape independent review caught: a prior
+        # version assumed `references`/`context` were always dict/list and
+        # let a mismatch surface as a bare, uncaught `AttributeError` instead
+        # of degrading like every other malformed-response case.
+        raise KhojUnavailableError(
+            f"Khoj chat 'references' context was not a list: {type(context).__name__}"
+        )
+    try:
+        return tuple(
+            KhojChatReference(
+                compiled=item["compiled"],
+                filename=item.get("file", ""),
+                heading=item.get("heading") or "",
+            )
+            for item in context
+        )
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise KhojUnavailableError(
+            f"Khoj chat returned an unexpected reference shape: {exc}"
+        ) from exc

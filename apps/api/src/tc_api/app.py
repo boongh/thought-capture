@@ -69,6 +69,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
 
     khoj = HttpKhojClient(http, settings.khoj_base_url)
     hydrator = PostgresSemanticHydrator(sessions)
+    exact_search = PostgresExactSearch(sessions)
 
     return ApiContext(
         settings=settings,
@@ -76,8 +77,8 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         reader=PostgresThoughtReader(sessions),
         documents=PostgresDocumentReader(sessions),
         entities=PostgresEntityReader(sessions),
-        search=Search(PostgresExactSearch(sessions), khoj, hydrator),
-        ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
+        search=Search(exact_search, khoj, hydrator),
+        ask=AskQuestion(khoj, hydrator, exact_search, enabled=settings.ask_enabled),
         llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(sessions)),

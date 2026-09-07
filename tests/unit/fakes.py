@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import uuid
+from collections.abc import AsyncIterator
 
 from tc_domain.capture import (
     AppendOutcome,
@@ -26,7 +27,7 @@ from tc_domain.digest import DigestContent
 from tc_domain.digest_ports import PendingDigest
 from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound, KhojExportNotFound
 from tc_domain.khoj_export import DocumentExport
-from tc_domain.khoj_ports import KhojChatResult, KhojIndexFile, KhojSearchResult
+from tc_domain.khoj_ports import KhojChatChunk, KhojIndexFile, KhojSearchResult
 from tc_domain.khoj_sync_ports import PendingKhojSync
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
 from tc_domain.search import SearchPage, SearchQuery, SearchResult
@@ -329,14 +330,14 @@ class FakeKhojPort:
         self,
         *,
         search_results: tuple[KhojSearchResult, ...] = (),
-        chat_result: KhojChatResult | None = None,
+        chat_chunks: tuple[KhojChatChunk, ...] = (),
         raises: Exception | None = None,
     ) -> None:
         self.indexed: list[tuple[KhojIndexFile, ...]] = []
         self.deleted: list[tuple[str, ...]] = []
         self.search_results = search_results
         self.search_queries: list[str] = []
-        self.chat_result = chat_result
+        self.chat_chunks = chat_chunks
         self.chat_calls: list[tuple[str, int]] = []
         self.raises = raises
 
@@ -356,12 +357,12 @@ class FakeKhojPort:
         self.search_queries.append(q)
         return self.search_results
 
-    async def chat(self, question: str, *, limit: int = 5) -> KhojChatResult:
+    async def chat(self, question: str, *, limit: int = 5) -> AsyncIterator[KhojChatChunk]:
         self.chat_calls.append((question, limit))
         if self.raises is not None:
             raise self.raises
-        assert self.chat_result is not None
-        return self.chat_result
+        for chunk in self.chat_chunks:
+            yield chunk
 
 
 class FakeKhojIndexRecorder:

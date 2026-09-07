@@ -131,6 +131,12 @@ services:
       - khoj-home:/khoj-home
     security_opt:
       - no-new-privileges:true
+    # Docker Desktop (Mac/Windows) resolves host.docker.internal on its own;
+    # the plain Linux Engine CI runs on does not unless told to - this makes
+    # a host-run TC_KHOJ_OPENAI_BASE_URL (e.g. the contract-test stub chat
+    # model) reachable identically in both places.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   khoj-db-data:
