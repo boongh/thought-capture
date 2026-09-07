@@ -1,17 +1,19 @@
-"""Owner-only slash commands: ``/organize`` and ``/status``.
+"""Owner-only slash commands: ``/organize``, ``/status``, ``/search``, ``/ask``.
 
 Discord slash commands map to use cases directly, not HTTP loopback calls
 (docs/DESIGN.md 5.1, 10) - ``organize`` here is the exact ``OrganizeWindow``
-callable the worker's own scheduler drives, not a second implementation.
+callable the worker's own scheduler drives, and ``search``/``ask`` are the
+exact ``Search``/``AskQuestion`` use cases ``apps/api`` drives, not second
+implementations.
 
 Message capture is scoped by guild/channel (docs/DESIGN.md 4.1's
 ``CaptureAllowlist``, ``adapter.py``/``client.py``). These commands are a
-different concern - administrative operations that must work in a DM
-regardless of which guild/channel is configured for capture - so each command
-here checks the caller's Discord user id directly against the configured
-owner, rather than reusing the channel-scoped capture allowlist, and is
-explicitly registered as usable from a DM (``allowed_contexts`` below) as
-well as a guild.
+different concern - operations that must work in a DM regardless of which
+guild/channel is configured for capture, and that read or trigger processing
+over the owner's personal memory content - so each command here checks the
+caller's Discord user id directly against the configured owner, rather than
+reusing the channel-scoped capture allowlist, and is explicitly registered as
+usable from a DM (``allowed_contexts`` below) as well as a guild.
 
 Registered as *global* commands (``build_admin_commands`` below), because a
 DM-only deployment (docs/DESIGN.md 4.1: "leave both blank for DM-only
@@ -19,12 +21,17 @@ capture") has no guild to scope a faster guild-only registration to; see
 ``CaptureClient._sync_commands`` (client.py) for the guild-copy-for-instant-
 availability-in-dev-plus-global-for-DMs sync strategy.
 
-Scope note (2026-09-02): only ``/organize`` and ``/status`` are implemented.
-``/search`` depends on the exact-search slice (still an open PR at the time
-of writing), ``/ask`` is blocked on the Khoj-chat-credential privacy decision
-ADR-0003 explicitly defers to the owner, and ``/undo`` has no restore/revert
-use case built yet anywhere in the codebase. Building any of those is new,
-separately-scoped work, not part of this slice.
+Scope note (docs/adr/0003's "Ask proxy" amendment, 2026-09-07): ``/search``
+supports all three modes ``tc_application.search.Search`` implements
+(``exact``, ``semantic``, ``hybrid``) - semantic/hybrid return real results
+once Khoj is running and synced (``POST /v1/admin/khoj-sync`` enqueues that;
+no Discord command for it, matching the API-only precedent
+``docs/DESIGN.md`` 10 sets for ``/v1/admin/export``). ``/ask`` answers only
+when the deployment has opted into ``TC_ASK_ENABLED`` *and* Khoj itself has a
+chat model configured (docs/adr/0003 finding 4); otherwise it says so
+explicitly rather than pretending no memory exists. ``/undo`` still has no
+restore/revert use case built anywhere in the codebase - not part of this
+slice either.
 """
 
 from __future__ import annotations
@@ -38,13 +45,25 @@ from typing import Any
 import discord
 from discord import app_commands
 
+from tc_application.ask import AskQuestion
 from tc_application.organize import OrganizeWindow
+from tc_application.search import Search, UnsupportedSearchModeError
+from tc_domain.ask import AskAnswer
 from tc_domain.capture import WorkspaceId
+from tc_domain.search import SearchPage, SearchQuery
 from tc_domain.windows import CaptureWindow, most_recent_cutoff, previous_cutoff_before
 from tc_infrastructure.db.run_reader import PostgresRunReader, RunRecord
 from tc_infrastructure.db.windows import PostgresCaptureWindows
 
 logger = logging.getLogger(__name__)
+
+# Discord hard-caps a single message (including an interaction followup) at
+# 2000 characters. These commands send plain text, not the digest's
+# section-boundary splitting (docs/DESIGN.md 4.2) - a deliberate scope cut
+# for diagnostic/query replies, not an oversight.
+_MESSAGE_LIMIT = 2000
+_SEARCH_RESULT_LIMIT = 5
+_SEARCH_MODES = ("exact", "semantic", "hybrid")
 
 # A DM-usable command must allow the DM context explicitly (discord.py 2.7's
 # default leaves this to the application's Developer Portal installation
@@ -86,9 +105,12 @@ def build_admin_commands(
     owner_user_id: int,
     digest_local_time: dt.time,
     timezone: str,
+    search: Search,
+    ask: AskQuestion,
     clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
 ) -> tuple[app_commands.Command[Any, ..., Any], ...]:
-    """Builds the ``/organize`` and ``/status`` commands, ready to register on a tree."""
+    """Builds the ``/organize``, ``/status``, ``/search``, and ``/ask`` commands,
+    ready to register on a tree."""
 
     async def organize_callback(
         interaction: discord.Interaction,
@@ -193,6 +215,40 @@ def build_admin_commands(
             return
         await interaction.followup.send(_format_run(record), ephemeral=True)
 
+    async def search_callback(
+        interaction: discord.Interaction, query: str, mode: str = "exact"
+    ) -> None:
+        if await _reject_if_not_owner(interaction, owner_user_id):
+            return
+        if mode not in _SEARCH_MODES:
+            await interaction.response.send_message(
+                f"`mode` must be one of {', '.join(_SEARCH_MODES)}.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            page = await search(
+                workspace_id, SearchQuery(q=query, limit=_SEARCH_RESULT_LIMIT), mode=mode
+            )
+        except UnsupportedSearchModeError:
+            await interaction.followup.send(
+                f"`mode` must be one of {', '.join(_SEARCH_MODES)}.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(_format_search_page(page, mode), ephemeral=True)
+
+    async def ask_callback(interaction: discord.Interaction, question: str) -> None:
+        if await _reject_if_not_owner(interaction, owner_user_id):
+            return
+
+        # Ask proxies to Khoj's chat model (docs/adr/0003's "Ask proxy"
+        # amendment), which can take longer than the 3-second interaction-
+        # acknowledgement budget - same reasoning as `/organize`'s defer.
+        await interaction.response.defer(ephemeral=True)
+        answer = await ask(workspace_id, question)
+        await interaction.followup.send(_format_ask_answer(answer), ephemeral=True)
+
     organize_command: app_commands.Command[Any, ..., Any] = app_commands.Command(
         name="organize",
         description="Force-organize a capture window now (defaults to the current open window).",
@@ -215,7 +271,26 @@ def build_admin_commands(
         status_command
     )
 
-    return (organize_command, status_command)
+    search_command: app_commands.Command[Any, ..., Any] = app_commands.Command(
+        name="search",
+        description="Search captured memory (exact by default; semantic/hybrid need a Khoj sync).",
+        callback=search_callback,
+        allowed_contexts=_OWNER_ONLY_CONTEXTS,
+    )
+    app_commands.describe(
+        query="Free text to search for",
+        mode="exact (default, always available), semantic, or hybrid",
+    )(search_command)
+
+    ask_command: app_commands.Command[Any, ..., Any] = app_commands.Command(
+        name="ask",
+        description="Ask a question over generated memory (requires Ask to be configured).",
+        callback=ask_callback,
+        allowed_contexts=_OWNER_ONLY_CONTEXTS,
+    )
+    app_commands.describe(question="The question to ask")(ask_command)
+
+    return (organize_command, status_command, search_command, ask_command)
 
 
 class _WindowInputError(ValueError):
@@ -299,3 +374,46 @@ def _format_run(record: RunRecord) -> str:
     if record.status == "failed":
         lines.append(f"Error: `{record.error_code}` - {record.error_detail}")
     return "\n".join(lines)
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MESSAGE_LIMIT:
+        return text
+    marker = "\n… (truncated)"
+    return text[: _MESSAGE_LIMIT - len(marker)] + marker
+
+
+def _format_search_page(page: SearchPage, mode: str) -> str:
+    header = f"**{mode}** search"
+    if page.degraded:
+        header += " — degraded: the semantic channel was unavailable"
+    if not page.items:
+        return f"{header}\nNo results."
+
+    lines = [header]
+    for result in page.items:
+        channels = "+".join(result.channels) if result.channels else mode
+        lines.append(f"`#{result.document_id}` **{result.title}** ({result.kind}, {channels})")
+        lines.append(result.snippet)
+    return _truncate("\n".join(lines))
+
+
+def _format_ask_answer(answer: AskAnswer) -> str:
+    if not answer.enabled:
+        return (
+            "Ask is not enabled on this deployment (`TC_ASK_ENABLED=false`, "
+            'docs/adr/0003\'s "Ask proxy" amendment). Try `/search` instead.'
+        )
+    if answer.degraded:
+        return (
+            "Ask is enabled, but Khoj could not answer right now - it may be unreachable, "
+            "or have no chat model configured (docs/adr/0003 finding 4)."
+        )
+
+    lines = [answer.answer or "(no answer text)"]
+    if answer.references:
+        lines.append("")
+        lines.append("**References:**")
+        for reference in answer.references:
+            lines.append(f"`#{reference.document_id}` {reference.title}")
+    return _truncate("\n".join(lines))

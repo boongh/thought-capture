@@ -28,6 +28,7 @@ from sqlalchemy.pool import NullPool
 
 from tc_api.app import create_app
 from tc_api.dependencies import ApiContext
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.khoj_sync import ForceKhojSync
 from tc_application.search import Search
@@ -283,7 +284,10 @@ def unique_message_id() -> str:
 
 
 async def _api_client(
-    app_session_factory: async_sessionmaker[AsyncSession], identity: tuple[uuid.UUID, uuid.UUID]
+    app_session_factory: async_sessionmaker[AsyncSession],
+    identity: tuple[uuid.UUID, uuid.UUID],
+    *,
+    ask_enabled: bool = False,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """The real app, wired to the test database with a known bearer token.
 
@@ -309,10 +313,15 @@ async def _api_client(
     """
     workspace_id, user_id = identity
     settings = Settings(
-        _env_file=None, api_bearer_token=API_TOKEN, workspace_timezone="Asia/Bangkok"
+        _env_file=None,
+        api_bearer_token=API_TOKEN,
+        workspace_timezone="Asia/Bangkok",
+        ask_enabled=ask_enabled,
     )
 
     async with httpx.AsyncClient() as khoj_http:
+        khoj = HttpKhojClient(khoj_http, UNREACHABLE_KHOJ_URL)
+        hydrator = PostgresSemanticHydrator(app_session_factory)
         context = ApiContext(
             settings=settings,
             capture=CaptureThought(
@@ -323,11 +332,8 @@ async def _api_client(
             reader=PostgresThoughtReader(app_session_factory),
             documents=PostgresDocumentReader(app_session_factory),
             entities=PostgresEntityReader(app_session_factory),
-            search=Search(
-                PostgresExactSearch(app_session_factory),
-                HttpKhojClient(khoj_http, UNREACHABLE_KHOJ_URL),
-                PostgresSemanticHydrator(app_session_factory),
-            ),
+            search=Search(PostgresExactSearch(app_session_factory), khoj, hydrator),
+            ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
             llm_calls=PostgresLlmCallReader(app_session_factory),
             outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
             force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(app_session_factory)),
@@ -378,4 +384,17 @@ async def api_fresh(
     shared workspace.
     """
     async for client in _api_client(app_session_factory, fresh_identity):
+        yield client
+
+
+@pytest.fixture
+async def api_fresh_ask_enabled(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Like ``api_fresh``, but with ``TC_ASK_ENABLED=true`` (docs/adr/0003's
+    "Ask proxy" amendment) - for asserting ``/v1/ask`` actually calls Khoj
+    (and degrades, since ``UNREACHABLE_KHOJ_URL`` is still used) rather than
+    short-circuiting on ``enabled: false``."""
+    async for client in _api_client(app_session_factory, fresh_identity, ask_enabled=True):
         yield client
