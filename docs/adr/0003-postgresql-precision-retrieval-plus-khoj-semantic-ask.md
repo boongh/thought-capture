@@ -367,3 +367,122 @@ for a deviation from an already-accepted pipeline step's stated behavior;
 (matching this document's own precedent of not silently rewriting
 accepted design text) with this ADR as the authoritative gloss on what "the
 run" refers to and how failure is actually tracked.
+
+## Ask proxy: gated resolution of finding 4 (2026-09-07, slice 20)
+
+Finding 4 above left Ask's privacy question explicitly undecided: `POST
+/api/chat` needs Khoj's own configured chat model, so a question and its
+retrieved note content would go to whatever model Khoj is configured with -
+outside this project's own OpenRouter adapter and `docs/adr/0006`'s
+safe/custom-mode controls entirely. Slices 18/19 (index sync, hybrid search)
+both deliberately left this deferred; this section is slice 20's decision.
+
+**Decision.** The same two-mode pattern `docs/adr/0006` already established
+for organize/select applies here, not a new mechanism: an explicit,
+greppable, default-off gate rather than a silent default in either
+direction.
+
+- **`TC_ASK_ENABLED`** (`Settings.ask_enabled`, default `false`) is this
+  project's own gate. `tc_application.ask.AskQuestion` is constructed with
+  `enabled=` resolved once at composition time (`apps/api/src/tc_api/app.py`,
+  `apps/discord_bot/src/tc_discord_bot/__main__.py`) - the same
+  build-time-resolved-value pattern `OrganizeWindow` already uses instead of
+  reading `Settings` itself (`docs/DESIGN.md` 5.3). When `False`,
+  `AskAnswer.enabled=False` and no call to Khoj is made at all.
+- **Khoj's own chat-model configuration** (finding 4) is a second,
+  independent gate this project's code never sets:
+  `TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY` (blank by default,
+  `env.example`) pass straight through to the `khoj` container's
+  `OPENAI_BASE_URL`/`OPENAI_API_KEY`, which Khoj's own `--non-interactive`
+  first-boot setup (`khoj.utils.initialization._create_chat_configuration`,
+  verified from source at the pinned tag `2.0.0-beta.28`) reads to
+  auto-register a chat model. This can point at a local server (Ollama,
+  vLLM, LM Studio) or at OpenRouter using `docs/adr/0006`'s own safe-mode
+  reviewed-model/ZDR discipline - the choice, the credential, and the model
+  all remain entirely the operator's.
+
+Both must be true before any question reaches a live model. Leaving either
+at its default keeps `/v1/ask` and Discord `/ask` reporting `enabled: false`
+rather than guessing, and `KhojUnavailableError` (Khoj unreachable, *or* -
+per finding 4 - Khoj reachable but with no chat model configured, since this
+project cannot distinguish those from the outside without guessing at
+Khoj's own error shape) maps to `degraded: true`, never a fabricated answer.
+
+**`/api/chat`'s request/response shape.** Not part of this ADR's original
+contract spike (finding 4 only observed the *absence* of a configured
+model). `ChatRequestBody` (request: `q`, `n`, `stream`, `create_new`, ...)
+and the non-streaming branch of `POST /api/chat` (response:
+`{"response", "references": {"context": [...]}, "usage", ...}`, where each
+`context` item carries a `"file"` key in the same convention as
+`/api/search`'s `additional.file`) were read directly from
+`khoj-ai/khoj`'s source at the pinned tag - a different evidence standard
+than this ADR's live-container spike for `/api/search`/`/api/content`, named
+here so it is not mistaken for the same level of verification. The query is
+prefixed `/notes ` to force Khoj's notes-only retrieval command and skip
+online search/code execution (both undeployed anyway, decision 5 above).
+
+**Live-verified separately:** with the pinned image running and no
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` set, `POST /api/chat` returns a plain
+`500 Internal Server Error` with no JSON body - not a `200` with an
+error-shaped payload. `HttpKhojClient.chat`'s `response.raise_for_status()`
+already converts this to `KhojUnavailableError` correctly, with no special
+case needed for the unconfigured path specifically.
+
+**Reference resolution.** `AskQuestion` resolves each Khoj citation back to
+a document through `SemanticHydrator` - the identical workspace-scoped,
+filter-re-checked, current-revision-only path `Search._semantic_results`
+already uses for search hits, not a second lookup mechanism. Filenames are
+deduped before hydrating and again while building the reference list: Khoj
+can chunk one uploaded document into more than one indexed entry sharing the
+same filename and cite more than one chunk in the same answer, which would
+otherwise return the same `AskReference` twice - the identical shape as a
+known, separate issue in `Search._semantic_results`'s own consumption of
+Khoj hits (see "Known gap" below).
+
+**Known limitation, shared with the merged search code, not new here.**
+`AskAnswer.answer` itself - Khoj's free-text prose - carries no workspace
+check of its own; only the structured `references` list is re-resolved and
+workspace-filtered through `SemanticHydrator`. `AskQuestion.__call__` calls
+`KhojPort.chat` with no `workspace_id` parameter at all, the same shape
+`Search._semantic_results`'s existing `khoj.search()` call already has.
+Search is safe because a raw Khoj `entry` is discarded entirely and only
+hydrator-resolved `SearchResult`s reach the caller; Ask's answer text has no
+equivalent discard step, since the prose itself *is* the deliverable. Under
+`docs/DESIGN.md`'s single-workspace-per-deployment model (section 6, "single-
+user first, workspace-scoped always" - one Khoj instance holds exactly one
+workspace's content today) this is unreachable, not a live gap. It becomes
+one if a future deployment ever shares one Khoj index across workspaces -
+tracked as a prerequisite for that change, not a defect in this one.
+
+**Discord.** `/search` and `/ask` are registered the same way
+`/organize`/`/status` already are (`_reject_if_not_owner`,
+`_OWNER_ONLY_CONTEXTS` allowing DM and guild) - arguably a stronger case
+than administrative commands, since these read or proxy the owner's own
+memory content rather than only trigger a job. `/ask` reports
+`enabled`/`degraded` in plain language rather than Discord rendering a raw
+problem document.
+
+**Known gap, not part of this slice's fix.** `tc_application.search.Search
+._semantic_results` (slice 19) passes Khoj's raw hit list to
+`fuse_rrf`/`SearchPage.items` without deduping by filename first. Because a
+single uploaded document can legitimately produce more than one Khoj hit
+(chunked ingestion), this can duplicate a result in `mode=semantic` and
+inflate its fused score in `mode=hybrid`. `AskQuestion` (this slice) dedupes
+its own consumption of Khoj hits to avoid the identical defect, but does not
+fix `Search`'s - that is flagged separately for its own review rather than
+folded into this change, since `Search`/`fuse_rrf` are already-merged,
+already-reviewed code this slice does not otherwise touch.
+
+**Verification.** `tests/unit/test_ask.py`: `enabled=False` makes zero calls
+to `KhojPort`; `KhojUnavailableError` maps to `degraded=True`; references
+are resolved via `SemanticHydrator` and deduped by filename.
+`tests/unit/test_khoj_client_chat.py`: `HttpKhojClient.chat` against a
+mocked `httpx` transport - the exact request body sent, correct parsing of
+the verified response shape, and a non-string `"response"` raising
+`KhojUnavailableError`. `tests/integration/test_api_ask.py`: `/v1/ask`
+through the real ASGI app against real PostgreSQL, including a real
+(unreachable-in-CI) `HttpKhojClient` so the degrade path is genuine. All of
+`ruff format --check`/`ruff check`/`mypy`/`pytest -m unit`/`pytest -m
+integration`/`pytest -m contract` pass - see the pull request for exact
+counts. Independent review (`.claude/agents/code-reviewer.md`) ran against
+this slice's diff before merge.

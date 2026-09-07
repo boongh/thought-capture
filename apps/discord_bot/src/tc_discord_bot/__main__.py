@@ -15,9 +15,11 @@ import uuid
 
 import httpx
 
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.digest_delivery import DeliverDigests
 from tc_application.organize import JournalFactory, OrganizeWindow
+from tc_application.search import Search
 from tc_application.structured import JournalWriter
 from tc_discord_bot.client import CaptureClient
 from tc_discord_bot.commands import build_admin_commands
@@ -39,9 +41,12 @@ from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.run_reader import PostgresRunReader
+from tc_infrastructure.db.search_reader import PostgresExactSearch
+from tc_infrastructure.db.semantic_hydrator import PostgresSemanticHydrator
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
 from tc_infrastructure.db.windows import PostgresCaptureWindows
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.llm.factory import build_organize_provider, build_select_provider
 from tc_infrastructure.runtime import run
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
@@ -163,6 +168,8 @@ async def serve(settings: Settings) -> None:
             ),
             reasoning_effort=settings.reasoning_effort_for(settings.model_organize),
         )
+        khoj = HttpKhojClient(http, settings.khoj_base_url)
+        hydrator = PostgresSemanticHydrator(sessions)
         admin_commands = build_admin_commands(
             organize=organize,
             windows=PostgresCaptureWindows(sessions),
@@ -172,6 +179,8 @@ async def serve(settings: Settings) -> None:
             owner_user_id=settings.discord_owner_user_id,
             digest_local_time=settings.digest_local_time,
             timezone=settings.workspace_timezone,
+            search=Search(PostgresExactSearch(sessions), khoj, hydrator),
+            ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
         )
         client.attach_admin_commands(admin_commands, guild_id=settings.discord_guild_id)
 

@@ -16,6 +16,7 @@ from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_api.problems import ProblemError, unauthorized
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.khoj_sync import ForceKhojSync
 from tc_application.search import Search
@@ -38,6 +39,7 @@ class ApiContext:
     documents: PostgresDocumentReader
     entities: PostgresEntityReader
     search: Search
+    ask: AskQuestion
     llm_calls: PostgresLlmCallReader
     outbox: PostgresOutbox
     force_khoj_sync: ForceKhojSync

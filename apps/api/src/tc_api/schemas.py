@@ -11,6 +11,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from tc_domain.ask import AskAnswer, AskReference
 from tc_domain.search import SearchPage, SearchResult
 from tc_infrastructure.db.document_reader import DocumentDetail, DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
@@ -258,6 +259,40 @@ class KhojSyncResponse(BaseModel):
             "blocking full reindex."
         )
     )
+
+
+class AskRequest(BaseModel):
+    q: str = Field(min_length=1, max_length=2_000, description="The question to ask")
+
+
+class AskReferenceResponse(BaseModel):
+    document_id: uuid.UUID
+    title: str
+    snippet: str
+
+    @classmethod
+    def of(cls, record: AskReference) -> AskReferenceResponse:
+        return cls(document_id=record.document_id, title=record.title, snippet=record.snippet)
+
+
+class AskResponse(BaseModel):
+    enabled: bool = Field(
+        description="False when this deployment has not opted into Ask (docs/adr/0003)."
+    )
+    degraded: bool = Field(
+        description="True when Ask is enabled but Khoj could not answer right now."
+    )
+    answer: str | None
+    references: list[AskReferenceResponse]
+
+    @classmethod
+    def of(cls, answer: AskAnswer) -> AskResponse:
+        return cls(
+            enabled=answer.enabled,
+            degraded=answer.degraded,
+            answer=answer.answer,
+            references=[AskReferenceResponse.of(r) for r in answer.references],
+        )
 
 
 class HealthResponse(BaseModel):

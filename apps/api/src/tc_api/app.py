@@ -19,7 +19,8 @@ from fastapi.responses import JSONResponse
 
 from tc_api.dependencies import ApiContext
 from tc_api.problems import ProblemError, problem_response
-from tc_api.routers import admin, debug, documents, entities, health, search, thoughts
+from tc_api.routers import admin, ask, debug, documents, entities, health, search, thoughts
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.khoj_sync import ForceKhojSync
 from tc_application.search import Search
@@ -66,17 +67,17 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         AttachmentPolicy(max_bytes=settings.attachment_max_bytes),
     )
 
+    khoj = HttpKhojClient(http, settings.khoj_base_url)
+    hydrator = PostgresSemanticHydrator(sessions)
+
     return ApiContext(
         settings=settings,
         capture=capture,
         reader=PostgresThoughtReader(sessions),
         documents=PostgresDocumentReader(sessions),
         entities=PostgresEntityReader(sessions),
-        search=Search(
-            PostgresExactSearch(sessions),
-            HttpKhojClient(http, settings.khoj_base_url),
-            PostgresSemanticHydrator(sessions),
-        ),
+        search=Search(PostgresExactSearch(sessions), khoj, hydrator),
+        ask=AskQuestion(khoj, hydrator, enabled=settings.ask_enabled),
         llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(sessions)),
@@ -140,6 +141,7 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
     app.include_router(documents.router)
     app.include_router(entities.router)
     app.include_router(search.router)
+    app.include_router(ask.router)
     app.include_router(admin.router)
     app.include_router(debug.router)
     return app

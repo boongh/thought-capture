@@ -234,18 +234,33 @@ that could not execute a stage says `NOT RUN` and is not a passing run.
 
 The runnable stack captures allowlisted Discord text and attachments, exposes
 authenticated API capture and reads, and preserves canonical data in
-PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`, and
-`/v1/entities` routes. A separate read-only `/debug` operator view exposes raw
-thoughts, entities, and daily digests; it is not the future unified UI.
+PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`,
+`/v1/entities`, `/v1/search` (exact, semantic, and hybrid modes), `/v1/ask`,
+and `/v1/admin/khoj-sync` routes. A separate read-only `/debug` operator view
+exposes raw thoughts, entities, daily digests, and journaled LLM runs; it is
+not the future unified UI. The Discord bot also takes `/organize`, `/status`,
+`/search`, and `/ask` slash commands, all restricted to the configured owner.
 
 The `worker` processes closed capture windows, catches up missed windows after
-startup, and writes versioned derived documents and entities. The Discord bot
-polls queued daily-digest deliveries separately from capture acknowledgements.
-With no reviewed model registered, safe mode uses the deterministic offline
-adapter; configuring a provider model remains subject to ADR-0006's review
+startup, and writes versioned derived documents and entities; it also runs a
+sync loop (`tc_worker.khoj_sync_loop`) that pushes newly-written documents
+into Khoj's index automatically. The Discord bot polls queued daily-digest
+deliveries separately from capture acknowledgements. `upstage/solar-pro4`
+(select) and `x-ai/grok-4.3` (organize) are reviewed and registered in safe
+mode (`REVIEWED_MODELS`), but `TC_MODEL_ORGANIZE` and `TC_MODEL_SELECT` still
+default to blank in `env.example`: an operator must opt in explicitly, or the
+pipeline keeps running organize on the deterministic offline adapter.
+Configuring a different provider model remains subject to ADR-0006's review
 requirements.
 
-Khoj indexing/search/Ask, backup and restore jobs, retry delivery for capture
-acknowledgements, and the future unified custom UI are not runnable yet. The
-`ai` and `backup` Compose profiles described in the design are likewise not
+**Ask needs explicit setup on top of the `ai` Compose profile actually
+running (`docs/adr/0003`'s "Ask proxy" amendment):** it requires
+`TC_ASK_ENABLED=true` (default `false`) *and* Khoj's own chat model
+configured (`TC_KHOJ_OPENAI_BASE_URL`/`TC_KHOJ_OPENAI_API_KEY`, blank by
+default) - two independent opt-ins, neither set by this project's own code,
+before any question reaches a live model. Leaving either at its default
+makes `/ask`/`/v1/ask` report `enabled: false` explicitly.
+
+Backup and restore jobs and the future unified custom UI are not runnable
+yet. The `backup` Compose profile described in the design is likewise not
 defined yet.
