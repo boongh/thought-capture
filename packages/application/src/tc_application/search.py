@@ -127,14 +127,29 @@ class Search:
     async def _semantic_results(
         self, workspace_id: WorkspaceId, query: SearchQuery, text: str
     ) -> tuple[SearchResult, ...]:
+        """Deduped by filename before hydrating and again while building the
+        results: Khoj can chunk one uploaded document into more than one
+        indexed entry and return more than one hit for the same document in
+        the same search (its own filename is identical across chunks of the
+        same upload), which would otherwise surface the same document twice
+        in ``mode="semantic"`` and inflate its RRF contribution in
+        ``mode="hybrid"`` (``fuse_rrf`` accumulates one contribution per
+        entry in the ``semantic`` tuple it is given). Khoj already orders
+        hits by relevance, so keeping the first occurrence keeps the
+        best-ranked one.
+        """
         results = await self._khoj.search(text, limit=query.limit)
-        hydrated = await self._hydrate.hydrate(
-            workspace_id, query, tuple(r.filename for r in results)
-        )
+        filenames = tuple(dict.fromkeys(r.filename for r in results))
+        hydrated = await self._hydrate.hydrate(workspace_id, query, filenames)
+
+        seen: set[str] = set()
         items: list[SearchResult] = []
         for result in results:
+            if result.filename in seen:
+                continue
             match = hydrated.get(result.filename)
             if match is None:
                 continue
+            seen.add(result.filename)
             items.append(dataclasses.replace(match, rank=result.score))
         return tuple(items)

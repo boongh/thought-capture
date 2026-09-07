@@ -146,6 +146,31 @@ async def test_semantic_mode_drops_a_result_that_does_not_hydrate() -> None:
     assert page.degraded is False
 
 
+async def test_semantic_mode_dedupes_khoj_hits_sharing_a_filename() -> None:
+    """Khoj can chunk one uploaded document into more than one indexed entry
+    and return more than one hit for it in the same search (each chunk hit
+    carries the same filename as the uploaded document) - the first
+    (best-ranked, since Khoj already orders by relevance) hit per filename
+    must win rather than the document appearing twice with two ranks."""
+    hydrated = _result(channels=("semantic",))
+    khoj = FakeKhojPort(
+        search_results=(
+            KhojSearchResult(entry="chunk one", score=0.9, filename="ws/project/x.md"),
+            KhojSearchResult(entry="chunk two", score=0.4, filename="ws/project/x.md"),
+        )
+    )
+    hydrate = FakeSemanticHydrator({"ws/project/x.md": hydrated})
+    search = _search(khoj=khoj, hydrate=hydrate)
+
+    page = await search(WORKSPACE, SearchQuery(q="aurora"), mode="semantic")
+
+    assert len(page.items) == 1
+    assert page.items[0].revision_id == hydrated.revision_id
+    assert page.items[0].rank == pytest.approx(0.9)
+    # Hydration itself is asked about the filename only once.
+    assert hydrate.calls[0][2] == ("ws/project/x.md",)
+
+
 async def test_semantic_mode_with_no_free_text_is_an_empty_non_degraded_answer() -> None:
     """A pure filter/phrase query has nothing to send Khoj - this is a valid
     empty result, not a degradation, and Khoj must not even be called."""
@@ -192,6 +217,45 @@ async def test_hybrid_mode_fuses_exact_and_semantic_results() -> None:
     assert page.degraded is False
     by_revision = {r.revision_id: r for r in page.items}
     assert set(by_revision) == {both.revision_id, exact_only.revision_id}
+    assert by_revision[shared_revision].channels == ("exact", "semantic")
+    assert by_revision[exact_only.revision_id].channels == ("exact",)
+
+
+async def test_hybrid_mode_does_not_inflate_the_rrf_score_for_a_chunked_document() -> None:
+    """A document Khoj chunked into more than one indexed entry can surface
+    more than one hit for it in the same search (each chunk hit carries the
+    document's own filename) - ``fuse_rrf`` must still see one semantic
+    contribution for it, not one per chunk hit, and its channels must not be
+    miscomputed by the duplicate entry."""
+    shared_revision = uuid.uuid4()
+    exact_only = _result(channels=("exact",))
+    both = _result(channels=("exact",), revision_id=shared_revision)
+    semantic_hydrated = _result(channels=("semantic",), revision_id=shared_revision)
+
+    exact = FakeExactSearch(SearchPage(items=(both, exact_only), next_cursor=None))
+    hydrate = FakeSemanticHydrator({"ws/project/x.md": semantic_hydrated})
+
+    single_khoj = FakeKhojPort(
+        search_results=(KhojSearchResult(entry="...", score=0.9, filename="ws/project/x.md"),)
+    )
+    single_page = await _search(exact=exact, khoj=single_khoj, hydrate=hydrate)(
+        WORKSPACE, SearchQuery(q="aurora"), mode="hybrid"
+    )
+    single_rank = {r.revision_id: r.rank for r in single_page.items}[shared_revision]
+
+    duplicated_khoj = FakeKhojPort(
+        search_results=(
+            KhojSearchResult(entry="chunk one", score=0.9, filename="ws/project/x.md"),
+            KhojSearchResult(entry="chunk two", score=0.7, filename="ws/project/x.md"),
+        )
+    )
+    page = await _search(exact=exact, khoj=duplicated_khoj, hydrate=hydrate)(
+        WORKSPACE, SearchQuery(q="aurora"), mode="hybrid"
+    )
+
+    by_revision = {r.revision_id: r for r in page.items}
+    assert set(by_revision) == {shared_revision, exact_only.revision_id}
+    assert by_revision[shared_revision].rank == pytest.approx(single_rank)
     assert by_revision[shared_revision].channels == ("exact", "semantic")
     assert by_revision[exact_only.revision_id].channels == ("exact",)
 
