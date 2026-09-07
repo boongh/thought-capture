@@ -52,14 +52,30 @@ async def test_default_mode_is_exact() -> None:
     assert len(exact.calls) == 1
 
 
-@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
-async def test_unimplemented_modes_raise_rather_than_silently_falling_back_to_exact(
-    mode: str,
-) -> None:
+async def test_unknown_mode_raises() -> None:
     exact = FakeExactSearch()
     search = Search(exact)
 
     with pytest.raises(UnsupportedSearchModeError):
-        await search(WORKSPACE, SearchQuery(), mode=mode)
+        await search(WORKSPACE, SearchQuery(), mode="not-a-real-mode")
 
     assert exact.calls == []
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+async def test_semantic_and_hybrid_degrade_when_no_khoj_is_wired(mode: str) -> None:
+    """docs/adr/0010: a deployment with no Khoj adapter degrades exactly like
+    an unreachable one, rather than raising or silently returning exact-only
+    results without saying so."""
+    exact = FakeExactSearch(SearchPage(items=(_result(),), next_cursor=None))
+    search = Search(exact, khoj=None)
+
+    page = await search(WORKSPACE, SearchQuery(q="hello"), mode=mode)
+
+    assert page.degraded is True
+    if mode == "hybrid":
+        # Exact results are still returned, just flagged degraded - the
+        # working channel's answer is not discarded.
+        assert len(page.items) == 1
+    else:
+        assert page.items == ()

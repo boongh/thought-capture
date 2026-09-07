@@ -89,3 +89,14 @@ class ExactSearchPort(Protocol):
         non-degraded answer.
         """
         ...
+
+    async def hydrate(
+        self, workspace_id: WorkspaceId, document_ids: tuple[uuid.UUID, ...], query: SearchQuery
+    ) -> dict[uuid.UUID, SearchResult]:
+        """Full current-revision rows for a specific set of document ids
+        (docs/adr/0010): how a Khoj semantic hit, which only carries a
+        filename, gets mapped back to a citable ``SearchResult`` for hybrid
+        fusion. Missing ids (deleted, or belonging to another workspace) are
+        simply absent from the returned mapping, never raised.
+        """
+        ...

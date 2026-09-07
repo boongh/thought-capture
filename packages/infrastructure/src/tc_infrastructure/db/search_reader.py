@@ -106,6 +106,63 @@ class PostgresExactSearch:
         )
         return SearchPage(items=items, next_cursor=next_cursor, degraded=False)
 
+    async def hydrate(
+        self,
+        workspace_id: WorkspaceId,
+        document_ids: tuple[uuid.UUID, ...],
+        query: SearchQuery,
+    ) -> dict[uuid.UUID, SearchResult]:
+        """Full current-revision rows for a specific set of document ids
+        (docs/adr/0010): how a Khoj semantic hit, which only carries a
+        filename, gets mapped back to a citable ``SearchResult``.
+
+        ``channels`` is always ``()`` and ``rank`` is always ``0.0`` on the
+        returned rows - both are channel-specific (which channel(s) actually
+        produced a hit, and Khoj's own similarity score), which this method,
+        reading only this project's own PostgreSQL, has no way to know. The
+        caller (``tc_application.search.Search``) fills them in.
+        """
+        if not document_ids:
+            return {}
+        statement = (
+            sa.select(
+                documents.c.id.label("document_id"),
+                documents.c.kind,
+                documents.c.title,
+                document_revisions.c.id.label("revision_id"),
+                document_revisions.c.body_markdown,
+                document_revisions.c.created_at,
+            )
+            .select_from(
+                documents.join(
+                    document_revisions, document_revisions.c.id == documents.c.current_revision_id
+                )
+            )
+            .where(documents.c.workspace_id == workspace_id, documents.c.id.in_(document_ids))
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).all()
+            revision_ids = [row.revision_id for row in rows]
+            thought_ids = await _thought_ids_for(session, workspace_id, revision_ids)
+            entity_names = await _entity_names_for(session, workspace_id, revision_ids)
+
+        return {
+            row.document_id: SearchResult(
+                result_id=str(row.revision_id),
+                document_id=row.document_id,
+                revision_id=row.revision_id,
+                thought_ids=thought_ids.get(row.revision_id, ()),
+                kind=row.kind,
+                title=row.title,
+                snippet=_snippet(row.body_markdown, query),
+                updated_at=row.created_at,
+                entities=entity_names.get(row.revision_id, ()),
+                channels=(),
+                rank=0.0,
+            )
+            for row in rows
+        }
+
 
 def _text_query_string(query: SearchQuery) -> str | None:
     """One ``websearch_to_tsquery`` string combining ``q``, ``include``, and

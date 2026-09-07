@@ -1,5 +1,5 @@
-"""Window resolution and formatting for the ``/organize``/``/status`` slash
-commands (tc_discord_bot.commands).
+"""Window resolution and formatting for the ``/organize``/``/status``/
+``/search``/``/ask`` slash commands (tc_discord_bot.commands).
 
 These are pure functions with no Discord Gateway dependency, so they are
 tested directly rather than through a live interaction, the same way
@@ -14,8 +14,16 @@ import uuid
 
 import pytest
 
-from tc_discord_bot.commands import _format_run, _resolve_window, _WindowInputError
+from tc_discord_bot.commands import (
+    _format_ask_answer,
+    _format_run,
+    _format_search_page,
+    _resolve_window,
+    _WindowInputError,
+)
+from tc_domain.ask import AskAnswer, AskReference
 from tc_domain.capture import WorkspaceId
+from tc_domain.search import SearchPage, SearchResult
 from tc_domain.windows import CaptureWindow
 from tc_infrastructure.db.run_reader import RunRecord
 
@@ -200,3 +208,74 @@ def test_format_run_omits_model_line_for_an_empty_window_run() -> None:
     record = _run_record(model_id=None, model_provider=None, input_tokens=0, output_tokens=0)
     text = _format_run(record)
     assert "Model:" not in text
+
+
+def _search_result(**overrides: object) -> SearchResult:
+    defaults: dict[str, object] = {
+        "result_id": "r1",
+        "document_id": uuid.uuid4(),
+        "revision_id": uuid.uuid4(),
+        "thought_ids": (),
+        "kind": "project",
+        "title": "A project",
+        "snippet": "a snippet",
+        "updated_at": dt.datetime(2026, 8, 31, tzinfo=dt.UTC),
+        "entities": (),
+        "channels": ("exact",),
+        "rank": 1.0,
+    }
+    defaults.update(overrides)
+    return SearchResult(**defaults)  # type: ignore[arg-type]
+
+
+def test_format_search_page_reports_no_results() -> None:
+    page = SearchPage(items=(), next_cursor=None)
+    text = _format_search_page(page, "exact")
+    assert "No results" in text
+
+
+def test_format_search_page_lists_title_channels_and_snippet() -> None:
+    result = _search_result(title="My Project", channels=("exact", "semantic"), snippet="hello")
+    page = SearchPage(items=(result,), next_cursor=None)
+    text = _format_search_page(page, "hybrid")
+    assert "My Project" in text
+    assert "exact+semantic" in text
+    assert "hello" in text
+    assert str(result.document_id) in text
+
+
+def test_format_search_page_flags_degraded() -> None:
+    page = SearchPage(items=(), next_cursor=None, degraded=True)
+    text = _format_search_page(page, "hybrid")
+    assert "degraded" in text.lower()
+
+
+def test_format_ask_answer_when_not_enabled() -> None:
+    answer = AskAnswer(enabled=False, degraded=False, answer=None, references=())
+    text = _format_ask_answer(answer)
+    assert "not enabled" in text.lower()
+    assert "/search" in text
+
+
+def test_format_ask_answer_when_degraded() -> None:
+    answer = AskAnswer(enabled=True, degraded=True, answer=None, references=())
+    text = _format_ask_answer(answer)
+    assert "could not answer" in text.lower()
+
+
+def test_format_ask_answer_with_references() -> None:
+    reference = AskReference(document_id=uuid.uuid4(), title="A Doc", snippet="…")
+    answer = AskAnswer(
+        enabled=True, degraded=False, answer="The launch went well.", references=(reference,)
+    )
+    text = _format_ask_answer(answer)
+    assert "The launch went well." in text
+    assert "A Doc" in text
+    assert str(reference.document_id) in text
+
+
+def test_format_ask_answer_truncates_to_the_discord_message_limit() -> None:
+    answer = AskAnswer(enabled=True, degraded=False, answer="x" * 3000, references=())
+    text = _format_ask_answer(answer)
+    assert len(text) <= 2000
+    assert text.endswith("(truncated)")

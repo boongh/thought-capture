@@ -31,7 +31,7 @@ Attachments are preserved as originals. They are not silently interpreted or rew
 
 ## Where the project is today
 
-The current release can securely capture allowlisted Discord messages and attachments, organize closed capture windows, create versioned digests and entity notes, and queue digest delivery. Semantic search, question answering, backup and restore workflows, and the eventual unified interface are the next steps.
+The current release can securely capture allowlisted Discord messages and attachments, organize closed capture windows, create versioned digests and entity notes, and queue digest delivery. `/organize`, `/status`, `/search`, and `/ask` Discord commands cover the day-to-day loop. Search works in three modes — exact (date, time, entity, phrase, and full-text filters), semantic (via a self-hosted Khoj instance), and hybrid (both, fused) — once an operator has synced the index. Ask answers questions over your own captured memory, gated behind two explicit opt-ins so nothing reaches a model without deliberate setup. Backup and restore workflows and the eventual unified interface are the next steps.
 
 ## Learn more
 

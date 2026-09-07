@@ -110,6 +110,20 @@ services:
       # Self-hosting Khoj specifically to keep personal data local; leaving
       # telemetry on by default would undermine that (docs/adr/0003).
       KHOJ_TELEMETRY_DISABLE: "True"
+      # Khoj's OWN chat-model credentials (docs/adr/0003 finding 4,
+      # docs/adr/0010) - entirely the operator's choice, never set by this
+      # project's own code. Blank by default: Khoj's own --non-interactive
+      # first-boot setup (khoj.utils.initialization._create_chat_configuration)
+      # reads these directly via `os.getenv`, and `or None` on the base-url
+      # read means an empty string here is treated as unset, matching a truly
+      # absent variable. If pointing at a local OpenAI-compatible server that
+      # accepts any non-empty key (e.g. Ollama), set
+      # TC_KHOJ_OPENAI_API_KEY to a placeholder value yourself - Khoj's own
+      # "placeholder" fallback only applies when this variable is entirely
+      # absent, not when it is present-but-empty, which is what an unset
+      # Compose variable interpolated here becomes.
+      OPENAI_BASE_URL: ${TC_KHOJ_OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${TC_KHOJ_OPENAI_API_KEY:-}
     ports:
       - "127.0.0.1:${TC_KHOJ_PORT:-42110}:42110"
     volumes:

@@ -19,8 +19,10 @@ from fastapi.responses import JSONResponse
 
 from tc_api.dependencies import ApiContext
 from tc_api.problems import ProblemError, problem_response
-from tc_api.routers import debug, documents, entities, health, search, thoughts
+from tc_api.routers import admin, ask, debug, documents, entities, health, search, thoughts
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
+from tc_application.khoj_sync import SyncKhojIndex
 from tc_application.search import Search
 from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
@@ -33,6 +35,7 @@ from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
 
@@ -62,13 +65,25 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         AttachmentPolicy(max_bytes=settings.attachment_max_bytes),
     )
 
+    document_reader = PostgresDocumentReader(sessions)
+    exact_search = PostgresExactSearch(sessions)
+    # Always constructed - this project's own bearer token remains the only
+    # credential a client needs (docs/adr/0003's zero-Khoj-credential
+    # deployment) - but every call it makes is opt-in per use case: `search`
+    # degrades explicitly if the `ai` profile is not running
+    # (`KhojUnavailableError`), and `ask` additionally requires
+    # `settings.ask_enabled` (docs/adr/0010).
+    khoj = HttpKhojClient(http, settings.khoj_base_url)
+
     return ApiContext(
         settings=settings,
         capture=capture,
         reader=PostgresThoughtReader(sessions),
-        documents=PostgresDocumentReader(sessions),
+        documents=document_reader,
         entities=PostgresEntityReader(sessions),
-        search=Search(PostgresExactSearch(sessions)),
+        search=Search(exact_search, khoj),
+        ask=AskQuestion(khoj, exact_search, enabled=settings.ask_enabled),
+        khoj_sync=SyncKhojIndex(document_reader, khoj),
         llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         session_factory=sessions,
@@ -131,5 +146,7 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
     app.include_router(documents.router)
     app.include_router(entities.router)
     app.include_router(search.router)
+    app.include_router(ask.router)
+    app.include_router(admin.router)
     app.include_router(debug.router)
     return app

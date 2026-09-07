@@ -1,4 +1,4 @@
-"""``GET /v1/search``, against a real database (docs/DESIGN.md 10)."""
+"""``POST /v1/admin/khoj-sync`` (docs/DESIGN.md 7.2, docs/adr/0010)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ async def _seed_document(
     user_id: uuid.UUID,
     *,
     unique: str,
-) -> uuid.UUID:
+) -> None:
     now = dt.datetime.now(dt.UTC)
     async with app_session_factory() as session, session.begin():
         thought_id = await session.scalar(
@@ -67,14 +67,13 @@ async def _seed_document(
         window_start=dt.datetime(2026, 8, 30, 13, tzinfo=dt.UTC),
         window_end=dt.datetime(2026, 8, 31, 13, tzinfo=dt.UTC),
     )
-    stable_key = f"project:api-{unique}"
     request = OrganizeWriteRequest(
         documents=(
             DocumentWrite(
-                stable_key=stable_key,
+                stable_key=f"project:api-{unique}",
                 kind="project",
                 title=f"Project {unique}",
-                body_markdown=f"## Summary\n\n{unique} needs a working search endpoint",
+                body_markdown=f"## Summary\n\n{unique} needs a working khoj sync",
                 source_thought_ids=(ThoughtId(thought_id),),
                 mentioned_entities=(),
                 change_summary="created",
@@ -84,57 +83,36 @@ async def _seed_document(
         unorganized_thought_ids=(),
     )
     writer = PostgresOrganizeWriter(app_session_factory)
-    result = await writer.write(
-        workspace_id=WorkspaceId(workspace_id),
-        run_id=run_id,
-        request=request,
-        outcome=_outcome(),
+    await writer.write(
+        workspace_id=WorkspaceId(workspace_id), run_id=run_id, request=request, outcome=_outcome()
     )
-    return result.document_ids[stable_key]
 
 
-async def test_search_requires_auth(api_fresh: httpx.AsyncClient) -> None:
-    response = await api_fresh.get("/v1/search", params={"q": "anything"})
+async def test_khoj_sync_requires_auth(api_fresh: httpx.AsyncClient) -> None:
+    response = await api_fresh.post("/v1/admin/khoj-sync")
     assert response.status_code == 401
 
 
-async def test_search_finds_a_written_document_by_q(
+async def test_khoj_sync_is_a_no_op_for_an_empty_workspace(api_fresh: httpx.AsyncClient) -> None:
+    """A real ``HttpKhojClient.index(())`` never attempts the connection at
+    all, so this must succeed even though the test stack has no Khoj running
+    (docs/adr/0010)."""
+    response = await api_fresh.post("/v1/admin/khoj-sync", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {"documents_indexed": 0}
+
+
+async def test_khoj_sync_returns_503_when_khoj_is_unreachable(
     api_fresh: httpx.AsyncClient,
     app_session_factory: async_sessionmaker[AsyncSession],
     fresh_identity: tuple[uuid.UUID, uuid.UUID],
     unique_message_id: str,
 ) -> None:
     workspace_id, user_id = fresh_identity
-    document_id = await _seed_document(
-        app_session_factory, workspace_id, user_id, unique=unique_message_id
-    )
+    await _seed_document(app_session_factory, workspace_id, user_id, unique=unique_message_id)
 
-    response = await api_fresh.get("/v1/search", headers=AUTH, params={"q": unique_message_id})
+    response = await api_fresh.post("/v1/admin/khoj-sync", headers=AUTH)
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["degraded"] is False
-    match = next(item for item in body["items"] if item["document_id"] == str(document_id))
-    assert match["result_id"] == match["revision_id"]
-    assert match["channels"] == ["exact"]
-
-
-async def test_search_rejects_an_unrecognized_mode(api_fresh: httpx.AsyncClient) -> None:
-    response = await api_fresh.get(
-        "/v1/search", headers=AUTH, params={"q": "anything", "mode": "not-a-real-mode"}
-    )
-    assert response.status_code == 501
-
-
-@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
-async def test_search_degrades_explicitly_when_khoj_is_not_running(
-    api_fresh: httpx.AsyncClient, mode: str
-) -> None:
-    """docs/adr/0010: the test stack's `core` profile runs with no Khoj
-    listening (docs/adr/0003's separate `ai` profile), so semantic/hybrid must
-    degrade explicitly rather than 501 or silently return only exact results."""
-    response = await api_fresh.get(
-        "/v1/search", headers=AUTH, params={"q": "anything", "mode": mode}
-    )
-    assert response.status_code == 200
-    assert response.json()["degraded"] is True
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/problem+json")

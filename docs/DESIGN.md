@@ -903,6 +903,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 | ADR-0005 | Workspace-scoped single-user-first schema |
 | ADR-0006 | OpenRouter behind a provider port, with safe and custom model-selection modes |
 | ADR-0007 | Custom unified UI over stable gateway, no Khoj fork |
+| ADR-0010 | Khoj index sync (full resync), hybrid search (RRF), and an explicitly-gated Ask proxy |
 
 Implementation should create these ADR files when the first code for each decision lands; this design remains the summary authority.
 

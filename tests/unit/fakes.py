@@ -25,8 +25,15 @@ from tc_domain.context import Tier1Row
 from tc_domain.digest import DigestContent
 from tc_domain.digest_ports import PendingDigest
 from tc_domain.errors import AttachmentArchiveFailed, DigestNotFound
+from tc_domain.khoj_export import DocumentExportRecord
+from tc_domain.khoj_ports import (
+    KhojChatResult,
+    KhojIndexFile,
+    KhojSearchResult,
+    KhojUnavailableError,
+)
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome, WindowThought
-from tc_domain.search import SearchPage, SearchQuery
+from tc_domain.search import SearchPage, SearchQuery, SearchResult
 
 
 class FakeThoughtRepository:
@@ -128,13 +135,89 @@ class FakeExactSearch:
     use case's mode-gating, not to re-prove the query.
     """
 
-    def __init__(self, page: SearchPage | None = None) -> None:
+    def __init__(
+        self,
+        page: SearchPage | None = None,
+        *,
+        hydrated: dict[uuid.UUID, SearchResult] | None = None,
+    ) -> None:
         self.page = page if page is not None else SearchPage(items=(), next_cursor=None)
+        self.hydrated = hydrated or {}
         self.calls: list[tuple[WorkspaceId, SearchQuery]] = []
+        self.hydrate_calls: list[tuple[WorkspaceId, tuple[uuid.UUID, ...], SearchQuery]] = []
 
     async def search(self, workspace_id: WorkspaceId, query: SearchQuery) -> SearchPage:
         self.calls.append((workspace_id, query))
         return self.page
+
+    async def hydrate(
+        self,
+        workspace_id: WorkspaceId,
+        document_ids: tuple[uuid.UUID, ...],
+        query: SearchQuery,
+    ) -> dict[uuid.UUID, SearchResult]:
+        self.hydrate_calls.append((workspace_id, document_ids, query))
+        return {doc_id: self.hydrated[doc_id] for doc_id in document_ids if doc_id in self.hydrated}
+
+
+class FakeKhoj:
+    """Records index/delete calls; returns scripted search/chat results.
+
+    Real HTTP behavior is ``HttpKhojClient``'s job
+    (``tests/unit/test_khoj_client_errors.py``,
+    ``tests/unit/test_khoj_client_chat.py``); this fake exists to drive
+    ``Search``/``AskQuestion``/``SyncKhojIndex``'s own orchestration.
+    """
+
+    def __init__(
+        self,
+        *,
+        search_results: tuple[KhojSearchResult, ...] = (),
+        chat_result: KhojChatResult | None = None,
+        raises: KhojUnavailableError | None = None,
+    ) -> None:
+        self.search_results = search_results
+        self.chat_result = chat_result
+        self.raises = raises
+        self.indexed: list[tuple[KhojIndexFile, ...]] = []
+        self.deleted: list[tuple[str, ...]] = []
+        self.search_calls: list[tuple[str, int]] = []
+        self.chat_calls: list[tuple[str, int]] = []
+
+    async def index(self, files: tuple[KhojIndexFile, ...]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.indexed.append(files)
+
+    async def delete(self, filenames: tuple[str, ...]) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.deleted.append(filenames)
+
+    async def search(self, q: str, *, limit: int = 5) -> tuple[KhojSearchResult, ...]:
+        self.search_calls.append((q, limit))
+        if self.raises is not None:
+            raise self.raises
+        return self.search_results
+
+    async def chat(self, question: str, *, limit: int = 5) -> KhojChatResult:
+        self.chat_calls.append((question, limit))
+        if self.raises is not None:
+            raise self.raises
+        assert self.chat_result is not None
+        return self.chat_result
+
+
+class FakeDocumentExportSource:
+    def __init__(self, records: list[DocumentExportRecord] | None = None) -> None:
+        self.records = records or []
+        self.calls: list[WorkspaceId] = []
+
+    async def list_all_current_for_export(
+        self, workspace_id: WorkspaceId
+    ) -> list[DocumentExportRecord]:
+        self.calls.append(workspace_id)
+        return self.records
 
 
 class FakeOrganizeWriter:

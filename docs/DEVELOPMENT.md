@@ -40,7 +40,7 @@ apps/
 packages/
   domain/              entities, commands, policies, ports
   application/         use cases and orchestration
-  infrastructure/      PostgreSQL, OpenRouter, and object-store adapters
+  infrastructure/      PostgreSQL, OpenRouter, Khoj, and object-store adapters
 migrations/            Alembic migrations
 tests/                 unit, integration, and contract tests
 docs/                  design, operations, and architecture decisions

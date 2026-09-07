@@ -11,6 +11,8 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from tc_application.khoj_sync import KhojSyncResult
+from tc_domain.ask import AskAnswer, AskReference
 from tc_domain.search import SearchPage, SearchResult
 from tc_infrastructure.db.document_reader import DocumentDetail, DocumentSummary
 from tc_infrastructure.db.entity_reader import EntityRecord
@@ -248,6 +250,48 @@ class SearchResponse(BaseModel):
             next_cursor=page.next_cursor,
             degraded=page.degraded,
         )
+
+
+class AskRequest(BaseModel):
+    q: str = Field(min_length=1, max_length=2_000, description="The question to ask")
+
+
+class AskReferenceResponse(BaseModel):
+    document_id: uuid.UUID
+    title: str
+    snippet: str
+
+    @classmethod
+    def of(cls, record: AskReference) -> AskReferenceResponse:
+        return cls(document_id=record.document_id, title=record.title, snippet=record.snippet)
+
+
+class AskResponse(BaseModel):
+    enabled: bool = Field(
+        description="False when this deployment has not opted into Ask (docs/adr/0010)."
+    )
+    degraded: bool = Field(
+        description="True when Ask is enabled but Khoj could not answer right now."
+    )
+    answer: str | None
+    references: list[AskReferenceResponse]
+
+    @classmethod
+    def of(cls, answer: AskAnswer) -> AskResponse:
+        return cls(
+            enabled=answer.enabled,
+            degraded=answer.degraded,
+            answer=answer.answer,
+            references=[AskReferenceResponse.of(r) for r in answer.references],
+        )
+
+
+class KhojSyncResponse(BaseModel):
+    documents_indexed: int
+
+    @classmethod
+    def of(cls, result: KhojSyncResult) -> KhojSyncResponse:
+        return cls(documents_indexed=result.documents_indexed)
 
 
 class HealthResponse(BaseModel):

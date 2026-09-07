@@ -28,7 +28,9 @@ from sqlalchemy.pool import NullPool
 
 from tc_api.app import create_app
 from tc_api.dependencies import ApiContext
+from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
+from tc_application.khoj_sync import SyncKhojIndex
 from tc_application.search import Search
 from tc_domain.capture import UserId, WorkspaceId
 from tc_domain.policy import AttachmentPolicy
@@ -40,6 +42,7 @@ from tc_infrastructure.db.outbox import PostgresOutbox
 from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.khoj.client import HttpKhojClient
 from tests.integration.support import CONNECT_ARGS
 from tests.unit.fakes import FakeAttachmentArchive
 
@@ -272,7 +275,10 @@ def unique_message_id() -> str:
 
 
 async def _api_client(
-    app_session_factory: async_sessionmaker[AsyncSession], identity: tuple[uuid.UUID, uuid.UUID]
+    app_session_factory: async_sessionmaker[AsyncSession],
+    identity: tuple[uuid.UUID, uuid.UUID],
+    *,
+    ask_enabled: bool = False,
 ) -> AsyncIterator[httpx.AsyncClient]:
     """The real app, wired to the test database with a known bearer token.
 
@@ -282,42 +288,55 @@ async def _api_client(
     ``ApiContext`` needs updating in every copy.
 
     The lifespan is replaced so the test does not depend on a seeded Discord
-    identity or a live HTTP client; everything else is the production code path.
+    identity or a live HTTP client; everything else is the production code
+    path - including a real ``HttpKhojClient`` pointed at ``Settings``'s
+    default (unreachable in this test stack, docs/adr/0010) ``khoj_base_url``,
+    so ``mode=semantic``/``hybrid`` exercise the genuine degrade-on-
+    unreachable path rather than the no-adapter-wired special case.
     """
     workspace_id, user_id = identity
     settings = Settings(
-        _env_file=None, api_bearer_token=API_TOKEN, workspace_timezone="Asia/Bangkok"
+        _env_file=None,
+        api_bearer_token=API_TOKEN,
+        workspace_timezone="Asia/Bangkok",
+        ask_enabled=ask_enabled,
     )
+    document_reader = PostgresDocumentReader(app_session_factory)
+    exact_search = PostgresExactSearch(app_session_factory)
 
-    context = ApiContext(
-        settings=settings,
-        capture=CaptureThought(
-            PostgresThoughtRepository(app_session_factory),
-            FakeAttachmentArchive(),
-            AttachmentPolicy(max_bytes=1024),
-        ),
-        reader=PostgresThoughtReader(app_session_factory),
-        documents=PostgresDocumentReader(app_session_factory),
-        entities=PostgresEntityReader(app_session_factory),
-        search=Search(PostgresExactSearch(app_session_factory)),
-        llm_calls=PostgresLlmCallReader(app_session_factory),
-        outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
-        session_factory=app_session_factory,
-        workspace_id=WorkspaceId(workspace_id),
-        user_id=UserId(user_id),
-    )
+    async with httpx.AsyncClient() as khoj_http:
+        khoj = HttpKhojClient(khoj_http, settings.khoj_base_url)
+        context = ApiContext(
+            settings=settings,
+            capture=CaptureThought(
+                PostgresThoughtRepository(app_session_factory),
+                FakeAttachmentArchive(),
+                AttachmentPolicy(max_bytes=1024),
+            ),
+            reader=PostgresThoughtReader(app_session_factory),
+            documents=document_reader,
+            entities=PostgresEntityReader(app_session_factory),
+            search=Search(exact_search, khoj),
+            ask=AskQuestion(khoj, exact_search, enabled=settings.ask_enabled),
+            khoj_sync=SyncKhojIndex(document_reader, khoj),
+            llm_calls=PostgresLlmCallReader(app_session_factory),
+            outbox=PostgresOutbox(app_session_factory, lease_owner="test-api"),
+            session_factory=app_session_factory,
+            workspace_id=WorkspaceId(workspace_id),
+            user_id=UserId(user_id),
+        )
 
-    @asynccontextmanager
-    async def no_startup(_: object) -> AsyncIterator[None]:
-        """Skip the production lifespan; the context is injected above."""
-        yield
+        @asynccontextmanager
+        async def no_startup(_: object) -> AsyncIterator[None]:
+            """Skip the production lifespan; the context is injected above."""
+            yield
 
-    app = create_app(lifespan_handler=no_startup)
-    app.state.context = context
+        app = create_app(lifespan_handler=no_startup)
+        app.state.context = context
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
 
 
 @pytest.fixture
@@ -349,4 +368,17 @@ async def api_fresh(
     shared workspace.
     """
     async for client in _api_client(app_session_factory, fresh_identity):
+        yield client
+
+
+@pytest.fixture
+async def api_fresh_ask_enabled(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Like ``api_fresh``, but with ``TC_ASK_ENABLED=true`` (docs/adr/0010) -
+    for asserting ``/v1/ask`` actually calls Khoj (and degrades, since this
+    test stack has no Khoj listening) rather than short-circuiting on
+    ``enabled: false``."""
+    async for client in _api_client(app_session_factory, fresh_identity, ask_enabled=True):
         yield client

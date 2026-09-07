@@ -1,9 +1,10 @@
 """Exact, semantic, and hybrid search over generated documents (docs/DESIGN.md 9, 10).
 
-Only ``mode=exact`` (the default) is implemented so far. ``semantic`` and
-``hybrid`` return a 501 problem document rather than silently falling back to
-exact-only results - docs/DESIGN.md 7.5 requires that a degraded or missing
-channel is always explicit, never an implied "no memory exists".
+``semantic``/``hybrid`` (docs/adr/0010) degrade to ``degraded=true`` rather
+than erroring when Khoj is unreachable or has nothing indexed yet (no
+``/v1/admin/khoj-sync`` has run) - docs/DESIGN.md 7.5 requires that a
+degraded or missing channel is always explicit, never an implied "no memory
+exists". An unrecognized ``mode`` value still returns a 501 problem document.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ router = APIRouter(prefix="/v1/search", tags=["search"], dependencies=[Authentic
 async def search(
     context: Context,
     q: Annotated[str | None, Query(description="Free text, English full-text, ranked")] = None,
-    mode: Annotated[str, Query(description="Only 'exact' is available so far")] = "exact",
+    mode: Annotated[str, Query(description="'exact', 'semantic', or 'hybrid'")] = "exact",
     phrase: Annotated[str | None, Query(description="Exact, case-insensitive substring")] = None,
     include: Annotated[list[str], Query(description="Required words")] = [],  # noqa: B006
     exclude: Annotated[list[str], Query(description="Forbidden words")] = [],  # noqa: B006

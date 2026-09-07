@@ -99,10 +99,22 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8080, ge=1, le=65535)
     api_bearer_token: SecretStr = SecretStr("")
 
-    # -- Khoj (docs/adr/0003) -----------------------------------------------
+    # -- Khoj (docs/adr/0003, docs/adr/0010) --------------------------------
     # Loopback-only, --anonymous-mode: no Khoj API token is provisioned or
     # used (docs/adr/0003's auth-mode decision).
     khoj_base_url: str = "http://127.0.0.1:42110"
+    # Deliberately off by default (docs/adr/0010): resolves docs/adr/0003
+    # finding 4's deferred privacy decision the same way docs/adr/0006 gates
+    # organize/select on an empty model slug - an explicit, greppable opt-in
+    # rather than a silent default. Turning this on sends the question text
+    # and Khoj's retrieved note content to whatever chat model Khoj itself is
+    # configured with (its own OPENAI_BASE_URL/OPENAI_API_KEY in
+    # deploy/compose/khoj.docker-compose.yml, entirely the operator's choice
+    # and never set by this project's own code) - outside this project's own
+    # OpenRouter adapter and docs/adr/0006's safe/custom mode controls
+    # entirely. Two independent opt-ins (this flag, and Khoj's own chat-model
+    # configuration) are required before any Ask call can reach a live model.
+    ask_enabled: bool = False
 
     @field_validator(
         "discord_owner_user_id",
