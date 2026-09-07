@@ -13,11 +13,12 @@ Claude owns:
 - explaining unfamiliar AI, backend, deployment, privacy, and operations concepts to the owner;
 - handing plans and completed changes to Codex for independent evaluation.
 
-## Specialized agent
+## Specialized agents
 
 - Use `.claude/agents/architecture-researcher.md` for bounded, read-only research when an architecture decision depends on current external facts, compatibility, licensing, cost, or provider behavior.
+- Use `.claude/agents/code-reviewer.md` as a first-line, independent review of a diff, branch, or commit before handing it to Codex - it checks correctness, security, design/ADR conformance, and this file's engineering invariants, but it does not edit anything and does not replace Codex's evaluation on persistence, migrations, security, privacy, retrieval, model prompts, backups, or deployment changes.
 - Keep final synthesis and architectural decisions in the primary Claude session.
-- Do not use the researcher as a substitute for asking the owner about consequential project-specific preferences.
+- Do not use either agent as a substitute for asking the owner about consequential project-specific preferences, or for Codex's required independent evaluation where CLAUDE.md's Implementation behavior section calls for it.
 
 Do not treat “primary architect” as permission to expand scope or override the owner. Do not make consequential project-specific assumptions when the answer materially changes architecture, privacy, cost, or user experience.
 
