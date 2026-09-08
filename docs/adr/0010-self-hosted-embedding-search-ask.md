@@ -414,6 +414,74 @@ See `docs/DESIGN.md` 7.6 for the full sequence, including the streamed
 response shape and the mid-stream degrade case (evidence found, generation
 failed).
 
+### 9. Ask's run and journal ownership
+
+`llm_calls.run_id` (`docs/adr/0008`,
+`migrations/versions/0004_derived_documents_and_provenance.py`) is
+`NOT NULL REFERENCES runs(id)`. Every existing caller of
+`LLMProvider` — `organize`, `select`, `query_plan` — already has a `runs`
+row, because a pipeline run is what triggers them. An on-demand `/v1/ask`
+call has none, and `llm_calls.step`'s CHECK constraint has no `'ask'`
+value either. Without deciding this, Ask's own call has nowhere valid to
+be journaled — a gap this ADR must close before authorizing Slice 4, not
+leave for that slice to improvise.
+
+**Decision: a dedicated per-request `ask` run, not a separate Ask
+journal.** A standalone `ask_calls`-style table decoupled from `runs`
+was considered and rejected: it would duplicate most of `llm_calls`'
+own columns (prompt/schema version, request/response, tokens, cost,
+latency, error) for no reason beyond avoiding `runs` — the identical
+"don't invent a second place to track this" judgment §3 already applied
+when reusing `runs.embedding_model_id` rather than adding a column
+elsewhere. Reusing `runs` also means Ask calls are visible through the
+existing `GET /v1/runs/{id}` endpoint for free, roll into the existing
+OpenRouter cost/budget tracking (`runs.estimated_cost_usd`,
+`docs/DESIGN.md` 2.1's "Pipeline cost" measure) without a second
+cost-tracking path, and inherit the existing backup/export coverage
+(`docs/DESIGN.md` 14.3) with no new code.
+
+**Schema.** `runs.kind` gains `'ask'`. `llm_calls.step` gains `'ask'`.
+`LLMStep` (`packages/domain/src/tc_domain/llm.py`) gains `ASK = "ask"`.
+No other column changes; `llm_calls.run_id` stays `NOT NULL` — this ADR
+gives it a valid owner rather than weakening the constraint.
+
+**Lifecycle.** A `runs` row is created only when a model call is actually
+attempted — empty evidence (§8) short-circuits before any run or journal
+row exists, because "a request arrived" and "a call was attempted" are
+different things and only the latter needs journaling. When evidence is
+non-empty, `AskQuestion` inserts one `runs` row (`kind='ask'`,
+`status='running'`, `model_id=TC_MODEL_ASK`, `window_start`/`window_end`
+left `NULL` the way `export`/`restore_test`/`reembed` already leave them)
+**before** calling `LLMProvider.stream()` — mirroring `docs/DESIGN.md`
+7.2 step 2's "create a run row" preceding organize's own model call, so
+an attempted call is durably recorded even if it then fails. The run
+resolves to exactly one of:
+
+- **`succeeded`** — the stream reached a terminal chunk. One `llm_calls`
+  row is written with the full accumulated text and the terminal chunk's
+  usage/cost/model fields. `citations_unverified` (§8) is a property of
+  the *returned answer's* grounding quality, not the call's technical
+  outcome, and never changes this status — a cleanly completed call with
+  zero valid citations is still a `succeeded` run.
+- **`failed`** — `LLMError` before any content. One `llm_calls` row is
+  still written, with `error_code` set and no usable content, matching
+  how a failed `organize` call is already journaled rather than silently
+  dropped.
+- **`partial`** — `LLMStreamInterrupted` after some content already
+  streamed. One `llm_calls` row is written with the partial text in
+  `response_raw` for durable record-keeping, but the `AskAnswer` returned
+  to the caller reports `degraded: true` (§7's Degradation note) and never
+  surfaces that unvalidated partial text as if it were a finished answer.
+
+**Retention and export require no new code.** Ask runs and their
+`llm_calls` rows live in the same tables as every other run, so
+`docs/DESIGN.md` 14.3's nightly `pg_dump`/monthly export and 12.2's
+"never log raw bodies/prompts" / "`llm_calls` is as sensitive as
+`thoughts`" requirements (`docs/adr/0008`) already apply without
+modification. Discord `/ask` and API `/v1/ask` both call the same
+`AskQuestion` use case, so both surfaces share this one mechanism —
+there is no second, divergent journaling path to keep in sync.
+
 ## Architecture overview
 
 ```
@@ -475,7 +543,7 @@ an open-ended "maybe later."
 
 This ADR authorizes the design change; it does not itself add code. Slice
 1 onward must each state, per this repository's implementation-behavior
-requirements: which pieces of §2-§8 they implement, what tests exercise
+requirements: which pieces of §2-§9 they implement, what tests exercise
 them (`tests/unit`, `tests/integration` against a real pgvector-enabled
 Postgres, a sidecar contract-test suite analogous to `tests/contract/khoj`
 but against first-party code; an integration test proving the
@@ -486,17 +554,23 @@ different document; for `LLMProvider.stream()` (§7-8, full contract in
 on the first chunk with zero `delta` reaching the caller, a pre-content
 transport failure raising plain `LLMError`, a post-content transport
 failure raising `LLMStreamInterrupted` with the correct accumulated text,
-and policy parity against `complete()`'s `provider_routing`; and — for §8's
+and policy parity against `complete()`'s `provider_routing`; for §8's
 citation contract specifically — citation-validation tests covering both a
 fabricated/out-of-range marker, which must never become a returned
 `AskReference`, and a marker-free answer, which must set
 `citations_unverified: true` exactly like an all-invalid-markers answer
-does), and confirmation via `scripts/check.ps1`/`scripts/check.sh`. Full
-Khoj removal (container, adapter code, compose files, credentials) is
-verified once the pgvector/sidecar/OpenRouter-Ask path passes
-`docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at parity with or
-better than the Khoj-era baseline — cutover is evidence-gated, not
-simultaneous with this ADR's acceptance.
+does; and for §9's run/journal state machine — empty evidence creates zero
+`runs`/`llm_calls` rows, a successful call creates exactly one `ask` run
+and `llm_calls` row with `status='succeeded'` regardless of
+`citations_unverified`, a pre-content `LLMError` leaves `status='failed'`,
+and a post-content `LLMStreamInterrupted` leaves `status='partial'` with
+the partial text present in `llm_calls.response_raw` but never surfaced in
+the returned `AskAnswer`), and confirmation via `scripts/check.ps1`/
+`scripts/check.sh`. Full Khoj removal (container, adapter code, compose
+files, credentials) is verified once the pgvector/sidecar/OpenRouter-Ask
+path passes `docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at
+parity with or better than the Khoj-era baseline — cutover is
+evidence-gated, not simultaneous with this ADR's acceptance.
 
 ## Migration and rollback
 
@@ -511,7 +585,10 @@ the same step it widens one (`docs/DESIGN.md` 6.3 has the full rationale);
 running alongside Khoj sync, not replacing it yet; (3) `EmbeddingSearchPort`
 wired into `Search._semantic_results` behind a flag, compared against
 Khoj's results on the golden set; (4) `TC_MODEL_ASK` + `OpenRouterProvider`
-Ask path, same comparison; (5) once parity is demonstrated, cut over
+Ask path (`LLMProvider.stream()`, §7-8's citation contract, §9's run/
+journal ownership — this slice's migration widens `runs.kind` and
+`llm_calls.step` to add `'ask'`, purely additive like step 1's), same
+comparison; (5) once parity is demonstrated, cut over
 default routing, then remove Khoj (container, adapter, compose profile,
 `TC_KHOJ_*`/`TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED` settings, `khoj_sync`
 outbox/run machinery) — **this is the migration that finally drops
