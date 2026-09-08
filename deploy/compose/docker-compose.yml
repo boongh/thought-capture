@@ -46,6 +46,17 @@ x-service-env: &service-env
   TC_DISCORD_CHANNEL_ID: ${TC_DISCORD_CHANNEL_ID:-}
   TC_ATTACHMENT_ROOT: /data/attachments
   TC_ATTACHMENT_MAX_BYTES: ${TC_ATTACHMENT_MAX_BYTES:-26214400}
+  # Same pattern as TC_DATABASE_URL above: inside the network Khoj is
+  # reachable as `khoj`, on the container's own listening port
+  # (deploy/compose/khoj.docker-compose.yml's --port=42110) - not via the
+  # separately configurable, loopback-only published port (TC_KHOJ_PORT).
+  # The .env value is for host tools (pytest, scripts/check.*) only, so it is
+  # deliberately overridden here rather than duplicated there. Harmless when
+  # the `ai` profile is not running - HttpKhojClient already degrades an
+  # unreachable Khoj the same way regardless of why it is unreachable.
+  TC_KHOJ_BASE_URL: http://khoj:42110
+  TC_ASK_ENABLED: ${TC_ASK_ENABLED:-false}
+  TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED: ${TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED:-false}
 
 # LLM configuration (docs/adr/0006). Deliberately a SEPARATE anchor from
 # `service-env`, not folded into it: TC_OPENROUTER_API_KEY is a secret, and
