@@ -146,7 +146,7 @@ class HttpKhojClient:
             "stream": True,
             "create_new": True,
         }
-        conversation_id: str | None = None
+        parser = _ChatEventParser()
         buffer = ""
         try:
             async with self._http.stream(
@@ -162,7 +162,7 @@ class HttpKhojClient:
                         raw_event, buffer = buffer.split(_END_EVENT, 1)
                         if not raw_event:
                             continue
-                        conversation_id, chunk = _parse_chat_event(raw_event, conversation_id)
+                        chunk = parser.parse_event(raw_event)
                         if chunk is not None:
                             yield chunk
                 if buffer.strip():
@@ -170,14 +170,14 @@ class HttpKhojClient:
                     # still has one more event's worth of content to parse -
                     # matches `read_chat_stream`'s own "process any remaining
                     # data in the buffer" step.
-                    conversation_id, chunk = _parse_chat_event(buffer, conversation_id)
+                    chunk = parser.parse_event(buffer)
                     if chunk is not None:
                         yield chunk
         except httpx.HTTPError as exc:
             raise KhojUnavailableError(f"Khoj chat failed: {exc}") from exc
         finally:
-            if conversation_id is not None:
-                await self._delete_conversation(conversation_id)
+            if parser.conversation_id is not None:
+                await self._delete_conversation(parser.conversation_id)
 
         yield KhojChatChunk(done=True)
 
@@ -223,8 +223,8 @@ def _try_parse_json_object(raw: str) -> dict[str, object] | None:
 # not just the ones this adapter surfaces. Used to tell a genuine (if
 # unhandled) khoj event apart from raw MESSAGE-event answer text that merely
 # happens to parse as a JSON object with a "type"-named key - a coincidence
-# `_parse_chat_event` must not mistake for a real event, whether or not that
-# coincidental value happens to collide with a name on this list.
+# `_ChatEventParser.parse_event` must not mistake for a real event, whether
+# or not that coincidental value happens to collide with a name on this list.
 _KNOWN_EVENT_TYPES = frozenset(
     {
         "metadata",
@@ -242,63 +242,88 @@ _KNOWN_EVENT_TYPES = frozenset(
 )
 
 
-def _parse_chat_event(
-    raw_event: str, conversation_id: str | None
-) -> tuple[str | None, KhojChatChunk | None]:
-    """Parse one `END_EVENT`-delimited piece of khoj's streaming response.
+class _ChatEventParser:
+    """Stateful parser for khoj's `END_EVENT`-delimited chat stream.
 
-    Returns the (possibly updated) `conversation_id` and a chunk to yield, or
-    `None` for an event this adapter does not surface - docs/adr/0003's "Ask
-    proxy" amendment only needs `metadata` (conversation id), `references`
-    (grounding notes), and raw message text; `start_llm_response`,
-    `end_llm_response`, `usage`, `end_response`, `status`, `thought`,
-    `generated_assets`, and `interrupt` carry nothing this project's Ask
-    needs.
+    Needs state, not just per-chunk inspection, because of a second layer of
+    the same coincidental-JSON problem `_KNOWN_EVENT_TYPES` already guards
+    against: the live-verified event order (docs/adr/0003's "Ask proxy"
+    amendment, contract-test capture) shows raw MESSAGE-event answer text
+    only ever streams strictly between `start_llm_response` and
+    `end_llm_response`, and no other event type is ever emitted in that
+    window. So an answer chunk that happens to parse as
+    `{"type": "status", "data": "42"}` mid-answer is indistinguishable from a
+    real `status` event by shape alone - both are "a known type name, not
+    metadata/references/message". Tracking whether we're inside that window
+    resolves the ambiguity the same way khoj's own protocol does: once
+    `start_llm_response` has been seen and `end_llm_response` has not, only
+    `end_llm_response` itself may still be treated as a control event: every
+    other chunk - whatever it happens to parse as - is answer text.
     """
-    parsed = _try_parse_json_object(raw_event)
-    if parsed is None:
-        # Not JSON-shaped at all: khoj's own `send_event` yields a MESSAGE
-        # event's payload unwrapped (unlike every other event type), so an
-        # un-typed chunk is always a raw answer-text delta.
-        return conversation_id, KhojChatChunk(text_delta=raw_event)
 
-    event_type = parsed.get("type")
-    data = parsed.get("data")
+    def __init__(self) -> None:
+        self.conversation_id: str | None = None
+        self._in_llm_response = False
 
-    if not isinstance(event_type, str) or event_type not in _KNOWN_EVENT_TYPES:
-        # Either there's no "type" key at all, its value isn't a string (a
-        # real khoj event's "type" always is - checked first so a non-string
-        # value, e.g. a raw answer that happens to be `{"type": [...], ...}`,
-        # short-circuits before the `in` check below, which would otherwise
-        # raise TypeError on an unhashable list/dict), or the string value is
-        # not one khoj actually emits. Either way this cannot be a genuine
-        # typed event, so it must be raw MESSAGE-event answer text that
-        # happens to be JSON-shaped - e.g. an answer literally starting with
-        # '{"answer": ...}', or one that coincidentally has a "type" key
-        # whose value is not a real khoj event name. Only a *recognized*
-        # event type may be silently dropped below; anything else falls
-        # through to the untyped-text path instead.
-        return conversation_id, KhojChatChunk(text_delta=raw_event)
+    def parse_event(self, raw_event: str) -> KhojChatChunk | None:
+        parsed = _try_parse_json_object(raw_event)
+        if parsed is None:
+            # Not JSON-shaped at all: khoj's own `send_event` yields a
+            # MESSAGE event's payload unwrapped (unlike every other event
+            # type), so an un-typed chunk is always a raw answer-text delta.
+            return KhojChatChunk(text_delta=raw_event)
 
-    if event_type == "metadata":
-        if isinstance(data, dict):
-            candidate = data.get("conversationId")
-            if isinstance(candidate, str) and candidate:
-                conversation_id = candidate
-        return conversation_id, None
+        event_type = parsed.get("type")
+        data = parsed.get("data")
 
-    if event_type == "references":
-        return conversation_id, KhojChatChunk(references=_parse_chat_references(data))
+        if not isinstance(event_type, str) or event_type not in _KNOWN_EVENT_TYPES:
+            # Either there's no "type" key at all, its value isn't a string
+            # (a real khoj event's "type" always is - checked first so a
+            # non-string value, e.g. a raw answer that happens to be
+            # `{"type": [...], ...}`, short-circuits before the `in` check
+            # below, which would otherwise raise TypeError on an unhashable
+            # list/dict), or the string value is not one khoj actually
+            # emits. Either way this cannot be a genuine typed event, so it
+            # must be raw MESSAGE-event answer text that happens to be
+            # JSON-shaped.
+            return KhojChatChunk(text_delta=raw_event)
 
-    if event_type == "message":
-        # A JSON-shaped message chunk happens too (the answer text itself
-        # starts with "{" and ends with "}") - use `data` as the text delta
-        # the same way khoj's own MessageProcessor does, rather than
-        # silently dropping it.
-        text = data if isinstance(data, str) else json.dumps(data)
-        return conversation_id, KhojChatChunk(text_delta=text)
+        if self._in_llm_response and event_type != "end_llm_response":
+            # Inside the answer-streaming window, the only confirmed control
+            # event is `end_llm_response` itself - anything else with a
+            # recognized "type" is a coincidental collision with real answer
+            # text (the P1 bug: a raw MESSAGE chunk like
+            # `{"type": "status", "data": "42"}` must not be dropped just
+            # because "status" is a name khoj happens to use elsewhere).
+            return KhojChatChunk(text_delta=raw_event)
 
-    return conversation_id, None
+        if event_type == "metadata":
+            if isinstance(data, dict):
+                candidate = data.get("conversationId")
+                if isinstance(candidate, str) and candidate:
+                    self.conversation_id = candidate
+            return None
+
+        if event_type == "references":
+            return KhojChatChunk(references=_parse_chat_references(data))
+
+        if event_type == "message":
+            # A JSON-shaped message chunk happens too (the answer text
+            # itself starts with "{" and ends with "}") - use `data` as the
+            # text delta the same way khoj's own MessageProcessor does,
+            # rather than silently dropping it.
+            text = data if isinstance(data, str) else json.dumps(data)
+            return KhojChatChunk(text_delta=text)
+
+        if event_type == "start_llm_response":
+            self._in_llm_response = True
+            return None
+
+        if event_type == "end_llm_response":
+            self._in_llm_response = False
+            return None
+
+        return None
 
 
 def _parse_chat_references(data: object) -> tuple[KhojChatReference, ...]:
