@@ -178,28 +178,38 @@ def _open_stalled_connection(host: str, port: int) -> socket.socket:
     return sock
 
 
-async def test_stalled_incomplete_header_connections_degrade_bounded_not_unbounded(
+async def test_stalled_incomplete_header_connections_cause_other_requests_to_be_bounced(
     sidecar: httpx.AsyncClient,
 ) -> None:
-    """Codex's review of this slice named this gap directly: uvicorn has no
-    time-based header-read timeout (confirmed by reading its h11 protocol
-    implementation directly, not assumed - `settings.py`'s
-    `limit_concurrency`/`h11_max_incomplete_event_size` docstrings have the
-    full reasoning), so a connection sending a small amount of incomplete
-    header data, slowly, is never evicted by time alone. What *is* already
-    true, and what this test proves against the real running container:
-    the degradation this causes is bounded, not unbounded. Uvicorn tracks
-    a connection in its concurrency-limited set from the moment it is
-    accepted (`connection_made`), not from when its request completes - so
-    opening more than `limit_concurrency` stalled connections causes
-    uvicorn to answer *new* legitimate requests with 503 once that ceiling
-    is reached, rather than accepting unlimited stalled connections and
-    exhausting memory/file descriptors without limit. Closing the
-    remaining gap (the attack itself, not just its blast radius) needs a
-    reverse proxy or a custom timeout wrapper in front of uvicorn -
-    deliberately out of scope for this loopback- and Docker-internal-
-    network-only slice; see `settings.py` for the full reasoning and the
-    trigger to revisit."""
+    """What this proves, precisely: opening more than `limit_concurrency`
+    connections that each send incomplete headers and never finish causes
+    uvicorn to answer an *unrelated, complete* request (e.g. this test's own
+    `/health` check) with 503, because uvicorn counts a connection in its
+    concurrency-limited set from the moment it is accepted
+    (`connection_made`), not from when its request completes.
+
+    What this does **not** prove, and an earlier version of this test's own
+    name/docstring wrongly claimed it did: that the stalled connections
+    themselves are capped, rejected, or evicted in any way. They are not -
+    confirmed directly against a real container (a separate, larger probe
+    opened 300 simultaneous stalled connections; every one was accepted,
+    none was ever refused or closed) and by reading uvicorn's h11 protocol
+    implementation, which unconditionally accepts and tracks every new TCP
+    connection with no check against `limit_concurrency` at accept time at
+    all - that check only runs when some *other* connection completes a
+    request. Uvicorn also has no time-based header-read timeout at all, so
+    a connection sending a few bytes of valid-so-far header data every few
+    seconds, forever, is never evicted by time either.
+
+    Net effect this test actually demonstrates: a real, verified symptom
+    (other traffic gets 503) - not a general containment guarantee. The
+    attacker's own connections accumulate up to whatever the host's file-
+    descriptor/memory limits allow, not a number this service controls.
+    Closing that gap needs a reverse proxy or a custom accept-time
+    gatekeeper in front of uvicorn - deliberately out of scope for this
+    loopback- and Docker-internal-network-only slice; see `settings.py`'s
+    `limit_concurrency`/`h11_max_incomplete_event_size` docstrings for the
+    full reasoning and the trigger to revisit."""
     assert sidecar.base_url.host is not None
     assert sidecar.base_url.port is not None
 

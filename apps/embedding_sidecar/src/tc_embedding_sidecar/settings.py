@@ -80,55 +80,69 @@ class Settings(BaseSettings):
     # hold), and each such connection still occupies memory and a uvicorn
     # connection slot for as long as it is allowed to linger.
     max_body_read_seconds: float = 10.0
-    # Passed straight through to uvicorn's own `limit_concurrency`: the
-    # hard ceiling on concurrent connections/requests uvicorn will accept
-    # at the transport level, *before* any of this process's own code
-    # (including `MaxBodySizeMiddleware`'s body buffering) ever runs for
-    # the request beyond it - uvicorn answers 503 itself. This is the
-    # actual fix for "many concurrent requests each buffering their own
-    # body": the request-level bounds above only ever bounded one request
-    # at a time; nothing previously capped how many could be doing that
-    # buffering simultaneously. Set comfortably above
-    # `max_concurrent_encodes + max_queued_encodes` so legitimate bursts
-    # (health checks alongside real traffic) are not the ones turned away.
+    # Passed straight through to uvicorn's own `limit_concurrency`: once
+    # this many connections are open, a *complete* request arriving on a
+    # connection beyond that count gets 503 from uvicorn itself, before
+    # this process's own code (including `MaxBodySizeMiddleware`'s body
+    # buffering) ever runs for it. This is the fix for "many *completed*
+    # concurrent requests each buffering their own body": the request-level
+    # bounds above only ever bounded one request at a time; nothing
+    # previously capped how many could be doing that buffering
+    # simultaneously. Set comfortably above `max_concurrent_encodes +
+    # max_queued_encodes` so legitimate bursts (health checks alongside
+    # real traffic) are not the ones turned away.
     #
-    # Confirmed by reading uvicorn's h11 protocol implementation directly
-    # (not assumed): a connection is added to the tracked set in
-    # `connection_made` - fired the instant the TCP connection is
-    # accepted - and only removed in `connection_lost`. This limit
-    # therefore *does* count a connection that never finishes sending its
-    # request line/headers at all, not only ones with a complete request -
-    # opening more than `limit_concurrency` such stalled connections
-    # degrades the service to answering 503 for new legitimate requests
-    # once the ceiling is reached, rather than exhausting memory/file
-    # descriptors without bound. See `h11_max_incomplete_event_size` below
-    # for the one further mitigation available without new infrastructure,
-    # and its own docstring for the gap that remains even with both set.
+    # This does **not** cap or close a connection that never completes its
+    # request line/headers at all - confirmed by reading uvicorn's h11
+    # protocol implementation directly, then verifying against a real
+    # running container (300 simultaneous stalled, incomplete-header
+    # connections; every one was accepted, none was ever refused or
+    # closed). `connection_made` unconditionally accepts and tracks every
+    # new TCP connection with no check against this limit at all; the
+    # limit is consulted only when some *other* connection completes a
+    # request, to decide whether *that* request gets 503. A prior version
+    # of this comment claimed opening more than `limit_concurrency` stalled
+    # connections "degrades the service... rather than exhausting memory/
+    # file descriptors without bound" - that was wrong, caught by a second
+    # review round: the stalled connections themselves are never rejected,
+    # so they accumulate up to whatever the OS's file-descriptor/memory
+    # limits allow, not a number this service controls. What *is* true, and
+    # what `tests/contract/embedding_sidecar/test_embed_endpoint.py`'s
+    # stalled-connection test actually proves: once enough stalled
+    # connections exist to reach this count, *other*, complete requests
+    # (e.g. a legitimate `/health` check) start getting 503 - a real,
+    # verified symptom, but not evidence that the attack itself is capped.
+    # See `h11_max_incomplete_event_size` below for the one further,
+    # narrower mitigation available without new infrastructure.
     limit_concurrency: int = 32
     # Bounds how many bytes of a *single* incomplete HTTP event (e.g. a
     # request line/header block that has not yet terminated) uvicorn's h11
-    # implementation will buffer before giving up on that connection -
+    # implementation will buffer before giving up on *that* connection -
     # uvicorn's own default (16 KiB), made explicit here rather than left
-    # implicit. This is a size cap, not a time cap: a connection sending
-    # a few bytes of valid-so-far header data every few seconds, forever,
-    # is not rejected by this - only one sending more incomplete data than
-    # this ceiling before ever completing its headers is. Combined with
-    # `limit_concurrency` above, the residual gap is exactly what Codex's
-    # review of this slice named: many connections held open with a small
-    # amount of incomplete header data, sent slowly, are individually
-    # within this size cap and are never time-boxed by uvicorn, degrading
-    # the service to 503-for-everyone (bounded, not unbounded resource
-    # exhaustion - `limit_concurrency` still caps how many such
-    # connections can be held at once) for as long as an attacker sustains
-    # them. Uvicorn has no built-in header-read timeout to close this the
-    # rest of the way; doing so requires either a reverse proxy in front
-    # (its own pinned image/config surface) or a hand-rolled asyncio
-    # protocol-level timeout wrapper (nontrivial, easy to get subtly
-    # wrong) - both out of scope for this slice, deliberately: this
-    # service is loopback- and Docker-internal-network-only today, the
-    # same perimeter every other `core` service (postgres, api) in this
-    # stack already relies on with no proxy in front either. Revisit if
-    # this service is ever exposed beyond that boundary.
+    # implicit. This bounds per-connection memory only; it does not bound
+    # how many such connections may be held open at once (see
+    # `limit_concurrency` above - confirmed not to cap this either) nor how
+    # long one may be held (there is no time budget at all for the header-
+    # read phase, unlike `max_body_read_seconds` for the body phase once a
+    # request line is complete).
+    #
+    # Net residual gap, stated plainly: nothing in this process prevents an
+    # attacker from opening an effectively unlimited number of connections
+    # that each send a small amount of incomplete header data, slowly,
+    # forever - bounded only by the host's file-descriptor and memory
+    # limits, not by any setting here. Closing this requires either a
+    # reverse proxy in front (its own pinned image/config surface, with
+    # mature header-read-timeout and connection-cap handling) or a hand-
+    # rolled asyncio accept-time gatekeeper (assessed and rejected for this
+    # slice - a known asyncio failure mode makes a naive version risk
+    # making things worse, e.g. an accept-retry busy-loop once a file-
+    # descriptor limit is hit, and it would duplicate what a real proxy
+    # already does more robustly). Deliberately accepted as residual risk
+    # for this slice instead, given this service's actual reachability
+    # today - loopback- and Docker-internal-network-only, the same
+    # perimeter every other `core` service (postgres, api) in this stack
+    # already relies on with no proxy in front of either. Revisit if this
+    # service is ever exposed beyond that boundary.
     h11_max_incomplete_event_size: int = 16_384
 
 
