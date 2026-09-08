@@ -218,6 +218,30 @@ def _try_parse_json_object(raw: str) -> dict[str, object] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+# The complete set of event types khoj's `ChatEvent`/`send_event` ever emits
+# (khoj.processor.conversation.utils, khoj.routers.api_chat, pinned tag) -
+# not just the ones this adapter surfaces. Used to tell a genuine (if
+# unhandled) khoj event apart from raw MESSAGE-event answer text that merely
+# happens to parse as a JSON object with a "type"-named key - a coincidence
+# `_parse_chat_event` must not mistake for a real event, whether or not that
+# coincidental value happens to collide with a name on this list.
+_KNOWN_EVENT_TYPES = frozenset(
+    {
+        "metadata",
+        "references",
+        "message",
+        "start_llm_response",
+        "end_llm_response",
+        "usage",
+        "end_response",
+        "status",
+        "thought",
+        "generated_assets",
+        "interrupt",
+    }
+)
+
+
 def _parse_chat_event(
     raw_event: str, conversation_id: str | None
 ) -> tuple[str | None, KhojChatChunk | None]:
@@ -241,13 +265,15 @@ def _parse_chat_event(
     event_type = parsed.get("type")
     data = parsed.get("data")
 
-    if event_type is None:
-        # Every genuine khoj event carries a "type" key (see this module's
-        # docstring); a dict without one is not a typed event at all, just
-        # raw MESSAGE-event answer text that happens to look JSON-shaped
-        # (e.g. an answer literally starting with '{"answer": ...}'). Fall
-        # through to the untyped-text path instead of silently discarding
-        # it as an unrecognized event.
+    if event_type not in _KNOWN_EVENT_TYPES:
+        # Either there's no "type" key at all, or its value is not one khoj
+        # actually emits. Either way this cannot be a genuine typed event,
+        # so it must be raw MESSAGE-event answer text that happens to be
+        # JSON-shaped - e.g. an answer literally starting with
+        # '{"answer": ...}', or one that coincidentally has a "type" key
+        # whose value is not a real khoj event name. Only a *recognized*
+        # event type may be silently dropped below; an unrecognized one
+        # falls through to the untyped-text path instead.
         return conversation_id, KhojChatChunk(text_delta=raw_event)
 
     if event_type == "metadata":

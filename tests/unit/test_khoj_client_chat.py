@@ -178,6 +178,21 @@ async def test_chat_treats_a_json_shaped_raw_answer_as_text_not_a_dropped_event(
     assert [c.text_delta for c in chunks if c.text_delta] == ['{"answer": "42"}']
 
 
+async def test_chat_treats_a_json_shaped_raw_answer_with_a_bogus_type_key_as_text() -> None:
+    """The same bug, one layer deeper: an untyped answer chunk that
+    coincidentally has a "type" key khoj never actually emits (e.g. the
+    model answers with literal JSON like '{"type": "answer", "data": "42"}')
+    must not be mistaken for a genuine-but-unhandled khoj event and dropped
+    - only a *recognized* event type may be silently ignored."""
+    stream_body = _message('{"type": "answer", "data": "42"}') + _event("end_response", "")
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = HttpKhojClient(http, "http://khoj.invalid")
+        chunks = await _drain(client)
+
+    assert [c.text_delta for c in chunks if c.text_delta] == ['{"type": "answer", "data": "42"}']
+
+
 async def test_chat_cleanup_failure_does_not_mask_a_successful_answer() -> None:
     stream_body = "".join(
         [
