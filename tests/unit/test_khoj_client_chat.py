@@ -193,6 +193,26 @@ async def test_chat_treats_a_json_shaped_raw_answer_with_a_bogus_type_key_as_tex
     assert [c.text_delta for c in chunks if c.text_delta] == ['{"type": "answer", "data": "42"}']
 
 
+async def test_chat_treats_a_json_shaped_raw_answer_with_a_non_string_type_as_text() -> None:
+    """A deeper variant of the same bug: a raw answer chunk whose JSON shape
+    has a "type" key, but one whose *value* is not even a string (e.g. a
+    list or dict) - a real khoj event's "type" is always a string, so this
+    cannot be a genuine event either. Must degrade to text like every other
+    unrecognized shape, not raise `TypeError: unhashable type` from testing
+    an unhashable value for frozenset membership."""
+    stream_body = _message('{"type": ["string", "null"], "data": "x"}') + _event(
+        "end_response", ""
+    )
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = HttpKhojClient(http, "http://khoj.invalid")
+        chunks = await _drain(client)  # must not raise TypeError
+
+    assert [c.text_delta for c in chunks if c.text_delta] == [
+        '{"type": ["string", "null"], "data": "x"}'
+    ]
+
+
 async def test_chat_cleanup_failure_does_not_mask_a_successful_answer() -> None:
     stream_body = "".join(
         [
