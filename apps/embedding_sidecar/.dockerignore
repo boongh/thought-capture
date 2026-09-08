@@ -1,0 +1,12 @@
+# The Dockerfile only ever COPYs pyproject.toml/uv.lock/.python-version/src/
+# (deploy/compose/docker-compose.yml's `embedding-sidecar` service builds
+# this whole directory as its context) - everything below is real local
+# state `docker build` would otherwise tar up and send to the daemon on
+# every rebuild for nothing, including a multi-GB `.venv` (torch/
+# sentence-transformers) once this project has been synced locally once.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

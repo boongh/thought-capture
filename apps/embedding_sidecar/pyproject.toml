@@ -1,0 +1,98 @@
+# A fully separate project, deliberately NOT a member of the repository
+# root's uv workspace (see that file's `[tool.uv.workspace] exclude`).
+# docs/adr/0010 §5: local embedding needs `sentence-transformers` ->
+# `torch`, neither of which ships a cp314 wheel yet, so this sidecar is
+# pinned to its own older interpreter with its own lockfile - the same
+# "separate runtime, own image" isolation this repo already required of
+# Khoj (docs/DESIGN.md 5.2), except first-party code instead of a vendored
+# image.
+
+[project]
+name = "tc-embedding-sidecar"
+version = "0.1.0"
+description = "Local sentence-transformers embedding service (docs/adr/0010)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.118",
+    "uvicorn[standard]>=0.37",
+    "pydantic-settings>=2.8",
+    "sentence-transformers>=3.3",
+    "torch>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.0",
+    "httpx>=0.28",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tc_embedding_sidecar"]
+
+# CPU-only wheels only: the default PyPI `torch` wheel bundles CUDA
+# libraries the sidecar never uses (docs/adr/0010 §5: "CPU-only, local"),
+# which would otherwise multiply the image size for nothing. `explicit`
+# keeps this index scoped to `torch` alone rather than shadowing PyPI for
+# every other dependency.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+# ---------------------------------------------------------------------------
+# Lint and format - same rule set as the root workspace, scoped to this
+# project's own sources since it is not covered by the root `[tool.ruff]`
+# `src` list (that list is Python-3.14 code only).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "SIM", "PTH", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tc_embedding_sidecar"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+mypy_path = ["src"]
+files = ["src"]
+
+# sentence-transformers/torch ship uneven or absent inline types; the
+# sidecar's own transport and settings code stays strictly checked.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers.*", "torch.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Tests - this project's own suite, run from within this directory
+# (`cd apps/embedding_sidecar && uv run pytest`), never from the repository
+# root's `uv run pytest`, which resolves a different Python entirely.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]

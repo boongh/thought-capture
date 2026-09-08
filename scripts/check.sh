@@ -99,6 +99,28 @@ step "types (mypy)"        "$uv_bin" run mypy
 step "unit tests"          "$uv_bin" run pytest -m "not integration and not contract"
 
 # ---------------------------------------------------------------------------
+# apps/embedding_sidecar carries its own toolchain (Python 3.12, own
+# pyproject.toml/uv.lock - docs/adr/0010 §5) and is deliberately excluded
+# from the root uv workspace, so none of the four steps above ever touch it.
+# Required, not skippable: this needs only uv + network access to provision
+# Python 3.12 (the same way the root project's own 3.14 is provisioned), not
+# Docker - a ruff/mypy/test regression here must fail the same way a root
+# regression does, not silently pass because nothing ever ran it (CLAUDE.md:
+# "extend both check scripts" whenever a formatter/linter/type checker/test
+# suite is added).
+# ---------------------------------------------------------------------------
+step "embedding sidecar: lockfile is current" \
+  bash -c "cd apps/embedding_sidecar && \"\$0\" lock --check" "$uv_bin"
+step "embedding sidecar: format (ruff)" \
+  bash -c "cd apps/embedding_sidecar && \"\$0\" run ruff format --check ." "$uv_bin"
+step "embedding sidecar: lint (ruff)" \
+  bash -c "cd apps/embedding_sidecar && \"\$0\" run ruff check ." "$uv_bin"
+step "embedding sidecar: types (mypy)" \
+  bash -c "cd apps/embedding_sidecar && \"\$0\" run mypy" "$uv_bin"
+step "embedding sidecar: unit tests" \
+  bash -c "cd apps/embedding_sidecar && \"\$0\" run pytest" "$uv_bin"
+
+# ---------------------------------------------------------------------------
 # Integration tests: require PostgreSQL from the 'core' compose profile.
 # ---------------------------------------------------------------------------
 printf '\n--- integration tests\n'
@@ -111,7 +133,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   fi
   printf '%s\n' "OK: integration tests"
 else
-  skipped+=("integration tests (Docker engine unavailable; start Docker, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d)")
+  skipped+=("integration tests (Docker engine unavailable; start Docker, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build)")
   printf '%s\n' "SKIPPED: Docker engine unavailable"
 fi
 
@@ -227,17 +249,37 @@ fi
 # unreachable Khoj is a skip, not a hard failure, until Phase 2 makes it
 # required.
 # ---------------------------------------------------------------------------
-printf '\n--- contract tests\n'
+printf '\n--- contract tests (khoj)\n'
 khoj_url="${TC_KHOJ_BASE_URL:-http://127.0.0.1:42110}"
 if curl --silent --fail --max-time 3 "$khoj_url/api/search?q=check" >/dev/null 2>&1; then
-  if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract; then
-    printf 'FAIL: contract tests\n' >&2
+  if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract tests/contract/khoj; then
+    printf 'FAIL: contract tests (khoj)\n' >&2
     exit 1
   fi
-  printf '%s\n' "OK: contract tests"
+  printf '%s\n' "OK: contract tests (khoj)"
 else
-  skipped+=("contract tests (Khoj unreachable at $khoj_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)")
+  skipped+=("contract tests (khoj) (Khoj unreachable at $khoj_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)")
   printf '%s\n' "SKIPPED: Khoj unreachable at $khoj_url"
+fi
+
+# ---------------------------------------------------------------------------
+# Contract tests: require the embedding sidecar from the 'core' compose
+# profile (docs/adr/0010). First-party and part of 'core', not an optional
+# add-on the way Khoj/'ai' is - still gated on explicit reachability, not a
+# hard failure, since 'core' being started at all is not implied by Docker
+# merely being available (same reasoning as the integration-test gate above).
+# ---------------------------------------------------------------------------
+printf '\n--- contract tests (embedding sidecar)\n'
+embedding_sidecar_url="${TC_EMBEDDING_SIDECAR_BASE_URL:-http://127.0.0.1:8081}"
+if curl --silent --fail --max-time 3 "$embedding_sidecar_url/health" >/dev/null 2>&1; then
+  if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract tests/contract/embedding_sidecar; then
+    printf 'FAIL: contract tests (embedding sidecar)\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "OK: contract tests (embedding sidecar)"
+else
+  skipped+=("contract tests (embedding sidecar) (unreachable at $embedding_sidecar_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build embedding-sidecar)")
+  printf '%s\n' "SKIPPED: embedding sidecar unreachable at $embedding_sidecar_url"
 fi
 
 # ---------------------------------------------------------------------------

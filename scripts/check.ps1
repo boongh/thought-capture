@@ -108,6 +108,38 @@ try {
     Invoke-Step "unit tests"          { & $Uv run pytest -m "not integration and not contract" }
 
     # -----------------------------------------------------------------------
+    # apps/embedding_sidecar carries its own toolchain (Python 3.12, own
+    # pyproject.toml/uv.lock - docs/adr/0010 §5) and is deliberately excluded
+    # from the root uv workspace, so none of the five steps above ever touch
+    # it. Required, not skippable: this needs only uv + network access to
+    # provision Python 3.12 (the same way the root project's own 3.14 is
+    # provisioned), not Docker - a ruff/mypy/test regression here must fail
+    # the same way a root regression does, not silently pass because nothing
+    # ever ran it (CLAUDE.md: "extend both check scripts" whenever a
+    # formatter/linter/type checker/test suite is added).
+    # -----------------------------------------------------------------------
+    Invoke-Step "embedding sidecar: lockfile is current" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv lock --check } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: format (ruff)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run ruff format --check . } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: lint (ruff)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run ruff check . } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: types (mypy)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run mypy } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: unit tests" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run pytest } finally { Pop-Location }
+    }
+
+    # -----------------------------------------------------------------------
     # Integration tests: require PostgreSQL from the 'core' compose profile.
     # -----------------------------------------------------------------------
     Write-Host ""
@@ -132,7 +164,7 @@ try {
         Write-Host "OK: integration tests"
     }
     else {
-        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d)"
+        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build)"
         Write-Host "SKIPPED: Docker engine unavailable" -ForegroundColor Yellow
     }
 
@@ -273,7 +305,7 @@ try {
     # required.
     # -----------------------------------------------------------------------
     Write-Host ""
-    Write-Host "--- contract tests" -ForegroundColor Cyan
+    Write-Host "--- contract tests (khoj)" -ForegroundColor Cyan
     $KhojUrl = if ($env:TC_KHOJ_BASE_URL) { $env:TC_KHOJ_BASE_URL } else { "http://127.0.0.1:42110" }
     $KhojUp = $false
     try {
@@ -287,17 +319,52 @@ try {
     if ($KhojUp) {
         $env:TC_REQUIRE_CONTRACT = "1"
         try {
-            & $Uv run pytest -m contract
-            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (exit $LASTEXITCODE)" }
+            & $Uv run pytest -m contract tests/contract/khoj
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (khoj) (exit $LASTEXITCODE)" }
         }
         finally {
             Remove-Item Env:\TC_REQUIRE_CONTRACT -ErrorAction SilentlyContinue
         }
-        Write-Host "OK: contract tests"
+        Write-Host "OK: contract tests (khoj)"
     }
     else {
-        $Script:Skipped += "contract tests (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)"
+        $Script:Skipped += "contract tests (khoj) (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)"
         Write-Host "SKIPPED: Khoj unreachable at $KhojUrl" -ForegroundColor Yellow
+    }
+
+    # -------------------------------------------------------------------
+    # Contract tests: require the embedding sidecar from the 'core' compose
+    # profile (docs/adr/0010). First-party and part of 'core', not an
+    # optional add-on the way Khoj/'ai' is - still gated on explicit
+    # reachability, not a hard failure, since 'core' being started at all is
+    # not implied by Docker merely being available.
+    # -------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- contract tests (embedding sidecar)" -ForegroundColor Cyan
+    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_BASE_URL } else { "http://127.0.0.1:8081" }
+    $EmbeddingSidecarUp = $false
+    try {
+        $response = Invoke-WebRequest -Uri "$EmbeddingSidecarUrl/health" -TimeoutSec 3 -UseBasicParsing
+        if ($response.StatusCode -eq 200) { $EmbeddingSidecarUp = $true }
+    }
+    catch {
+        $EmbeddingSidecarUp = $false
+    }
+
+    if ($EmbeddingSidecarUp) {
+        $env:TC_REQUIRE_CONTRACT = "1"
+        try {
+            & $Uv run pytest -m contract tests/contract/embedding_sidecar
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (embedding sidecar) (exit $LASTEXITCODE)" }
+        }
+        finally {
+            Remove-Item Env:\TC_REQUIRE_CONTRACT -ErrorAction SilentlyContinue
+        }
+        Write-Host "OK: contract tests (embedding sidecar)"
+    }
+    else {
+        $Script:Skipped += "contract tests (embedding sidecar) (unreachable at $EmbeddingSidecarUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build embedding-sidecar)"
+        Write-Host "SKIPPED: embedding sidecar unreachable at $EmbeddingSidecarUrl" -ForegroundColor Yellow
     }
 
     # -----------------------------------------------------------------------

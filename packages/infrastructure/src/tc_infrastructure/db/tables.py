@@ -10,9 +10,15 @@ here against the live database.
 from __future__ import annotations
 
 import sqlalchemy as sa
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects import postgresql as pg
 
 metadata = sa.MetaData()
+
+# thenlper/gte-small (docs/adr/0010 §5's recommended v1 model) outputs
+# 384-dim vectors; migrations/versions/0008_document_embeddings.py is the
+# authoritative source for this value.
+EMBEDDING_DIMENSIONS = 384
 
 users = sa.Table(
     "users",
@@ -251,6 +257,16 @@ khoj_index_items = sa.Table(
     sa.Column("revision_id", pg.UUID(as_uuid=True), nullable=False),
     sa.Column("body_sha256", sa.CHAR(64), nullable=False),
     sa.Column("synced_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+document_embeddings = sa.Table(
+    "document_embeddings",
+    metadata,
+    sa.Column("document_id", pg.UUID(as_uuid=True), primary_key=True),
+    sa.Column("revision_id", pg.UUID(as_uuid=True), nullable=False),
+    sa.Column("embedding", Vector(EMBEDDING_DIMENSIONS), nullable=False),
+    sa.Column("embedding_model_id", sa.Text, nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
 )
 
 outbox_events = sa.Table(

@@ -13,6 +13,12 @@ dev = [
 
 [tool.uv.workspace]
 members = ["apps/*", "packages/*"]
+# apps/embedding_sidecar is pinned to Python 3.12 (docs/adr/0010 §5: torch/
+# sentence-transformers ship no cp314 wheels yet) and carries its own
+# pyproject.toml/lockfile - it must not join this workspace's single Python
+# 3.14 resolution, the same isolation this repo already required of Khoj
+# (docs/DESIGN.md 5.2).
+exclude = ["apps/embedding_sidecar"]
 
 [tool.uv.sources]
 tc-domain = { workspace = true }
