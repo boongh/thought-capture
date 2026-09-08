@@ -11,7 +11,18 @@ import pytest
 pytestmark = pytest.mark.contract
 
 EXPECTED_MODEL_ID = "thenlper/gte-small"
+# The immutable commit this project pins (settings.py's own docstring has
+# the full reasoning) - asserting it here catches a rebuild that silently
+# resolved a different revision, not just a different model id.
+EXPECTED_MODEL_REVISION = "17e1f347d17fe144873b1201da91788898c639cd"
 EXPECTED_DIMENSIONS = 384
+
+# Must match apps/embedding_sidecar/src/tc_embedding_sidecar/settings.py's
+# own defaults - duplicated here because the contract tests run in this
+# project's own Python 3.14 environment and cannot import the sidecar's
+# Python-3.12-only settings module directly.
+MAX_BATCH_SIZE = 64
+MAX_TEXT_LENGTH = 50_000
 
 
 async def test_health_reports_the_ready_model(sidecar: httpx.AsyncClient) -> None:
@@ -21,6 +32,7 @@ async def test_health_reports_the_ready_model(sidecar: httpx.AsyncClient) -> Non
     body = response.json()
     assert body["status"] == "ok"
     assert body["model_id"] == EXPECTED_MODEL_ID
+    assert body["model_revision"] == EXPECTED_MODEL_REVISION
     assert body["dimensions"] == EXPECTED_DIMENSIONS
 
 
@@ -32,6 +44,7 @@ async def test_embed_returns_a_vector_of_the_expected_dimensionality(
     assert response.status_code == 200
     body = response.json()
     assert body["model_id"] == EXPECTED_MODEL_ID
+    assert body["model_revision"] == EXPECTED_MODEL_REVISION
     assert body["dimensions"] == EXPECTED_DIMENSIONS
     assert len(body["vectors"]) == 1
     vector = body["vectors"][0]
@@ -71,5 +84,22 @@ async def test_embed_with_an_empty_batch_returns_no_vectors(sidecar: httpx.Async
 
 async def test_embed_rejects_a_malformed_request_body(sidecar: httpx.AsyncClient) -> None:
     response = await sidecar.post("/embed", json={"texts": "not-a-list"})
+
+    assert response.status_code == 422
+
+
+async def test_embed_rejects_a_batch_over_the_configured_limit(sidecar: httpx.AsyncClient) -> None:
+    """Proves the real deployed process enforces this bound, not only the
+    fake-model unit tests - a request this large would otherwise tie up the
+    single-process CPU-bound encoder for an unbounded amount of work."""
+    response = await sidecar.post("/embed", json={"texts": ["x"] * (MAX_BATCH_SIZE + 1)})
+
+    assert response.status_code == 422
+
+
+async def test_embed_rejects_a_text_over_the_configured_length_limit(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    response = await sidecar.post("/embed", json={"texts": ["x" * (MAX_TEXT_LENGTH + 1)]})
 
     assert response.status_code == 422

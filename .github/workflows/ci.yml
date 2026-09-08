@@ -72,6 +72,29 @@ jobs:
         # which is the dependency-metadata validation the design asks for.
         run: uv sync --all-packages --frozen
 
+      - name: Build and smoke-test the custom Postgres image (docs/adr/0010 §2)
+        # The step below patches the *stock* `postgres:18.6-trixie` services
+        # container (started before any step ran) rather than building
+        # deploy/compose/postgres/Dockerfile - a bug in that Dockerfile
+        # itself (a bad ARG, a broken RUN step, a base-image reference typo)
+        # would otherwise never be exercised anywhere in CI and could merge
+        # green. This actually builds it and proves the resulting image
+        # boots and serves `CREATE EXTENSION vector`, independent of (and in
+        # addition to) the patched services container the rest of this job
+        # uses for migration/integration testing.
+        run: |
+          docker build -t thought-capture-postgres:ci -f deploy/compose/postgres/Dockerfile deploy/compose/postgres
+          docker run -d --name pg-smoke -e POSTGRES_PASSWORD=ci-smoke-only thought-capture-postgres:ci
+          for _ in $(seq 1 20); do
+            if docker exec pg-smoke pg_isready -U postgres >/dev/null 2>&1; then
+              echo "Custom Postgres image is ready"
+              break
+            fi
+            sleep 1
+          done
+          docker exec pg-smoke psql -U postgres -c "CREATE EXTENSION vector; SELECT '[1,2,3]'::vector;"
+          docker rm -f pg-smoke
+
       - name: Install pgvector into the CI Postgres service
         # GitHub Actions `services:` containers are started from a pulled
         # image before any step runs, so they cannot be the custom image

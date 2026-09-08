@@ -231,6 +231,13 @@ services:
       # but loading its weights into memory at process start still takes on
       # the order of docs/adr/0010 finding 5's ~30s cold start.
       start_period: 45s
+    # Defense in depth alongside the request-level batch/length/concurrency
+    # bounds this service enforces itself (settings.py): a container-level
+    # ceiling on how much of the host a CPU-bound, unauthenticated-within-
+    # the-network embedding process can consume, matching how this repo
+    # already treats "loopback only" as a boundary, not the only one.
+    mem_limit: ${TC_EMBEDDING_SIDECAR_MEM_LIMIT:-2g}
+    cpus: ${TC_EMBEDDING_SIDECAR_CPU_LIMIT:-2.0}
     security_opt:
       - no-new-privileges:true
 

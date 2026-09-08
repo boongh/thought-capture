@@ -5,7 +5,8 @@ from __future__ import annotations
 from httpx import AsyncClient
 
 from tc_embedding_sidecar.app import MODEL_NOT_READY_DETAIL
-from tests.conftest import FAKE_DIMENSIONS, FAKE_MODEL_ID
+from tc_embedding_sidecar.settings import get_settings
+from tests.conftest import FAKE_DIMENSIONS, FAKE_MODEL_ID, FAKE_MODEL_REVISION
 
 
 async def test_health_reports_ready_model(client: AsyncClient) -> None:
@@ -13,7 +14,12 @@ async def test_health_reports_ready_model(client: AsyncClient) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {"status": "ok", "model_id": FAKE_MODEL_ID, "dimensions": FAKE_DIMENSIONS}
+    assert body == {
+        "status": "ok",
+        "model_id": FAKE_MODEL_ID,
+        "model_revision": FAKE_MODEL_REVISION,
+        "dimensions": FAKE_DIMENSIONS,
+    }
 
 
 async def test_health_returns_503_before_the_model_is_ready(not_ready_client: AsyncClient) -> None:
@@ -29,6 +35,7 @@ async def test_embed_returns_one_vector_per_text_in_order(client: AsyncClient) -
     assert response.status_code == 200
     body = response.json()
     assert body["model_id"] == FAKE_MODEL_ID
+    assert body["model_revision"] == FAKE_MODEL_REVISION
     assert body["dimensions"] == FAKE_DIMENSIONS
     assert len(body["vectors"]) == 3
     assert all(len(vector) == FAKE_DIMENSIONS for vector in body["vectors"])
@@ -46,3 +53,44 @@ async def test_embed_returns_503_before_the_model_is_ready(not_ready_client: Asy
 
     assert response.status_code == 503
     assert response.json()["detail"] == MODEL_NOT_READY_DETAIL
+
+
+# ---------------------------------------------------------------------------
+# Request bounds (settings.py: batch size and per-text length), guarding
+# against unbounded CPU-bound work per request.
+# ---------------------------------------------------------------------------
+
+
+async def test_embed_rejects_a_batch_over_the_configured_limit(client: AsyncClient) -> None:
+    limit = get_settings().max_batch_size
+
+    response = await client.post("/embed", json={"texts": ["x"] * (limit + 1)})
+
+    assert response.status_code == 422
+
+
+async def test_embed_accepts_a_batch_at_exactly_the_configured_limit(client: AsyncClient) -> None:
+    limit = get_settings().max_batch_size
+
+    response = await client.post("/embed", json={"texts": ["x"] * limit})
+
+    assert response.status_code == 200
+    assert len(response.json()["vectors"]) == limit
+
+
+async def test_embed_rejects_a_text_over_the_configured_length_limit(client: AsyncClient) -> None:
+    limit = get_settings().max_text_length
+
+    response = await client.post("/embed", json={"texts": ["x" * (limit + 1)]})
+
+    assert response.status_code == 422
+
+
+async def test_embed_accepts_a_text_at_exactly_the_configured_length_limit(
+    client: AsyncClient,
+) -> None:
+    limit = get_settings().max_text_length
+
+    response = await client.post("/embed", json={"texts": ["x" * limit]})
+
+    assert response.status_code == 200

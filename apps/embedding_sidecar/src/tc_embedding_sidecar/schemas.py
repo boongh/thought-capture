@@ -19,6 +19,12 @@ class EmbedRequest(BaseModel):
 
 class EmbedResponse(BaseModel):
     model_id: str
+    # A HF repo's default branch is mutable; this is the exact immutable
+    # commit the returned vectors were computed from (settings.py has the
+    # full reasoning). A future writer of `document_embeddings
+    # .embedding_model_id` combines `model_id`/`model_revision` into one
+    # identity string - not decided by this HTTP contract.
+    model_revision: str
     dimensions: int
     vectors: tuple[tuple[float, ...], ...]
 
@@ -26,4 +32,5 @@ class EmbedResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     model_id: str
+    model_revision: str
     dimensions: int

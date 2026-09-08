@@ -47,11 +47,14 @@ USER tc
 # Bakes the pinned model's weights into the image layer, so a container
 # restart never depends on network access to Hugging Face's hub at runtime
 # (docs/DESIGN.md 9's "local by default"; docs/adr/0010 §5's "no external
-# calls"). Uses the same settings module the app itself reads, so the model
-# id can never drift between build time and run time.
+# calls"). Uses the same settings module the app itself reads - including
+# `model_revision` (settings.py's own docstring has the full reasoning for
+# why the bare model id alone is not enough) - so the model id and pinned
+# revision can never drift between build time and run time.
 RUN python -c "from tc_embedding_sidecar.settings import get_settings; \
     from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer(get_settings().model_id)"
+    settings = get_settings(); \
+    SentenceTransformer(settings.model_id, revision=settings.model_revision)"
 
 # Only takes effect after the bake step above, which needs the opposite -
 # forcing this on earlier would make that download fail. Guarantees the

@@ -20,12 +20,14 @@ from httpx import ASGITransport, AsyncClient
 from tc_embedding_sidecar.app import create_app
 
 FAKE_MODEL_ID = "fake/stub-embedder"
+FAKE_MODEL_REVISION = "fake0000revision0000sha"
 FAKE_DIMENSIONS = 4
 
 
 class FakeEmbeddingModel:
     def __init__(self, *, ready: bool = True) -> None:
         self.model_id = FAKE_MODEL_ID
+        self.revision = FAKE_MODEL_REVISION
         self.dimensions = FAKE_DIMENSIONS
         self._ready = ready
 
