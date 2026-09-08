@@ -164,6 +164,20 @@ async def test_chat_treats_a_json_shaped_message_event_as_text() -> None:
     assert deltas == [json.dumps({"details": "something"})]
 
 
+async def test_chat_treats_a_json_shaped_raw_answer_as_text_not_a_dropped_event() -> None:
+    """The exact bug independent review caught: a raw (untyped) MESSAGE
+    chunk whose answer text itself happens to be a JSON object - e.g. the
+    model literally answers '{"answer": "..."}' - has no "type" key, so it
+    must never be mistaken for a typed event and silently dropped."""
+    stream_body = _message('{"answer": "42"}') + _event("end_response", "")
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = HttpKhojClient(http, "http://khoj.invalid")
+        chunks = await _drain(client)
+
+    assert [c.text_delta for c in chunks if c.text_delta] == ['{"answer": "42"}']
+
+
 async def test_chat_cleanup_failure_does_not_mask_a_successful_answer() -> None:
     stream_body = "".join(
         [

@@ -241,6 +241,15 @@ def _parse_chat_event(
     event_type = parsed.get("type")
     data = parsed.get("data")
 
+    if event_type is None:
+        # Every genuine khoj event carries a "type" key (see this module's
+        # docstring); a dict without one is not a typed event at all, just
+        # raw MESSAGE-event answer text that happens to look JSON-shaped
+        # (e.g. an answer literally starting with '{"answer": ...}'). Fall
+        # through to the untyped-text path instead of silently discarding
+        # it as an unrecognized event.
+        return conversation_id, KhojChatChunk(text_delta=raw_event)
+
     if event_type == "metadata":
         if isinstance(data, dict):
             candidate = data.get("conversationId")
