@@ -26,6 +26,12 @@ def main() -> int:
         host=settings.host,
         port=settings.port,
         log_level="info",
+        # The transport-level concurrency ceiling (settings.py's own
+        # docstring has the full reasoning): beyond this many concurrent
+        # connections, uvicorn itself answers 503, before this process's
+        # own code - including MaxBodySizeMiddleware's body buffering -
+        # ever runs for the request past the limit.
+        limit_concurrency=settings.limit_concurrency,
     )
     return 0
 

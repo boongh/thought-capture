@@ -5,6 +5,10 @@ cover its `embed` endpoint's request/response shape and failure modes").
 
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
 import httpx
 import pytest
 
@@ -24,6 +28,7 @@ EXPECTED_DIMENSIONS = 384
 MAX_BATCH_SIZE = 64
 MAX_TEXT_LENGTH = 50_000
 MAX_REQUEST_BYTES = 4_000_000
+LIMIT_CONCURRENCY = 32
 
 
 async def test_health_reports_the_ready_model(sidecar: httpx.AsyncClient) -> None:
@@ -116,3 +121,46 @@ async def test_embed_rejects_an_oversized_body_before_parsing_it(
     response = await sidecar.post("/embed", json={"texts": ["x" * (MAX_REQUEST_BYTES + 1)]})
 
     assert response.status_code == 413
+
+
+async def test_concurrent_slow_requests_are_bounded_not_unlimited(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """Fires more concurrent, slowly-streamed requests than the container's
+    configured `limit_concurrency` allows, each individually well within
+    every per-request bound (batch size, text length, byte size) proven
+    above. Those per-request checks only ever bounded one request at a
+    time; this proves *some* transport-level mechanism actually engages
+    once too much arrives at once - uvicorn's own 503 above
+    `limit_concurrency`, the model's 429 admission cap, or the body-read
+    timeout's 408 - rather than everything being silently accepted with
+    no ceiling at all."""
+    request_count = LIMIT_CONCURRENCY + 20
+
+    async def slow_body(index: int) -> AsyncIterator[bytes]:
+        payload = json.dumps({"texts": [f"concurrency probe {index}"]}).encode()
+        midpoint = len(payload) // 2
+        yield payload[:midpoint]
+        await asyncio.sleep(0.3)
+        yield payload[midpoint:]
+
+    async def slow_post(index: int) -> httpx.Response | httpx.HTTPError:
+        try:
+            return await sidecar.post(
+                "/embed",
+                content=slow_body(index),
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            # A connection reset while the server was over capacity is
+            # itself a form of "not silently accepted," not a test bug.
+            return exc
+
+    responses = await asyncio.gather(*(slow_post(i) for i in range(request_count)))
+
+    statuses = [
+        response.status_code if isinstance(response, httpx.Response) else "connection-error"
+        for response in responses
+    ]
+    rejected = [status for status in statuses if status != 200]
+    assert rejected, f"expected at least one rejected/bounded response among {statuses}"

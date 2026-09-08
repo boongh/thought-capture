@@ -71,6 +71,27 @@ class Settings(BaseSettings):
     # headroom over `max_batch_size * max_text_length`'s raw character total
     # (3.2 MB by default) for JSON structure/escaping overhead.
     max_request_bytes: int = 4_000_000
+    # How long `MaxBodySizeMiddleware` will wait for a request body to
+    # finish arriving before giving up (408). Without this, a client that
+    # sends a body slower than `max_bytes` ever requires - a single byte
+    # every few seconds, forever - holds its buffering slot open
+    # indefinitely; the byte cap alone only defends against a body that is
+    # too *large*, not one that simply never finishes (a slowloris-style
+    # hold), and each such connection still occupies memory and a uvicorn
+    # connection slot for as long as it is allowed to linger.
+    max_body_read_seconds: float = 10.0
+    # Passed straight through to uvicorn's own `limit_concurrency`: the
+    # hard ceiling on concurrent connections/requests uvicorn will accept
+    # at the transport level, *before* any of this process's own code
+    # (including `MaxBodySizeMiddleware`'s body buffering) ever runs for
+    # the request beyond it - uvicorn answers 503 itself. This is the
+    # actual fix for "many concurrent requests each buffering their own
+    # body": the request-level bounds above only ever bounded one request
+    # at a time; nothing previously capped how many could be doing that
+    # buffering simultaneously. Set comfortably above
+    # `max_concurrent_encodes + max_queued_encodes` so legitimate bursts
+    # (health checks alongside real traffic) are not the ones turned away.
+    limit_concurrency: int = 32
 
 
 @lru_cache

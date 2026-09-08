@@ -130,7 +130,11 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
     # middleware.py's own docstring has the full reasoning for why the
     # per-field checks in the /embed handler below are not, by themselves,
     # early enough to bound memory use.
-    app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.max_request_bytes)
+    app.add_middleware(
+        MaxBodySizeMiddleware,
+        max_bytes=settings.max_request_bytes,
+        max_read_seconds=settings.max_body_read_seconds,
+    )
 
     @app.get("/health", response_model=HealthResponse, summary="Readiness: model loaded and usable")
     async def health() -> HealthResponse:
