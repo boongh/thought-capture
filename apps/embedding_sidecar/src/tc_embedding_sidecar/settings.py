@@ -91,7 +91,45 @@ class Settings(BaseSettings):
     # buffering simultaneously. Set comfortably above
     # `max_concurrent_encodes + max_queued_encodes` so legitimate bursts
     # (health checks alongside real traffic) are not the ones turned away.
+    #
+    # Confirmed by reading uvicorn's h11 protocol implementation directly
+    # (not assumed): a connection is added to the tracked set in
+    # `connection_made` - fired the instant the TCP connection is
+    # accepted - and only removed in `connection_lost`. This limit
+    # therefore *does* count a connection that never finishes sending its
+    # request line/headers at all, not only ones with a complete request -
+    # opening more than `limit_concurrency` such stalled connections
+    # degrades the service to answering 503 for new legitimate requests
+    # once the ceiling is reached, rather than exhausting memory/file
+    # descriptors without bound. See `h11_max_incomplete_event_size` below
+    # for the one further mitigation available without new infrastructure,
+    # and its own docstring for the gap that remains even with both set.
     limit_concurrency: int = 32
+    # Bounds how many bytes of a *single* incomplete HTTP event (e.g. a
+    # request line/header block that has not yet terminated) uvicorn's h11
+    # implementation will buffer before giving up on that connection -
+    # uvicorn's own default (16 KiB), made explicit here rather than left
+    # implicit. This is a size cap, not a time cap: a connection sending
+    # a few bytes of valid-so-far header data every few seconds, forever,
+    # is not rejected by this - only one sending more incomplete data than
+    # this ceiling before ever completing its headers is. Combined with
+    # `limit_concurrency` above, the residual gap is exactly what Codex's
+    # review of this slice named: many connections held open with a small
+    # amount of incomplete header data, sent slowly, are individually
+    # within this size cap and are never time-boxed by uvicorn, degrading
+    # the service to 503-for-everyone (bounded, not unbounded resource
+    # exhaustion - `limit_concurrency` still caps how many such
+    # connections can be held at once) for as long as an attacker sustains
+    # them. Uvicorn has no built-in header-read timeout to close this the
+    # rest of the way; doing so requires either a reverse proxy in front
+    # (its own pinned image/config surface) or a hand-rolled asyncio
+    # protocol-level timeout wrapper (nontrivial, easy to get subtly
+    # wrong) - both out of scope for this slice, deliberately: this
+    # service is loopback- and Docker-internal-network-only today, the
+    # same perimeter every other `core` service (postgres, api) in this
+    # stack already relies on with no proxy in front either. Revisit if
+    # this service is ever exposed beyond that boundary.
+    h11_max_incomplete_event_size: int = 16_384
 
 
 @lru_cache

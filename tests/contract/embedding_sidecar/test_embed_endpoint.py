@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from collections.abc import AsyncIterator
 
 import httpx
@@ -164,3 +165,62 @@ async def test_concurrent_slow_requests_are_bounded_not_unlimited(
     ]
     rejected = [status for status in statuses if status != 200]
     assert rejected, f"expected at least one rejected/bounded response among {statuses}"
+
+
+def _open_stalled_connection(host: str, port: int) -> socket.socket:
+    """A raw TCP connection sending a request line and partial headers,
+    deliberately never terminated with the blank line HTTP requires - h11
+    waits indefinitely for the rest, exactly like a real slowloris
+    connection. httpx cannot construct a request this malformed on
+    purpose, so this bypasses it entirely."""
+    sock = socket.create_connection((host, port), timeout=5)
+    sock.sendall(b"POST /embed HTTP/1.1\r\nHost: sidecar\r\nContent-Type: application/json\r\n")
+    return sock
+
+
+async def test_stalled_incomplete_header_connections_degrade_bounded_not_unbounded(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """Codex's review of this slice named this gap directly: uvicorn has no
+    time-based header-read timeout (confirmed by reading its h11 protocol
+    implementation directly, not assumed - `settings.py`'s
+    `limit_concurrency`/`h11_max_incomplete_event_size` docstrings have the
+    full reasoning), so a connection sending a small amount of incomplete
+    header data, slowly, is never evicted by time alone. What *is* already
+    true, and what this test proves against the real running container:
+    the degradation this causes is bounded, not unbounded. Uvicorn tracks
+    a connection in its concurrency-limited set from the moment it is
+    accepted (`connection_made`), not from when its request completes - so
+    opening more than `limit_concurrency` stalled connections causes
+    uvicorn to answer *new* legitimate requests with 503 once that ceiling
+    is reached, rather than accepting unlimited stalled connections and
+    exhausting memory/file descriptors without limit. Closing the
+    remaining gap (the attack itself, not just its blast radius) needs a
+    reverse proxy or a custom timeout wrapper in front of uvicorn -
+    deliberately out of scope for this loopback- and Docker-internal-
+    network-only slice; see `settings.py` for the full reasoning and the
+    trigger to revisit."""
+    assert sidecar.base_url.host is not None
+    assert sidecar.base_url.port is not None
+
+    stalled_sockets = [
+        _open_stalled_connection(sidecar.base_url.host, sidecar.base_url.port)
+        for _ in range(LIMIT_CONCURRENCY + 10)
+    ]
+    try:
+        # Poll briefly rather than a single fixed-delay check - uvicorn
+        # registers each accepted connection near-instantly, but a loaded
+        # CI runner may take a moment longer than a local machine would.
+        for _ in range(20):
+            response = await sidecar.get("/health")
+            if response.status_code == 503:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail(
+                "expected /health to be answered 503 once limit_concurrency "
+                "was exhausted by stalled connections, but it never was"
+            )
+    finally:
+        for sock in stalled_sockets:
+            sock.close()

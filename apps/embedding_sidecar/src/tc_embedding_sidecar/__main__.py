@@ -30,8 +30,15 @@ def main() -> int:
         # docstring has the full reasoning): beyond this many concurrent
         # connections, uvicorn itself answers 503, before this process's
         # own code - including MaxBodySizeMiddleware's body buffering -
-        # ever runs for the request past the limit.
+        # ever runs for the request past the limit. Confirmed against
+        # uvicorn's own source to count a connection from the moment it is
+        # accepted, not from when its request completes - see settings.py.
         limit_concurrency=settings.limit_concurrency,
+        # Bounds memory for a single connection stuck mid-header (this
+        # process's one available mitigation for that case without adding
+        # new infrastructure - settings.py's own docstring has the full
+        # reasoning and residual gap).
+        h11_max_incomplete_event_size=settings.h11_max_incomplete_event_size,
     )
     return 0
 
