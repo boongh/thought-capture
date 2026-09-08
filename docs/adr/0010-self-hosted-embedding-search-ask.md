@@ -169,16 +169,26 @@ single-workspace model).
 Each *document* — not each revision — gets exactly one stored embedding
 row, always holding whichever revision was most recently embedded
 successfully. Concretely, `document_embeddings` is keyed by `document_id`
-(primary key), carries `revision_id` as a plain `NOT NULL` foreign key to
-`document_revisions`, and carries no independent `workspace_id` column at
-all: every read joins `document_embeddings -> documents` for `workspace_id`
-rather than trusting a second, separately-writable copy of it that could
-drift out of sync with the row's actual owner. This is stricter than a
-same-value foreign key would be — two independently-set foreign keys can
-each individually reference something valid while still disagreeing with
-each other about which document/workspace they jointly describe, which is
-exactly the failure mode an early draft of this ADR left open (see
-`docs/DESIGN.md` 8.4 for the exact schema and full rationale).
+(primary key) and carries `revision_id` constrained by a **composite**
+foreign key against `document_revisions (id, document_id)` — not a plain
+single-column foreign key to `document_revisions(id)` alone, and not an
+independent second foreign key to `documents(id)` either (both were an
+early draft's shape). A single-column `revision_id` foreign key only
+proves the revision exists somewhere; it does not prove it belongs to
+*this* `document_id`, so a faulty sync writer could otherwise pair
+document A with a revision that actually belongs to document B and
+Postgres would accept it. The composite foreign key makes that
+unrepresentable: `document_revisions (id, document_id)` is already
+unique (its `id` primary key alone guarantees that), so the database
+itself rejects any `document_embeddings` row whose `revision_id` isn't
+one that actually belongs to its `document_id`. There is also no
+independent `workspace_id` column at all — every read joins
+`document_embeddings -> documents` for `workspace_id` rather than
+trusting a second, separately-writable copy of it that could drift out of
+sync with the row's actual owner (see `docs/DESIGN.md` 8.4 for the exact
+schema, and 6.3 for the identical technique applied to
+`documents.current_revision_id`, which had the analogous gap since
+ADR-0004).
 
 Currentness — "only the current revision is searchable" — is not a static
 constraint a foreign key can express, because embedding sync is
@@ -274,20 +284,34 @@ unchanged; only what feeds the semantic channel changes.
 
 ### 7. Ask: OpenRouterProvider + `TC_MODEL_ASK`, not a Khoj credential
 
-Ask's LLM call becomes a third caller of `OpenRouterProvider`
+Ask's LLM call becomes a fourth caller of `OpenRouterProvider`
 (`packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`),
-alongside `organize` and `select`. A new reviewed-model slug,
-**`TC_MODEL_ASK`**, is resolved through the existing `Settings`/
-`REVIEWED_MODELS`/safe-mode machinery
-(`packages/infrastructure/src/tc_infrastructure/config.py:67-90`,
-`_safe_mode_restricts_to_reviewed_models`) — the same pattern
-`model_organize`/`model_select`/`model_query_plan` already use, including
-per-stage review (`ReviewedModel.stages` must list `"ask"` for whatever
-slug is pinned), `zdr: true`, `data_collection: deny`, `provider.only`
-routing, and the served-model check. Ask's evidence assembly (retrieved
-document content + question) is therefore governed by exactly the same
-safe/custom-mode controls as every other model call this project makes —
-no second credential, no second policy surface.
+alongside `organize`, `select`, and `query_plan`. A new reviewed-model
+slug, **`TC_MODEL_ASK`**, extends the same `Settings`/`REVIEWED_MODELS`/
+safe-mode machinery `model_organize`/`model_select`/`model_query_plan`
+already use — this ADR is the authorization for that extension, not a
+description of code that already exists today. Concretely, Slice 1 must:
+
+- add a `model_ask: str = ""` field to `Settings`
+  (`packages/infrastructure/src/tc_infrastructure/config.py`), empty by
+  default (no provider call) matching `model_organize`'s existing
+  no-slug-means-offline convention;
+- add `"model_ask": "ask"` to `_safe_mode_restricts_to_reviewed_models`'s
+  `field_stages` mapping (`config.py:181-185` today), so an unreviewed or
+  wrong-stage `TC_MODEL_ASK` fails process startup exactly like an
+  unreviewed `model_organize` does now — not a runtime surprise on the
+  first `/ask` call;
+- add at least one entry to `REVIEWED_MODELS`
+  (`tc_infrastructure.llm.reviewed_models`) whose `stages` includes
+  `"ask"`, reviewed against this ADR §8's citation-contract prompt shape
+  specifically, before `TC_ASK_ENABLED=true` can select a live model in
+  safe mode.
+
+Once wired, `TC_MODEL_ASK` is governed by exactly the same `zdr: true`,
+`data_collection: deny`, `provider.only` routing, and served-model check
+as every other reviewed model — no second credential, no second policy
+surface. See `docs/DESIGN.md` 11 for the design-level statement of this
+same contract.
 
 **This removes `TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED`**
 (`Settings.ask_provider_retention_acknowledged`,
@@ -350,10 +374,17 @@ against the evidence packet's `index` values: a marker resolving to a real
 item becomes a validated `AskReference`; a marker that resolves to nothing
 (a fabricated or out-of-range citation) is dropped from `references` and
 left as inert text, never surfaced as a working citation, and never fails
-the request outright. An answer with markers but zero valid resolutions
-still returns its prose with `references: []` and `citations_unverified:
-true`, so a caller can choose to flag it rather than present unvalidated
-prose as if it were cited.
+the request outright.
+
+**`citations_unverified` is keyed on the outcome (`references` empty),
+never on whether the model bothered to emit any markers.** `citations_unverified
+= (len(references) == 0)`, evaluated after validation, unconditionally.
+An answer with markers that all fail to resolve and an answer with no
+markers at all are the identical failure from a grounding standpoint —
+zero verifiable claims — and get the identical flag. Gating the flag on
+"markers were present" instead would let a model that skips the citation
+instruction return as if it were normally, fully cited, quietly
+reopening the untraceable-claim gap this section exists to close.
 
 **Traceability closes through existing data, not a new mechanism.** A
 validated `AskReference` names a `document_id`/`revision_id`; that
@@ -430,14 +461,19 @@ This ADR authorizes the design change; it does not itself add code. Slice
 requirements: which pieces of §2-§8 they implement, what tests exercise
 them (`tests/unit`, `tests/integration` against a real pgvector-enabled
 Postgres, a sidecar contract-test suite analogous to `tests/contract/khoj`
-but against first-party code, and — for §8 specifically — a citation-
-validation test asserting a fabricated/out-of-range marker never becomes a
-returned `AskReference`), and confirmation via `scripts/check.ps1`/
-`scripts/check.sh`. Full Khoj removal (container, adapter code, compose
-files, credentials) is verified once the pgvector/sidecar/OpenRouter-Ask
-path passes `docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at
-parity with or better than the Khoj-era baseline — cutover is evidence-
-gated, not simultaneous with this ADR's acceptance.
+but against first-party code; an integration test proving the
+`document_embeddings` composite foreign key (§3) rejects an
+insert/update pairing a `document_id` with a `revision_id` belonging to a
+different document; and — for §8 specifically — citation-validation tests
+covering both a fabricated/out-of-range marker, which must never become a
+returned `AskReference`, and a marker-free answer, which must set
+`citations_unverified: true` exactly like an all-invalid-markers answer
+does), and confirmation via `scripts/check.ps1`/`scripts/check.sh`. Full
+Khoj removal (container, adapter code, compose files, credentials) is
+verified once the pgvector/sidecar/OpenRouter-Ask path passes
+`docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at parity with or
+better than the Khoj-era baseline — cutover is evidence-gated, not
+simultaneous with this ADR's acceptance.
 
 ## Migration and rollback
 

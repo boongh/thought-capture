@@ -268,7 +268,7 @@ CREATE TABLE runs (
   id uuid PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id),
   kind text NOT NULL CHECK (kind IN
-    ('organize','force_organize','khoj_sync','export','restore_test','reembed')),
+    ('organize','force_organize','embedding_sync','export','restore_test','reembed')),
   window_start timestamptz,
   window_end timestamptz,
   status text NOT NULL CHECK (status IN ('queued','running','succeeded','partial','failed')),
@@ -310,11 +310,22 @@ CREATE TABLE document_revisions (
   change_kind text NOT NULL CHECK (change_kind IN
     ('create','organize','manual_restore','supersede')),
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (document_id, revision_number)
+  UNIQUE (document_id, revision_number),
+  UNIQUE (id, document_id)
 );
 
+-- (document_revisions.id, document_revisions.document_id) is already
+-- unique (id alone is the primary key), which is what lets the
+-- composite foreign keys below pin *both* "this is a real revision" and
+-- "it belongs to this exact document" in one constraint, instead of two
+-- independently-satisfiable single-column foreign keys that could each
+-- individually validate while disagreeing with each other about which
+-- document they jointly describe (docs/adr/0010's "document_embeddings"
+-- fix below applies the identical pattern; this tightens an existing gap
+-- in documents.current_revision_id noticed while designing that fix).
+
 ALTER TABLE documents ADD CONSTRAINT documents_current_revision_fk
-  FOREIGN KEY (current_revision_id) REFERENCES document_revisions(id);
+  FOREIGN KEY (current_revision_id, id) REFERENCES document_revisions (id, document_id);
 
 CREATE TABLE revision_sources (
   revision_id uuid NOT NULL REFERENCES document_revisions(id),
@@ -568,7 +579,8 @@ class AskEvidenceItem(BaseModel):
 
 - A marker resolving to a real evidence item becomes a validated `AskReference` (carrying that item's `document_id`/`revision_id`/`title`) in the response's `references` list.
 - A marker with no matching `index` (a model inventing a citation number, or citing evidence trimmed by `ask_evidence_top_k`) is dropped from `references` and left as plain, non-clickable text in the answer — never surfaced as if it were a real citation, and never causes the request to fail.
-- An answer with citation markers but zero valid resolutions still returns its prose (a partial-grounding case, not a hard error) with `references: []` and a `citations_unverified: true` flag, so a caller can choose to warn rather than silently present ungrounded prose as if it were cited.
+
+**`citations_unverified` is set whenever `references` ends up empty, full stop — not only when markers were present and none resolved.** A model that ignores the citation instruction entirely and returns plain, marker-free prose is exactly as ungrounded as one whose markers all fail to resolve; gating the flag on "markers existed" would let the more common failure (no markers at all) return as if it were a normal, fully-cited answer, silently reintroducing the untraceable-claim problem this contract exists to close. Concretely: `citations_unverified = (len(references) == 0)`, computed after validation regardless of how many markers, if any, appeared in the text. `docs/DESIGN.md` 1's "every generated claim is traceable" requirement is enforced by this flag, not by trusting the prompt instruction to be followed.
 
 **Traceability.** A validated `AskReference` names a `document_id`/`revision_id`; that revision's `revision_sources` rows (section 6.3) already link it to the raw `thought_id`s that produced it. Resolving an Ask citation down to raw source thoughts — the same traceability `docs/DESIGN.md` 1's Release 1 definition of done requires for every generated claim — reuses this existing table; no new provenance mechanism is needed.
 
@@ -605,10 +617,12 @@ Every document has at most one row, keyed by `document_id` — not `revision_id`
 ```sql
 CREATE TABLE document_embeddings (
   document_id uuid PRIMARY KEY REFERENCES documents(id),
-  revision_id uuid NOT NULL REFERENCES document_revisions(id),
+  revision_id uuid NOT NULL,
   embedding vector(384) NOT NULL,
   embedding_model_id text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (revision_id, document_id)
+    REFERENCES document_revisions (id, document_id)
 );
 
 CREATE INDEX document_embeddings_hnsw_idx
@@ -621,14 +635,33 @@ dimensionality, `docs/adr/0010` §5's recommended model.) There is no
 `workspace_id` column here — `workspace_id` is never stored redundantly
 against a row it could drift out of sync with; every query joins
 `document_embeddings -> documents` to obtain and filter on it, so a
-row's workspace/document identity is exactly whatever `documents` already
-says it is, not a second, independently writable foreign key that could
-disagree with the first. This is a stronger guarantee than a same-value
-foreign key would have given, since two independently-set foreign keys
-(the shape this section described through design version 1.9's first
-`docs/adr/0010` draft) can be individually valid yet mutually inconsistent
-— a bug this schema makes structurally unrepresentable instead of merely
-untested.
+row's workspace identity is exactly whatever `documents` already says it
+is, not a second, independently writable foreign key that could disagree
+with the first.
+
+The `(revision_id, document_id)` pairing is enforced by a **composite**
+foreign key against `document_revisions (id, document_id)` — not two
+independent single-column foreign keys, one to `documents(id)` and one to
+`document_revisions(id)` (the shape an earlier draft of this ADR used).
+Two independent foreign keys can each individually reference something
+that exists while still jointly describing a lie — `document_id` pointing
+at document A, `revision_id` pointing at a real revision that actually
+belongs to document B — because neither column's constraint knows the
+other column exists. A faulty sync writer could then pair the wrong
+document with the wrong revision and Postgres would accept it. The
+composite foreign key closes exactly that gap: `document_revisions (id,
+document_id)` is already unique (6.3's `UNIQUE (id, document_id)`, added
+alongside this same fix), so the database itself refuses any
+`document_embeddings` row whose `revision_id` does not actually belong to
+its `document_id` — this is not merely handled in application code, it is
+unrepresentable in the table. The same composite-foreign-key technique
+was applied to `documents.current_revision_id` (6.3): that FK has
+referenced only `document_revisions(id)` since ADR-0004, which is enough
+to guarantee the referenced row exists but not that it belongs to *this*
+document — a distinct but analogous ownership gap, closed here (`FOREIGN
+KEY (current_revision_id, id) REFERENCES document_revisions (id,
+document_id)`) once designing `document_embeddings`'s guarantee made the
+general pattern visible.
 
 **Currentness is enforced two ways, not by a single foreign key,**
 because embedding sync is asynchronous by design (7.2 step 11's decoupled
@@ -701,7 +734,7 @@ All first-party endpoints are under `/v1`, return RFC 9457-style problem details
 | `POST` | `/v1/ask` | streamed Ask (self-hosted embedding evidence plus OpenRouter generation, `docs/adr/0010`) with validated citations and explicit degradation status |
 | `GET` | `/v1/entities` | entities, aliases, document links |
 | `POST` | `/v1/entities/{id}/aliases` | owner-approved alias |
-| `POST` | `/v1/admin/khoj-sync` | force current-document export/index sync |
+| `POST` | `/v1/admin/embedding-sync` | force a re-embed of current documents: enqueues one `embedding.sync_requested` outbox event per document with a current revision (7.2 step 11, `docs/adr/0010`), the same event the organize writer enqueues on each revision write, so a forced sync and an organize-triggered sync share one code path; returns the count enqueued, not a synchronous embed |
 | `POST` | `/v1/admin/export` | create portable plaintext export |
 | `GET` | `/health/live` | process liveness only |
 | `GET` | `/health/ready` | database and required dependency readiness |
@@ -720,7 +753,7 @@ Discord slash commands map to use cases, not HTTP loopback calls:
 
 OpenRouter is an API gateway, not the model itself. The application sends an OpenAI-compatible HTTPS request to `https://openrouter.ai/api/v1` with an OpenRouter API key and a model slug. OpenRouter authenticates the project, routes the request to a provider that serves that model, normalizes the response, and bills the OpenRouter account. This allows model changes without replacing the SDK.
 
-The first-party adapter uses the official OpenAI Python client pointed at OpenRouter's base URL. Configuration contains separate model IDs for `organize`, `select` (context assembly, section 7.3), `query_plan`, and optional `embedding`. Never use floating “latest” aliases in production; pin a tested slug and record the actual returned model/provider on every run.
+The first-party adapter uses the official OpenAI Python client pointed at OpenRouter's base URL. Configuration contains separate model IDs for `organize`, `select` (context assembly, section 7.3), `query_plan`, `ask` (`TC_MODEL_ASK`, section 7.6, `docs/adr/0010`), and optional `embedding`. Never use floating “latest” aliases in production; pin a tested slug and record the actual returned model/provider on every run.
 
 Operational rules:
 
@@ -733,7 +766,18 @@ Operational rules:
 - Disable silent fallback between materially different models for organization unless the fallback model is explicitly tested.
 - Cache development responses by a hash of redacted prompt, model, prompt version, and schema version; production capture content is not written to developer logs.
 
-Model selection has two modes (ADR-0006). **Safe mode** (the default) restricts `model_organize`/`model_select`/`model_query_plan` to a small allowlist of slugs that have actually been checked against the three rules above - retention/training policy, tested structured-output support, and the quoted-data prompt-injection assumption in section 12.2 - enforced at process startup, not left to review discipline. It also disables OpenRouter provider fallback outright, sends `data_collection: deny` and `zdr: true` on every request, and restricts routing to the specific provider endpoint(s) recorded against the reviewed model (`provider.only`, since disabling fallback alone only blocks a *second* provider after the first fails, not OpenRouter's initial choice). `zdr: true` limits the request to OpenRouter's current zero-data-retention endpoints and fails the request rather than falling through to a non-ZDR endpoint. Together, these controls prevent a reviewed model from being silently served by an unreviewed backup, an unreviewed initial provider, or one that retains the request. `require_parameters: true` additionally excludes any provider that can't actually honor the strict schema enforcement being asked for. **Custom mode** lifts the model allowlist for an operator who accepts responsibility for an unreviewed model themselves, and leaves provider fallback to a separate boolean (`TC_MODEL_ALLOW_FALLBACK`, default on, matching OpenRouter's own default) without forcing retention-deny - which would otherwise break the one documented custom-mode case, a free tier that requires accepting training to use at all. Either way, the response actually served is still checked against the requested model before its content is used (see above): safe mode prevents sending prompts to a model nobody vetted; the served-model check catches a gateway silently substituting one after the fact. These are different failures and neither guard substitutes for the other.
+Model selection has two modes (ADR-0006, extended by `docs/adr/0010` to cover Ask). **Safe mode** (the default) restricts `model_organize`/`model_select`/`model_query_plan`/`model_ask` (`TC_MODEL_ASK`, `docs/adr/0010`) to a small allowlist of slugs that have actually been checked against the three rules above - retention/training policy, tested structured-output support, and the quoted-data prompt-injection assumption in section 12.2 - enforced at process startup, not left to review discipline. `REVIEWED_MODELS` entries are reviewed per stage (`ReviewedModel.stages`, as `organize`/`select`/`query_plan` already are); a slug pinned to `model_ask` must carry `"ask"` in its own `stages` list to be accepted - registry membership reviewed only for a different stage's prompt shape and cost profile does not transfer. It also disables OpenRouter provider fallback outright, sends `data_collection: deny` and `zdr: true` on every request, and restricts routing to the specific provider endpoint(s) recorded against the reviewed model (`provider.only`, since disabling fallback alone only blocks a *second* provider after the first fails, not OpenRouter's initial choice). `zdr: true` limits the request to OpenRouter's current zero-data-retention endpoints and fails the request rather than falling through to a non-ZDR endpoint. Together, these controls prevent a reviewed model from being silently served by an unreviewed backup, an unreviewed initial provider, or one that retains the request. `require_parameters: true` additionally excludes any provider that can't actually honor the strict schema enforcement being asked for. **Custom mode** lifts the model allowlist for an operator who accepts responsibility for an unreviewed model themselves, and leaves provider fallback to a separate boolean (`TC_MODEL_ALLOW_FALLBACK`, default on, matching OpenRouter's own default) without forcing retention-deny - which would otherwise break the one documented custom-mode case, a free tier that requires accepting training to use at all. Either way, the response actually served is still checked against the requested model before its content is used (see above): safe mode prevents sending prompts to a model nobody vetted; the served-model check catches a gateway silently substituting one after the fact. These are different failures and neither guard substitutes for the other.
+
+`model_ask` joining the safe-mode-restricted field set is a Slice 1 code
+change, not something this design authorizes retroactively: it means
+extending `Settings._safe_mode_restricts_to_reviewed_models`'s
+`field_stages` mapping (`packages/infrastructure/src/tc_infrastructure/
+config.py`) with `"model_ask": "ask"`, adding a `TC_MODEL_ASK` field next
+to `model_organize`/`model_select`/`model_query_plan`, and reviewing at
+least one slug for the `"ask"` stage in `REVIEWED_MODELS`
+(`tc_infrastructure.llm.reviewed_models`) before `TC_ASK_ENABLED=true` can
+select a live model in safe mode. An empty `TC_MODEL_ASK` behaves like an
+empty `model_organize` today: no provider call, not a validation failure.
 
 The embedding model is the deliberate exception to the OpenRouter default: from the organize second wave onward it runs locally (section 7.3.6), because text embedding is cheap to host, keeps the organize path free of an extra network round trip, and avoids disclosing document content to a second provider.
 
