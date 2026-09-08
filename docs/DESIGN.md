@@ -268,7 +268,7 @@ CREATE TABLE runs (
   id uuid PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id),
   kind text NOT NULL CHECK (kind IN
-    ('organize','force_organize','embedding_sync','export','restore_test','reembed')),
+    ('organize','force_organize','khoj_sync','embedding_sync','export','restore_test','reembed')),
   window_start timestamptz,
   window_end timestamptz,
   status text NOT NULL CHECK (status IN ('queued','running','succeeded','partial','failed')),
@@ -336,6 +336,8 @@ CREATE TABLE revision_sources (
 ```
 
 Store full Markdown snapshots for reliable recovery. Produce unified diffs on read or cache them as non-canonical artifacts. A restore selects a historical snapshot and writes it as the next revision. Daily digest `stable_key` is the capture-window end timestamp; entity documents use normalized entity IDs.
+
+**`runs.kind` gains `'embedding_sync'` without removing `'khoj_sync'`.** `docs/adr/0010`'s migration plan requires the embedding sidecar to run alongside Khoj sync before cutover (its "Migration and rollback" step 2), and any already-deployed instance's migration history created the `runs.kind` CHECK constraint with `'khoj_sync'` in it. Replacing that value outright — narrowing the CHECK constraint in the same migration that adds the new one — either fails on a database holding a `'khoj_sync'` row or forces relabeling historical rows as something they were not, neither of which is compatible with this project's append-only, non-destructive migration discipline (section 3, principle 2). This ADR's Slice 1 migration is therefore purely additive: it widens the CHECK to `('organize','force_organize','khoj_sync','embedding_sync','export','restore_test','reembed')`. `'khoj_sync'` is dropped from the CHECK only in the later, evidence-gated Khoj-removal migration (`docs/adr/0010`'s "Migration and rollback" step 5), the same migration that removes the Khoj container/adapter/credentials — never before cutover is proven. (In practice neither value has ever been written by any code path — `docs/adr/0003`'s "Index sync run-tracking scope" left `'khoj_sync'` reserved-but-unused because index sync is fully decoupled from `runs`, and this design keeps that same decoupled shape for `'embedding_sync'`, section 7.2 step 11 — but the CHECK constraint's own migration safety does not depend on whether a value happens to be in use.)
 
 ### 6.4 Entities and mentions
 
@@ -573,7 +575,47 @@ class AskEvidenceItem(BaseModel):
 
 **Empty-evidence behavior.** If the evidence list is empty, `TC_MODEL_ASK` is never called. Ask returns a fixed, non-generated response (`AskAnswer.answer = "No indexed documents matched this question."`, `evidence: []`) — the same "never invent a result" discipline principle 6 and `docs/DESIGN.md` 1's grounding requirement already apply everywhere else. This differs from Khoj's own behavior, which called its configured chat model even with nothing indexed and relied on the model itself producing a canned no-notes reply (ADR-0003's "Ask proxy" amendment); this design makes the same outcome structural rather than dependent on model behavior.
 
-**Prompt and streamed output.** The prompt instructs the model to answer only from the numbered evidence items and to mark every claim drawn from evidence with an inline bracketed citation matching that item's `index` (for example `[2]`), the same "quoted data, not instructions" framing principle 12.2 already requires for organize prompts. The gateway streams the answer's prose tokens as they generate (`docs/DESIGN.md`'s existing streaming requirement), exactly as `OpenRouterProvider` streams `organize`/`select` completions today — no new wire protocol.
+**Prompt.** The prompt instructs the model to answer only from the numbered evidence items and to mark every claim drawn from evidence with an inline bracketed citation matching that item's `index` (for example `[2]`), the same "quoted data, not instructions" framing principle 12.2 already requires for organize prompts.
+
+**Streaming provider contract — new, not reused.** `organize`/`select`/`query_plan` never stream: `LLMProvider.complete()` (`packages/domain/src/tc_domain/llm.py`) returns one `LLMResponse` after `OpenRouterProvider.complete()` (`packages/infrastructure/src/tc_infrastructure/llm/openrouter.py`) calls `chat.completions.create()` without `stream=True`. Ask needs incremental output, so `LLMProvider` gains a second method, not a rewrite of `complete()`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class LLMStreamChunk:
+    delta: str                        # "" for a chunk carrying only metadata
+    finish_reason: str | None = None  # non-None only on the terminal chunk
+    model_served: str | None = None   # populated once known, from the first chunk on
+    generation_id: str | None = None
+    input_tokens: int | None = None   # populated only on the terminal chunk
+    output_tokens: int | None = None
+    cost_usd: Decimal | None = None
+
+
+class LLMStreamInterrupted(LLMError):
+    """The stream failed after at least one chunk already carried content.
+
+    Carries `partial_text` (every `delta` yielded so far, concatenated) and
+    whatever usage fields were known, so the caller can still use - and
+    journal - the content that already arrived rather than losing it.
+    """
+
+
+class LLMProvider(Protocol):
+    ...
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        """Issue one call, yielding incremental content chunks."""
+        ...
+```
+
+`OpenRouterProvider.stream()` sends the same `messages`/`temperature`/`max_tokens` and the same `provider_routing` policy dict `complete()` already builds (`allow_fallbacks`, `data_collection: deny`, `zdr: true`, `provider.only` — `require_parameters`/`response_format` do not apply, since Ask's output is free-text prose, not schema-validated JSON), plus `stream: True` and `stream_options: {"include_usage": true}` so OpenRouter's own terminal SSE event carries usage the same way the non-streaming response's `usage` field does today.
+
+**Policy enforcement holds mid-stream, not only at the end.** The served-model check (`complete()`'s existing `served not in self._allowed_served_models` guard) runs against the **first** chunk's `model` field, before any `delta` is yielded to the caller — an unapproved substituted model is rejected with `LLMError` before a single token of its output reaches the user, not after the fact.
+
+**Errors after partial output are distinguishable from errors before any output.** A transport/timeout/status failure before the first content-bearing chunk raises `LLMError`, identically to `complete()` today. The same failure after at least one non-empty `delta` was already yielded raises `LLMStreamInterrupted` instead, carrying the partial text accumulated so far. Ask's caller (`AskQuestion`) treats `LLMStreamInterrupted` as the mid-stream degrade case: `degraded: true`, the evidence list still attached (as already stated below), and the partial text is discarded rather than shown as if it were a complete, citation-validated answer — an interrupted stream has not gone through citation validation and must not be presented as a finished one.
+
+**Usage journaling.** Exactly one `llm_calls` row (`docs/adr/0008`) is still written per Ask call, whether the stream completed normally or was interrupted: the caller accumulates `delta`s into the full text and takes usage/cost/`model_served`/`generation_id` from the terminal chunk when one was reached, or records `null` usage with whatever partial text existed when `LLMStreamInterrupted` cut it short — the same "every attempt is recorded" invariant `complete()` already satisfies, not a new exemption for streamed calls.
+
+**Tests required before Slice 4 can rely on this.** Contract/unit coverage for: the streaming happy path (deltas accumulate to the full text; terminal chunk carries correct usage); served-model rejection on the first chunk (no `delta` reaches the caller); a transport failure before any content (plain `LLMError`, matching `complete()`); a transport failure after partial content (`LLMStreamInterrupted` with the correct accumulated `partial_text`); and policy parity (the same `provider_routing` fields as `complete()`, minus the schema-specific ones, are actually sent).
 
 **Citation validation, after the stream completes.** The full answer text is scanned for citation markers matching `\[(\d+)\]`. Each marker is resolved against the evidence packet's `index` values:
 
@@ -584,7 +626,7 @@ class AskEvidenceItem(BaseModel):
 
 **Traceability.** A validated `AskReference` names a `document_id`/`revision_id`; that revision's `revision_sources` rows (section 6.3) already link it to the raw `thought_id`s that produced it. Resolving an Ask citation down to raw source thoughts — the same traceability `docs/DESIGN.md` 1's Release 1 definition of done requires for every generated claim — reuses this existing table; no new provenance mechanism is needed.
 
-**Degradation.** If `TC_MODEL_ASK`'s call itself fails or times out after evidence was found (embedding search succeeded, generation did not), Ask returns `degraded: true` with the evidence list still attached, so a caller can fall back to showing raw search results rather than nothing. See `docs/adr/0010` for the full replacement design and migration path.
+**Degradation.** If `TC_MODEL_ASK`'s call itself fails before any content streams, or is interrupted mid-stream (`LLMStreamInterrupted`, above) after evidence was found (embedding search succeeded, generation did not complete), Ask returns `degraded: true` with the evidence list still attached and no partial, unvalidated prose — a caller falls back to showing raw search results rather than an answer that never went through citation validation. See `docs/adr/0010` for the full replacement design and migration path.
 
 ## 8. Embedding integration contract
 

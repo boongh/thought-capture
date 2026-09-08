@@ -329,16 +329,29 @@ model.
 
 `docs/DESIGN.md` 7.6's streaming requirement, strict-filter capability-code
 fallback, and per-call conversation-cleanup concerns are addressed
-differently under this design: streaming comes from `OpenRouterProvider`'s
-existing SSE support rather than parsing Khoj's `END_EVENT` wire format;
-there is no server-side "conversation" left over to delete, since
-OpenRouter's chat-completions call is stateless per request the way
-`organize`/`select` calls already are — the entire P1 category ADR-0003
-needed a remediation round for (buffered-not-streamed, no strict-filter
-fallback, no contract test for chat, no conversation cleanup, no
-provider-retention gate) does not reappear here because the new design
-reuses infrastructure already hardened for `organize`/`select`, rather than
-wrapping a second, differently-shaped external chat API.
+differently under this design, with one correction to how: **streaming is
+not something `OpenRouterProvider` already does today.** `LLMProvider`
+(`packages/domain/src/tc_domain/llm.py`) exposes only `complete()`, and
+`OpenRouterProvider.complete()`
+(`packages/infrastructure/src/tc_infrastructure/llm/openrouter.py:212`)
+calls the OpenAI client without `stream=True` — `organize`/`select`/
+`query_plan` are non-streaming today and stay that way. Ask needs a new
+`LLMProvider.stream()` method, a new `LLMStreamChunk` value type, and a new
+`LLMStreamInterrupted` error distinguishing a failure before any output
+from one after partial output — the full contract is specified in
+`docs/DESIGN.md` 7.6 (policy enforcement mid-stream, not only at the end;
+usage journaling on both normal and interrupted completion; required test
+coverage) and authorized here as part of this ADR, not assumed to already
+exist. There is no server-side "conversation" left over to delete, since
+OpenRouter's chat-completions call is stateless per request regardless of
+streaming — the entire P1 category ADR-0003 needed a remediation round for
+(buffered-not-streamed, no strict-filter fallback, no contract test for
+chat, no conversation cleanup, no provider-retention gate) does not
+reappear here because the new design's streaming contract is built and
+tested to the same standard `complete()` already meets, rather than
+wrapping a second, differently-shaped external chat API — but it is new
+code, not reused code, and Slice 4 must build and test it before the API's
+streamed-Ask contract can be satisfied.
 
 ### 8. Ask's evidence packet and citation-validation contract
 
@@ -368,8 +381,12 @@ model-side reply the way Khoj's own no-notes-indexed behavior did.
 carry an inline bracketed marker matching the cited item's `index` (e.g.
 `[2]`), following the existing "quoted data, not instructions" framing
 already used for organize prompts (`docs/DESIGN.md` 12.2). The provider
-streams prose exactly as it already does for `organize`/`select`. After
-the stream completes, a validation pass resolves every `\[(\d+)\]` marker
+streams prose through the new `LLMProvider.stream()` contract (§7 above,
+full specification in `docs/DESIGN.md` 7.6) — not through any existing
+`organize`/`select` streaming, since neither of those streams today. After
+the stream completes (or is interrupted — see §7's `LLMStreamInterrupted`
+and `docs/DESIGN.md` 7.6's degrade behavior), a validation pass resolves
+every `\[(\d+)\]` marker
 against the evidence packet's `index` values: a marker resolving to a real
 item becomes a validated `AskReference`; a marker that resolves to nothing
 (a fabricated or out-of-range citation) is dropped from `references` and
@@ -464,9 +481,15 @@ Postgres, a sidecar contract-test suite analogous to `tests/contract/khoj`
 but against first-party code; an integration test proving the
 `document_embeddings` composite foreign key (§3) rejects an
 insert/update pairing a `document_id` with a `revision_id` belonging to a
-different document; and — for §8 specifically — citation-validation tests
-covering both a fabricated/out-of-range marker, which must never become a
-returned `AskReference`, and a marker-free answer, which must set
+different document; for `LLMProvider.stream()` (§7-8, full contract in
+`docs/DESIGN.md` 7.6) — the streaming happy path, served-model rejection
+on the first chunk with zero `delta` reaching the caller, a pre-content
+transport failure raising plain `LLMError`, a post-content transport
+failure raising `LLMStreamInterrupted` with the correct accumulated text,
+and policy parity against `complete()`'s `provider_routing`; and — for §8's
+citation contract specifically — citation-validation tests covering both a
+fabricated/out-of-range marker, which must never become a returned
+`AskReference`, and a marker-free answer, which must set
 `citations_unverified: true` exactly like an all-invalid-markers answer
 does), and confirmation via `scripts/check.ps1`/`scripts/check.sh`. Full
 Khoj removal (container, adapter code, compose files, credentials) is
@@ -478,16 +501,22 @@ simultaneous with this ADR's acceptance.
 ## Migration and rollback
 
 **Forward path.** Slices land in the order: (1) pgvector-enabled Postgres
-image + migration adding the embedding column/table and HNSW index; (2)
-embedding sidecar service + `EmbeddingPort`/`EmbeddingSyncLoop`, running
-alongside Khoj sync, not replacing it yet; (3) `EmbeddingSearchPort`
+image + migration adding the embedding table (`document_embeddings`, with
+its composite foreign keys) and HNSW index — this migration also widens
+`runs.kind`'s CHECK constraint to add `'embedding_sync'` **without
+removing `'khoj_sync'`**, since step 2 immediately below requires both to
+be valid at once and a migration must never narrow a CHECK constraint in
+the same step it widens one (`docs/DESIGN.md` 6.3 has the full rationale);
+(2) embedding sidecar service + `EmbeddingPort`/`EmbeddingSyncLoop`,
+running alongside Khoj sync, not replacing it yet; (3) `EmbeddingSearchPort`
 wired into `Search._semantic_results` behind a flag, compared against
 Khoj's results on the golden set; (4) `TC_MODEL_ASK` + `OpenRouterProvider`
 Ask path, same comparison; (5) once parity is demonstrated, cut over
 default routing, then remove Khoj (container, adapter, compose profile,
 `TC_KHOJ_*`/`TC_ASK_PROVIDER_RETENTION_ACKNOWLEDGED` settings, `khoj_sync`
-outbox/run machinery — the last renamed/repurposed to `embedding_sync`
-rather than left dead).
+outbox/run machinery) — **this is the migration that finally drops
+`'khoj_sync'` from the CHECK constraint**, since only at this point is it
+certain no in-flight or historical row depends on it remaining valid.
 
 **Rollback.** Each slice before step 5 is additive (new table, new
 service, new flag) and can be reverted independently without touching the
