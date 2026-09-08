@@ -122,7 +122,7 @@ jobs:
         # exercising the "not configured" degraded path, never a real answer.
         run: |
           nohup uv run uvicorn tests.contract.khoj.stub_chat_model:app \
-            --host 127.0.0.1 --port 8899 > stub-chat-model.log 2>&1 &
+            --host 0.0.0.0 --port 8899 > stub-chat-model.log 2>&1 &
           for _ in $(seq 1 20); do
             if curl --silent --fail --max-time 2 http://127.0.0.1:8899/v1/models >/dev/null 2>&1; then
               echo "Stub chat model is ready"
@@ -161,6 +161,25 @@ jobs:
           docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
             --profile ai logs khoj
           exit 1
+
+      - name: Preflight - Khoj can reach the stub chat model
+        # Confirms the network path the chat contract tests depend on (the
+        # khoj container reaching host.docker.internal:8899, where the stub
+        # above listens) actually works, and fails clearly here instead of
+        # surfacing only as a missing answer + a failed cleanup DELETE in the
+        # contract tests. Runs from inside the khoj container itself, the
+        # same path Khoj's own outbound chat-model requests take (docs/adr/0003
+        # finding 4). Uses python3, already present in the pinned Khoj image,
+        # rather than curl, which is not guaranteed to be. Prints only
+        # success/failure, never the stub's response body.
+        run: |
+          if ! docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml \
+            --profile ai exec -T khoj python3 -c \
+            "import urllib.request; urllib.request.urlopen('http://host.docker.internal:8899/v1/models', timeout=5)"; then
+            echo "khoj container cannot reach the stub chat model at http://host.docker.internal:8899/v1/models" >&2
+            exit 1
+          fi
+          echo "OK: khoj container can reach the stub chat model"
 
       - name: Contract tests
         env:
