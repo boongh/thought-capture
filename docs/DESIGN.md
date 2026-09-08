@@ -551,7 +551,7 @@ The prompt forbids facts absent from sources, requires first-person voice where 
 The request may provide structured filters directly. If it provides only natural language, the coordinator may ask a cheap model to produce a validated `QueryPlan`; the original query is always retained. (`docs/adr/0010` retires Khoj as the semantic channel; this section describes the self-hosted replacement.)
 
 1. PostgreSQL applies workspace, date/time, entity, type, source, and lexical constraints.
-2. The coordinator calls `EmbeddingPort.embed` (the local embedding sidecar, `docs/adr/0010`) on the query text, then runs one SQL query against the workspace-scoped pgvector column, joined with the same date/entity/type/source filters as the exact path in the same `WHERE` clause — not a second system's filter language re-expressed and hoped to be honored.
+2. The coordinator calls `EmbeddingPort.embed` (the local embedding sidecar, `docs/adr/0010`) on the query text, then runs one SQL query against the workspace-scoped pgvector column, joined with the same date/entity/type/source filters as the exact path in the same `WHERE` clause — not a second system's filter language re-expressed and hoped to be honored. This query is an exact scan in v1, not an approximate-index-accelerated one, specifically so a selective filter cannot silently under-return matches (8.4 explains why and states the trigger for revisiting).
 3. Both paths return stable document/revision/source identifiers directly from this project's own schema.
 4. Normalize ranks and fuse with RRF using `k=60`; exact phrase matches receive a documented deterministic boost before rank assignment.
 5. Deduplicate by revision ID and return evidence snippets, scores by channel, and citations. Because each document's current revision has exactly one embedding row (`docs/adr/0010` §3, no chunking), a duplicate-hit-by-filename class of bug is structurally impossible here, not merely handled.
@@ -653,7 +653,7 @@ through design version 1.8.
 
 ### 8.2 What pgvector (in the first-party PostgreSQL) owns
 
-- Storage of one embedding vector per document's current revision, an HNSW index over it, and cosine-similarity ranking.
+- Storage of one embedding vector per document's current revision, queried by exact (not approximate-index-accelerated) cosine-similarity ranking in v1 — see 8.4 for why.
 - Semantic nearest-neighbor search, expressed as an ordinary SQL query alongside the exact-search predicates (7.5), not a separate system's query language.
 
 ### 8.3 What neither owns
@@ -677,9 +677,6 @@ CREATE TABLE document_embeddings (
   FOREIGN KEY (revision_id, document_id)
     REFERENCES document_revisions (id, document_id)
 );
-
-CREATE INDEX document_embeddings_hnsw_idx
-  ON document_embeddings USING hnsw (embedding vector_cosine_ops);
 ```
 
 (Exact column list and vector dimensionality are finalized in the Slice 1
@@ -742,6 +739,52 @@ There is no exported Markdown file or filename convention in this design —
 the embedding is computed directly from the revision's stored
 `body_markdown`, read at sync time, not from a stale copy captured when
 the outbox event was originally enqueued.
+
+**No vector index in v1 — queries use an exact scan, deliberately.** A
+naive combination of an HNSW index with the workspace/date/entity/type/
+source filters 7.5 requires would be wrong, not just suboptimal: pgvector
+applies an HNSW-accelerated `ORDER BY embedding <=> $1 LIMIT $n` as an
+*approximate* graph traversal first, then filters the candidates it
+happened to find — a selective filter (a narrow date range, a specific
+entity) can therefore return fewer than `$n` results, or miss a real
+match entirely, even when valid matches exist elsewhere in the table,
+without ever marking the response degraded. This is a documented,
+general property of pgvector's HNSW filtering (its own guidance is
+iterative index scans, partial indexes, or partitioning for exactly this
+case), not a bug to route around case by case.
+
+Given this project's stated scale — single workspace, thousands not
+millions of `document_embeddings` rows (`docs/adr/0010` §1, matching
+`docs/DESIGN.md` 7.3.6's cost envelope) — the correct answer for v1 is to
+not build an approximate index at all: the semantic query (7.5) is a
+plain `ORDER BY embedding <=> $1 LIMIT $n` with the same workspace/date/
+entity/type/source predicates as the exact-search channel in the same
+`WHERE` clause, executed as an ordinary sequential (or filter-index-
+accelerated, for the non-vector predicates) scan that computes the exact
+distance for every row matching those filters and sorts. There is no
+approximation step to under-return results, by construction — "precise
+before impressive" (section 3, principle 6) applies to the index
+strategy itself, not only to the filters. At this row count the scan
+costs low tens of milliseconds, well within acceptable interactive search
+latency; there is no measured problem an ANN index would be solving yet.
+
+**Revisit only when a stated trigger fires**, not preemptively: once
+`document_embeddings` grows past the low tens of thousands of rows, or
+measured semantic-search p95 latency (14.2's existing "search latency by
+channel" metric) exceeds an owner-set threshold — whichever comes first.
+At that point, adopt `CREATE INDEX document_embeddings_hnsw_idx ON
+document_embeddings USING hnsw (embedding vector_cosine_ops)` together
+with pgvector's own documented mitigation for filtered ANN search —
+`SET LOCAL hnsw.iterative_scan = strict_order` (preserves exact distance
+ordering while scanning additional candidates until the filter is
+satisfied or a bound is hit) with a bounded `hnsw.max_scan_tuples` — and
+add regression tests exercising recall under a deliberately selective
+filter (a narrow date range or single-entity filter against a corpus
+sized so that fewer than `hnsw.ef_search` candidates would satisfy it)
+before enabling the index for production queries. Building the index
+before that point, or building it without the iterative-scan setting and
+its regression test, is exactly the silently-degraded-recall failure mode
+this section exists to avoid.
 
 ### 8.5 Upgrade policy
 
@@ -1081,7 +1124,7 @@ Verified 2026-08-30, retained for historical context of the retired Khoj-era des
 
 Verified 2026-09-08, current architecture (`docs/adr/0010`):
 
-- pgvector extension and HNSW indexing: https://github.com/pgvector/pgvector
+- pgvector extension, exact scans, and HNSW's documented filtered-search/iterative-scan behavior (8.4): https://github.com/pgvector/pgvector
 - sentence-transformers: https://www.sbert.net/
 - `thenlper/gte-small` model card: https://huggingface.co/thenlper/gte-small
 - PyTorch Python 3.14 wheel tracking issue: https://github.com/pytorch/pytorch/issues/156856

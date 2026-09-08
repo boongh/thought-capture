@@ -158,11 +158,26 @@ this reversal explicitly, per this repository's convention (ADR-0003's own
 "Index sync run-tracking scope" section) of stating a deviation rather than
 silently rewriting prior text.
 
-Vector index: **HNSW** (pgvector's modern index type) over IVFFlat — no
-training step required, and a good recall/speed tradeoff at this project's
-scale (single workspace, thousands not millions of rows, per
-`docs/DESIGN.md` 7.3.6's cost envelope and `docs/DESIGN.md` 6's
-single-workspace model).
+**Vector index: none in v1 — exact scan, not HNSW.** An earlier draft of
+this ADR chose HNSW here on general "modern ANN index, good recall/speed
+tradeoff" grounds without accounting for how pgvector's HNSW interacts
+with the workspace/date/entity/type/source filters §6 requires: HNSW
+performs its approximate graph traversal *before* those filters are
+applied, so a selective filter can silently return fewer results than
+requested, or miss a real match, even though it exists in the table —
+pgvector's own documentation names iterative index scans, partial
+indexes, or partitioning as the mitigations for exactly this failure
+mode. At this project's stated scale (single workspace, thousands not
+millions of rows, per `docs/DESIGN.md` 7.3.6's cost envelope and
+`docs/DESIGN.md` 6's single-workspace model), the simpler and strictly
+correct choice is not to build an approximate index at all: an exact,
+filter-then-sort scan has no approximation step to under-return results
+from, by construction, and costs low tens of milliseconds at this row
+count. `docs/DESIGN.md` 8.4 has the full mechanism and the explicit
+trigger (row-count or measured-latency threshold) for revisiting this
+with HNSW plus `hnsw.iterative_scan = strict_order` and a bounded
+`hnsw.max_scan_tuples`, backed by a filtered-recall regression test —
+not before that trigger fires.
 
 ### 3. One vector per document revision, not per chunk
 
@@ -539,6 +554,16 @@ fallback language.
 non-goals (§1), each with its own stated re-evaluation trigger rather than
 an open-ended "maybe later."
 
+**Deferred.** An approximate (HNSW) vector index — designed for and named
+(§2), not built. v1 uses an exact scan specifically because an HNSW index
+combined with this design's required filters (§6) can silently under-return
+results for a selective filter, a real correctness risk this project has
+no measured need to accept yet at its stated row count. Triggered by row
+count or measured latency crossing a stated threshold (`docs/DESIGN.md`
+8.4), and gated on landing `hnsw.iterative_scan = strict_order` plus a
+filtered-recall regression test in the same change that adds the index —
+not adding the index first and the safeguard later.
+
 ## Verification
 
 This ADR authorizes the design change; it does not itself add code. Slice
@@ -565,8 +590,14 @@ and `llm_calls` row with `status='succeeded'` regardless of
 `citations_unverified`, a pre-content `LLMError` leaves `status='failed'`,
 and a post-content `LLMStreamInterrupted` leaves `status='partial'` with
 the partial text present in `llm_calls.response_raw` but never surfaced in
-the returned `AskAnswer`), and confirmation via `scripts/check.ps1`/
-`scripts/check.sh`. Full Khoj removal (container, adapter code, compose
+the returned `AskAnswer`; and for §2's exact-scan decision — a test
+seeding a corpus with a selective filter (e.g. a single-entity or narrow
+date-range filter matching a small subset of rows) and asserting semantic
+search returns every matching row within the requested limit, both as a
+correctness baseline now and as the regression test that must keep
+passing unmodified if HNSW is ever added later per §2's trigger),
+and confirmation via `scripts/check.ps1`/`scripts/check.sh`. Full Khoj
+removal (container, adapter code, compose
 files, credentials) is verified once the pgvector/sidecar/OpenRouter-Ask
 path passes `docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at
 parity with or better than the Khoj-era baseline — cutover is
@@ -576,7 +607,8 @@ evidence-gated, not simultaneous with this ADR's acceptance.
 
 **Forward path.** Slices land in the order: (1) pgvector-enabled Postgres
 image + migration adding the embedding table (`document_embeddings`, with
-its composite foreign keys) and HNSW index — this migration also widens
+its composite foreign keys) — no vector index in this migration; queries
+use an exact scan per §2's revised decision — this migration also widens
 `runs.kind`'s CHECK constraint to add `'embedding_sync'` **without
 removing `'khoj_sync'`**, since step 2 immediately below requires both to
 be valid at once and a migration must never narrow a CHECK constraint in
