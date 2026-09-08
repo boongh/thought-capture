@@ -137,10 +137,11 @@ async def test_chat_streams_text_deltas_in_order_and_resolves_references() -> No
 async def test_chat_ignores_event_types_it_does_not_need() -> None:
     stream_body = "".join(
         [
+            _event("status", "thinking"),
             _event("start_llm_response", ""),
             _message("answer"),
+            _event("end_llm_response", ""),
             _event("usage", {"input_tokens": 10}),
-            _event("status", "thinking"),
             _event("end_response", ""),
         ]
     )
@@ -151,6 +152,56 @@ async def test_chat_ignores_event_types_it_does_not_need() -> None:
 
     assert [c.text_delta for c in chunks if c.text_delta] == ["answer"]
     assert all(c.references is None for c in chunks)
+
+
+async def test_chat_does_not_drop_a_raw_answer_chunk_that_collides_with_a_known_event_type() -> (
+    None
+):
+    """The exact P1 independent review caught: a raw MESSAGE chunk streamed
+    *during* the answer (i.e. after `start_llm_response`, before
+    `end_llm_response`) whose text itself happens to be valid JSON with a
+    "type" key that collides with a real, otherwise-ignored khoj event name
+    (e.g. the model answers with literal JSON like
+    '{"type": "status", "data": "42"}') must still be surfaced as answer
+    text - the live-verified protocol (docs/adr/0003) never emits `status`
+    inside that window, so this cannot be a genuine event there, unlike the
+    same shape arriving before `start_llm_response`."""
+    stream_body = "".join(
+        [
+            _event("start_llm_response", ""),
+            _message('{"type": "status", "data": "42"}'),
+            _event("end_llm_response", ""),
+            _event("end_response", ""),
+        ]
+    )
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = HttpKhojClient(http, "http://khoj.invalid")
+        chunks = await _drain(client)
+
+    assert [c.text_delta for c in chunks if c.text_delta] == ['{"type": "status", "data": "42"}']
+
+
+async def test_chat_still_ignores_a_genuine_status_event_before_the_answer_starts() -> None:
+    """The companion case: the same `status` shape arriving *before*
+    `start_llm_response` (where khoj actually emits it, per the live
+    contract capture) is a genuine control event and must still be
+    silently ignored, not surfaced as answer text."""
+    stream_body = "".join(
+        [
+            _event("status", "**Searching Documents for:** q"),
+            _event("start_llm_response", ""),
+            _message("answer"),
+            _event("end_llm_response", ""),
+            _event("end_response", ""),
+        ]
+    )
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = HttpKhojClient(http, "http://khoj.invalid")
+        chunks = await _drain(client)
+
+    assert [c.text_delta for c in chunks if c.text_delta] == ["answer"]
 
 
 async def test_chat_treats_a_json_shaped_message_event_as_text() -> None:
@@ -200,9 +251,7 @@ async def test_chat_treats_a_json_shaped_raw_answer_with_a_non_string_type_as_te
     cannot be a genuine event either. Must degrade to text like every other
     unrecognized shape, not raise `TypeError: unhashable type` from testing
     an unhashable value for frozenset membership."""
-    stream_body = _message('{"type": ["string", "null"], "data": "x"}') + _event(
-        "end_response", ""
-    )
+    stream_body = _message('{"type": ["string", "null"], "data": "x"}') + _event("end_response", "")
     transport = httpx.MockTransport(lambda r: httpx.Response(200, text=stream_body))
     async with httpx.AsyncClient(transport=transport) as http:
         client = HttpKhojClient(http, "http://khoj.invalid")
