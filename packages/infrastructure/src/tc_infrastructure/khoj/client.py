@@ -265,15 +265,19 @@ def _parse_chat_event(
     event_type = parsed.get("type")
     data = parsed.get("data")
 
-    if event_type not in _KNOWN_EVENT_TYPES:
-        # Either there's no "type" key at all, or its value is not one khoj
-        # actually emits. Either way this cannot be a genuine typed event,
-        # so it must be raw MESSAGE-event answer text that happens to be
-        # JSON-shaped - e.g. an answer literally starting with
+    if not isinstance(event_type, str) or event_type not in _KNOWN_EVENT_TYPES:
+        # Either there's no "type" key at all, its value isn't a string (a
+        # real khoj event's "type" always is - checked first so a non-string
+        # value, e.g. a raw answer that happens to be `{"type": [...], ...}`,
+        # short-circuits before the `in` check below, which would otherwise
+        # raise TypeError on an unhashable list/dict), or the string value is
+        # not one khoj actually emits. Either way this cannot be a genuine
+        # typed event, so it must be raw MESSAGE-event answer text that
+        # happens to be JSON-shaped - e.g. an answer literally starting with
         # '{"answer": ...}', or one that coincidentally has a "type" key
         # whose value is not a real khoj event name. Only a *recognized*
-        # event type may be silently dropped below; an unrecognized one
-        # falls through to the untyped-text path instead.
+        # event type may be silently dropped below; anything else falls
+        # through to the untyped-text path instead.
         return conversation_id, KhojChatChunk(text_delta=raw_event)
 
     if event_type == "metadata":
