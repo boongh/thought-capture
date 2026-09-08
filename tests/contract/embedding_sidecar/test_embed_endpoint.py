@@ -23,6 +23,7 @@ EXPECTED_DIMENSIONS = 384
 # Python-3.12-only settings module directly.
 MAX_BATCH_SIZE = 64
 MAX_TEXT_LENGTH = 50_000
+MAX_REQUEST_BYTES = 4_000_000
 
 
 async def test_health_reports_the_ready_model(sidecar: httpx.AsyncClient) -> None:
@@ -103,3 +104,15 @@ async def test_embed_rejects_a_text_over_the_configured_length_limit(
     response = await sidecar.post("/embed", json={"texts": ["x" * (MAX_TEXT_LENGTH + 1)]})
 
     assert response.status_code == 422
+
+
+async def test_embed_rejects_an_oversized_body_before_parsing_it(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """A body over the byte limit must be rejected by `MaxBodySizeMiddleware`
+    (413) against the real deployed process, not only the fake-model unit
+    tests - proving the real ASGI middleware stack actually intercepts it
+    rather than relying on FastAPI's own body parsing to fail first."""
+    response = await sidecar.post("/embed", json={"texts": ["x" * (MAX_REQUEST_BYTES + 1)]})
+
+    assert response.status_code == 413

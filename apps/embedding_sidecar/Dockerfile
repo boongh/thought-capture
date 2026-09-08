@@ -10,9 +10,14 @@
 #   docker inspect --format='{{index .RepoDigests 0}}' python:3.12.14-slim-trixie
 FROM python:3.12.14-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 
-# uv is pinned: an unpinned build tool makes the image non-reproducible
-# (same rationale as the root Dockerfile).
-COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /usr/local/bin/uv
+# uv is pinned by digest, not just tag: a mutable tag reference makes the
+# image non-reproducible and runs an unverified builder as root during
+# dependency installation (same rationale as the root Dockerfile - though
+# that one is still tag-only pinned; digest-pinning it too is tracked as a
+# separate follow-up, out of scope for this app). Update by re-running:
+#   docker pull ghcr.io/astral-sh/uv:0.12.7
+#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/astral-sh/uv:0.12.7
+COPY --from=ghcr.io/astral-sh/uv:0.12.7@sha256:95f2aa1fe59274951cfe9b0cbc7972e879ff1004bc8945d130a32eb0dbd85945 /uv /usr/local/bin/uv
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \

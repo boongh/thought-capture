@@ -14,8 +14,20 @@ from collections.abc import Sequence
 from sentence_transformers import SentenceTransformer
 
 
+class TooManyRequestsError(Exception):
+    """Raised when admission is already at `max_concurrent_encodes +
+    max_queued_encodes` - the caller should surface this as HTTP 429."""
+
+
 class EmbeddingModel:
-    def __init__(self, model_id: str, *, revision: str, max_concurrent_encodes: int = 1) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        revision: str,
+        max_concurrent_encodes: int = 1,
+        max_queued_encodes: int = 8,
+    ) -> None:
         self.model_id = model_id
         self.revision = revision
         self.dimensions = 0
@@ -25,6 +37,16 @@ class EmbeddingModel:
         # across threads here, so concurrent requests queue instead of each
         # spawning their own worker-thread forward pass.
         self._encode_semaphore = asyncio.Semaphore(max_concurrent_encodes)
+        # A *separate* admission cap from the semaphore above: the semaphore
+        # only bounds how many `encode()` calls run at once, not how many
+        # already-parsed requests may be waiting behind it - an unbounded
+        # queue would let unlimited validated payloads pile up in memory
+        # while waiting their turn. `_admitted` is incremented/decremented
+        # with no `await` in between, so it needs no lock: asyncio only
+        # switches coroutines at an `await` point, making that check-and-
+        # increment atomic within this single-threaded event loop.
+        self._max_admitted = max_concurrent_encodes + max_queued_encodes
+        self._admitted = 0
 
     @property
     def is_ready(self) -> bool:
@@ -45,8 +67,16 @@ class EmbeddingModel:
             raise RuntimeError("embed() called before the model finished loading")
         if not texts:
             return []
-        async with self._encode_semaphore:
-            vectors = await asyncio.to_thread(
-                self._model.encode, list(texts), convert_to_numpy=True
+        if self._admitted >= self._max_admitted:
+            raise TooManyRequestsError(
+                f"already at capacity ({self._max_admitted} concurrent/queued encode requests)"
             )
+        self._admitted += 1
+        try:
+            async with self._encode_semaphore:
+                vectors = await asyncio.to_thread(
+                    self._model.encode, list(texts), convert_to_numpy=True
+                )
+        finally:
+            self._admitted -= 1
         return [vector.tolist() for vector in vectors]

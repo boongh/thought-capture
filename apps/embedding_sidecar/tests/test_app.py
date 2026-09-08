@@ -94,3 +94,31 @@ async def test_embed_accepts_a_text_at_exactly_the_configured_length_limit(
     response = await client.post("/embed", json={"texts": ["x" * limit]})
 
     assert response.status_code == 200
+
+
+async def test_embed_rejects_an_oversized_body_before_parsing_it(client: AsyncClient) -> None:
+    """A body over `max_request_bytes` must be rejected (413) by
+    `MaxBodySizeMiddleware`, distinct from the 422 the batch/length checks
+    below would give it - proving the rejection happens before FastAPI ever
+    parses the body, not just that the parsed value later failed a field
+    check. One text well over both the byte cap and (incidentally) the
+    per-text length cap: if the 422 path fired instead, that would mean the
+    middleware did not intercept it first."""
+    byte_limit = get_settings().max_request_bytes
+
+    response = await client.post("/embed", json={"texts": ["x" * (byte_limit + 1)]})
+
+    assert response.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Admission bound (settings.py: max_concurrent_encodes + max_queued_encodes) -
+# `model.TooManyRequestsError` must surface as 429, not a 500 or a hang.
+# ---------------------------------------------------------------------------
+
+
+async def test_embed_returns_429_when_the_model_is_at_capacity(busy_client: AsyncClient) -> None:
+    response = await busy_client.post("/embed", json={"texts": ["hello"]})
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"

@@ -19,7 +19,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from tc_embedding_sidecar.model import EmbeddingModel
+from tc_embedding_sidecar.middleware import MaxBodySizeMiddleware
+from tc_embedding_sidecar.model import EmbeddingModel, TooManyRequestsError
 from tc_embedding_sidecar.schemas import EmbedRequest, EmbedResponse, HealthResponse
 from tc_embedding_sidecar.settings import get_settings
 
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.model_id,
         revision=settings.model_revision,
         max_concurrent_encodes=settings.max_concurrent_encodes,
+        max_queued_encodes=settings.max_queued_encodes,
     )
     app.state.model = model
     logger.info(
@@ -124,6 +126,11 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
         summary="Local sentence-transformers embedding service (docs/adr/0010).",
         lifespan=lifespan_handler or lifespan,  # type: ignore[arg-type]
     )
+    # Runs before FastAPI/Pydantic ever buffer or parse the request body -
+    # middleware.py's own docstring has the full reasoning for why the
+    # per-field checks in the /embed handler below are not, by themselves,
+    # early enough to bound memory use.
+    app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.max_request_bytes)
 
     @app.get("/health", response_model=HealthResponse, summary="Readiness: model loaded and usable")
     async def health() -> HealthResponse:
@@ -161,7 +168,12 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
                     f"{settings.max_text_length}-character limit per text"
                 ),
             )
-        vectors = await model.embed(request.texts)
+        try:
+            vectors = await model.embed(request.texts)
+        except TooManyRequestsError as exc:
+            raise HTTPException(
+                status_code=429, detail=str(exc), headers={"Retry-After": "1"}
+            ) from exc
         return EmbedResponse(
             model_id=model.model_id,
             model_revision=model.revision,

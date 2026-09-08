@@ -53,6 +53,24 @@ class Settings(BaseSettings):
     # throughput on a CPU-bound task, only memory pressure and context-switch
     # overhead, so concurrent requests are serialized rather than rejected.
     max_concurrent_encodes: int = 1
+    # How many additional requests may wait behind `max_concurrent_encodes`
+    # before a new one is rejected outright (429) instead of queuing
+    # indefinitely. An unbounded queue behind the semaphore would let an
+    # unlimited number of already-validated requests each hold up to
+    # `max_batch_size * max_text_length` of parsed payload in memory at
+    # once - the semaphore only bounds *execution* concurrency, not
+    # *admission*. Total admitted at once is
+    # `max_concurrent_encodes + max_queued_encodes`.
+    max_queued_encodes: int = 8
+    # A hard ceiling on the raw request body, enforced by
+    # `MaxBodySizeMiddleware` *before* FastAPI/Pydantic ever buffers or
+    # parses it into Python objects - `max_batch_size`/`max_text_length`
+    # alone only bound a body Pydantic has already fully parsed, which is
+    # too late: a huge or chunked-transfer (no declared Content-Length)
+    # request would already have forced the full parse first. Sized with
+    # headroom over `max_batch_size * max_text_length`'s raw character total
+    # (3.2 MB by default) for JSON structure/escaping overhead.
+    max_request_bytes: int = 4_000_000
 
 
 @lru_cache
