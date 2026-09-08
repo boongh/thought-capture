@@ -1,8 +1,8 @@
 # Thought Capture AI - System Design
 
 - **Status:** Accepted implementation anchor
-- **Version:** 1.8
-- **Date:** 2026-09-03
+- **Version:** 1.9
+- **Date:** 2026-09-08
 - **Audience:** Small experienced engineering team
 - **Owner:** Project owner
 
@@ -536,66 +536,78 @@ The prompt forbids facts absent from sources, requires first-person voice where 
 
 ### 7.5 Search sequence
 
-The request may provide structured filters directly. If it provides only natural language, the coordinator may ask a cheap model to produce a validated `QueryPlan`; the original query is always retained.
+The request may provide structured filters directly. If it provides only natural language, the coordinator may ask a cheap model to produce a validated `QueryPlan`; the original query is always retained. (`docs/adr/0010` retires Khoj as the semantic channel; this section describes the self-hosted replacement.)
 
 1. PostgreSQL applies workspace, date/time, entity, type, source, and lexical constraints.
-2. Khoj receives the semantic query with supported date, word, and file filters appended at the end in a canonical order. This placement avoids known parser edge cases.
-3. Both paths return stable document/revision/source identifiers.
+2. The coordinator calls `EmbeddingPort.embed` (the local embedding sidecar, `docs/adr/0010`) on the query text, then runs one SQL query against the workspace-scoped pgvector column, joined with the same date/entity/type/source filters as the exact path in the same `WHERE` clause — not a second system's filter language re-expressed and hoped to be honored.
+3. Both paths return stable document/revision/source identifiers directly from this project's own schema.
 4. Normalize ranks and fuse with RRF using `k=60`; exact phrase matches receive a documented deterministic boost before rank assignment.
-5. Deduplicate by revision ID and return evidence snippets, scores by channel, and citations.
+5. Deduplicate by revision ID and return evidence snippets, scores by channel, and citations. Because each document's current revision has exactly one embedding row (`docs/adr/0010` §3, no chunking), a duplicate-hit-by-filename class of bug is structurally impossible here, not merely handled.
 
-If Khoj is unavailable, hybrid search degrades to exact search with `degraded=true`; it never returns an empty success that implies no memory exists.
+If the embedding sidecar is unavailable, hybrid search degrades to exact search with `degraded=true`; it never returns an empty success that implies no memory exists.
 
 ### 7.6 Ask sequence
 
-Release 1 Ask delegates to Khoj `/notes` mode with generated Markdown indexed and query filters appended. The gateway streams the answer and normalizes references. During the first integration milestone, test whether Khoj's query-file attachment path can accept the coordinator's prefiltered evidence packet. If supported and stable, strict filters use that path. If not, strict Ask returns a clear capability code and offers exact search results; it does not silently answer from an unconstrained corpus. Direct first-party answer generation is a separately approved future ADR, not an implicit fallback.
+Ask assembles evidence through the same `EmbeddingSearchPort` search described in 7.5 (with query filters applied directly in SQL, not appended to a second system's query string) and sends the assembled question, evidence, and citations to `OpenRouterProvider` using the reviewed `TC_MODEL_ASK` slug (`docs/adr/0006`'s safe-mode/ZDR controls apply exactly as they do to `organize`/`select`/`query_plan`). The gateway streams the answer and normalizes references. Strict filters are always honored, because they are ordinary SQL predicates on the same query that produces the semantic channel — there is no second system whose filter-expressiveness must first be probed, so the Khoj-era "capability code" fallback for an unsupported filter no longer applies to the semantic channel; a request only degrades if the embedding sidecar or `TC_MODEL_ASK` itself is unavailable. See `docs/adr/0010` for the full replacement design and migration path.
 
-## 8. Khoj integration contract
+## 8. Embedding integration contract
 
-### 8.1 What Khoj owns
+`docs/adr/0010` retires Khoj; this section describes the self-hosted
+embedding/search replacement it authorizes. It supersedes the prior Khoj
+markdown-export/filename-convention contract, which lived in this section
+through design version 1.8.
 
-- Chunking and embedding exported Markdown.
-- Semantic nearest-neighbor search.
-- Optional cross-encoder reranking.
-- Existing search and chat UI.
-- RAG conversation flow and references.
-- Conversation state owned by Khoj.
+### 8.1 What the embedding sidecar owns
 
-### 8.2 What Khoj does not own
+- Computing embedding vectors for document revision content, locally, via `EmbeddingPort`.
+- Nothing else. It holds no index, no conversation state, and no filter logic — it is a stateless `embed(texts) -> vectors` call.
 
-- Raw thoughts, attachments, identities, entities, document revision history, schedules, provenance, exact filters, or backups.
+### 8.2 What pgvector (in the first-party PostgreSQL) owns
+
+- Storage of one embedding vector per document's current revision, an HNSW index over it, and cosine-similarity ranking.
+- Semantic nearest-neighbor search, expressed as an ordinary SQL query alongside the exact-search predicates (7.5), not a separate system's query language.
+
+### 8.3 What neither owns
+
+- Raw thoughts, attachments, identities, entities, document revision history, schedules, provenance, exact filters, or backups — unchanged from the Khoj era.
 - The canonical current version of a generated document.
 - Authorization decisions for Discord or the future application UI.
+- Reranking or RAG conversation flow — Ask's chat call goes to `OpenRouterProvider` (7.6), not to the embedding sidecar.
 
-### 8.3 Indexed Markdown format
+### 8.4 Stored row shape
 
-Each revision export uses deterministic YAML front matter and visible ISO dates so both humans and Khoj filters can interpret it:
+Each document's current revision has one row carrying its embedding vector, joined to `document_revisions` by `revision_id`:
 
-```markdown
----
-document_id: "..."
-revision_id: "..."
-workspace_id: "..."
-kind: "project"
-stable_key: "project:thought-capture-ai"
-window_start: "2026-08-29T20:00:00+07:00"
-window_end: "2026-08-30T20:00:00+07:00"
-entities: ["Thought Capture AI", "Khoj"]
-source_thought_ids: [101, 105]
----
+```sql
+CREATE TABLE document_embeddings (
+  revision_id uuid PRIMARY KEY REFERENCES document_revisions(id),
+  document_id uuid NOT NULL REFERENCES documents(id),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  embedding vector(384) NOT NULL,
+  embedding_model_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
-# Thought Capture AI
-
-...
+CREATE INDEX document_embeddings_hnsw_idx
+  ON document_embeddings USING hnsw (embedding vector_cosine_ops);
 ```
 
-Filename: `{workspace_id}/{kind}/{stable_key_slug}--{document_id}.md`. Only the current revision is present in the live Khoj index. Historical revisions remain in PostgreSQL and portable exports, preventing Ask from citing superseded facts. Reverting changes the current file content and triggers reindex.
+(Exact column list and vector dimensionality are finalized in the Slice 1
+migration; `vector(384)` matches `thenlper/gte-small`'s output
+dimensionality, `docs/adr/0010` §5's recommended model.) Only the current
+revision has a row — reverting a document deletes the superseded row's
+claim to "current" implicitly by writing a new revision and re-embedding
+it, the same "only the current revision is searchable" invariant the Khoj
+era enforced via reindex, now enforced by a foreign key to
+`documents.current_revision_id` instead of a second system's upload state.
+There is no exported Markdown file or filename convention in this design —
+the embedding is computed directly from the revision's stored
+`body_markdown` and written in the same transaction that updates
+`document_embeddings`, one step instead of export-then-index.
 
-### 8.4 Upgrade policy
+### 8.5 Upgrade policy
 
-Pin Khoj by immutable image digest and record its version. Contract tests cover content batch upload/delete, search filters, result schema, chat streaming, references, and authentication. Upgrade in a branch, rebuild the index from canonical exports, run the retrieval golden set, and only then change the digest.
-
-Khoj is AGPL-3.0-or-later. Unmodified network use through its API is operationally simpler. If the project distributes or serves a modified Khoj fork, obtain legal review and provide corresponding source as required. This document is technical guidance, not legal advice.
+Pin the embedding model by name and the sidecar image by digest, matching this project's existing pinned-digest-plus-contract-test policy (unchanged principle from the Khoj era). Changing the embedding model requires a `reembed` run (`runs.kind = 'reembed'`, `runs.embedding_model_id`) that recomputes every `document_embeddings` row before the new model is read from; never compare vectors from different models. Contract tests for the sidecar cover its `embed` endpoint's request/response shape and failure modes, mirroring the discipline `tests/contract/khoj` previously applied to the Khoj container.
 
 ## 9. Retrieval model
 
@@ -610,7 +622,7 @@ Khoj is AGPL-3.0-or-later. Unmodified network use through its API is operational
 
 ### 9.2 Semantic path
 
-Khoj initially uses its local default search models to avoid sending embeddings externally. If hardware performance is unacceptable, configure its OpenAI-compatible embedding endpoint to OpenRouter and pin an embedding model. Model changes require a full reindex; never compare vectors from different models.
+Embedding runs locally via a first-party sidecar service (`docs/adr/0010`), not Khoj: a small, pinned Python 3.12 process wrapping `sentence-transformers`, called through `EmbeddingPort` and stored in the first-party PostgreSQL's pgvector extension (8.4). This avoids sending document content to a third-party embedding API by default, matching this section's original intent from the Khoj era. If hardware performance is unacceptable, `EmbeddingPort` is designed to accept a future OpenRouter-backed adapter implementing the same protocol (`docs/adr/0010` §4) — a new adapter class, not a redesign of search or storage. Model changes require a full `reembed` run (8.5); never compare vectors from different models.
 
 ### 9.3 Multilingual upgrade seam
 
@@ -682,10 +694,10 @@ Personal memory data is unusually sensitive: it can reveal relationships, health
 ### 12.1 Data disclosures
 
 - Discord sees message content and attachments sent through Discord.
-- OpenRouter and the selected downstream model provider receive text included in model requests.
-- Entity-document embeddings for organize context assembly are computed locally and are not disclosed to any provider (section 7.3.6).
-- If OpenRouter embeddings are enabled instead of the local model, the provider receives indexed document chunks.
-- Khoj and PostgreSQL retain local copies.
+- OpenRouter and the selected downstream model provider receive text included in model requests — including Ask's evidence-assembly prompt as of `docs/adr/0010`, which routes through the same reviewed-model/ZDR controls as `organize`/`select`/`query_plan` rather than a separate, ungoverned credential.
+- Entity-document embeddings for organize context assembly are computed locally and are not disclosed to any provider (section 7.3.6). Search/Ask embeddings are likewise computed locally by the first-party sidecar (`docs/adr/0010`) and are not disclosed to any provider by default.
+- If a future OpenRouter embedding adapter is enabled instead of the local sidecar, the provider receives indexed document content (`docs/adr/0010` §4's designed-for, not-yet-built seam).
+- PostgreSQL (including its pgvector-backed semantic index) retains local copies.
 - Off-site backup providers receive encrypted ciphertext only.
 
 The settings and README must state these boundaries plainly. Release 1 has no claim of end-to-end encryption.
@@ -694,8 +706,8 @@ The settings and README must state these boundaries plainly. Release 1 has no cl
 
 - Allowlist exact Discord user, guild, and channel IDs; use least-privilege bot permissions.
 - Enable only required Gateway intents. Do not request member or presence intents.
-- Bind API, Khoj, and databases to `127.0.0.1` in local Compose.
-- Use unique database roles/passwords and a non-default Khoj admin password/secret.
+- Bind API, the embedding sidecar, and databases to `127.0.0.1` in local Compose.
+- Use unique database roles/passwords.
 - Keep secrets out of Git, logs, prompts, exports, and diagnostic bundles.
 - Cap attachment size, sanitize filenames for display only, store by hash, reject executable types by policy, and scan before future processing.
 - Encrypt host disks where available. Encrypt off-site backups with `age`; keep the private key off the backup destination.
@@ -849,9 +861,9 @@ Use text capture for two weeks without LLM organization changes. Gate: owner sti
 
 Add OpenRouter adapter, versioned prompts, runs, entity extraction, daily/entity revisions, 20:00 scheduler, `/organize`, digest outbox, and evaluation fixtures. Gate: five representative windows rerun without destructive change; coverage and grounding pass.
 
-### Phase 2 - Khoj and hybrid retrieval
+### Phase 2 - Self-hosted embedding and hybrid retrieval
 
-Pin self-hosted Khoj, export current Markdown, implement index sync, exact search, semantic search, RRF, Ask proxy, and contract tests. Run the strict-filter evidence-attachment spike. Gate: golden-set recall and degradation behavior pass.
+Add pgvector to the first-party PostgreSQL image, build the embedding sidecar and `EmbeddingPort`, implement embedding sync, exact search, semantic search, RRF, an Ask path routed through `OpenRouterProvider`/`TC_MODEL_ASK`, and contract tests (`docs/adr/0010`, superseding this phase's original Khoj-based plan from design version 1.8 and earlier). Gate: golden-set recall and degradation behavior pass at parity with or better than the superseded Khoj-era baseline before Khoj is removed.
 
 ### Phase 3 - Operational hardening
 
@@ -859,7 +871,7 @@ Add backup/export/restore drill, metrics, budgets, security tests, upgrade runbo
 
 ### Phase 4 - Unified custom UI
 
-Build the browser client against `/v1` only. Include search filters, Ask streaming/references, raw source view, revisions/diff/restore, run status, and settings. Gate: Khoj may be upgraded or temporarily unavailable without changing the UI contract; exact search remains usable.
+Build the browser client against `/v1` only. Include search filters, Ask streaming/references, raw source view, revisions/diff/restore, run status, and settings. Gate: the embedding sidecar or `TC_MODEL_ASK`'s provider may be upgraded or temporarily unavailable without changing the UI contract; exact search remains usable.
 
 ### Phase 5 - VPS readiness and multi-user implementation
 
@@ -872,20 +884,20 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 - Discord replaces Telegram as the first capture surface.
 - Single-user operation with workspace-scoped schema.
 - Raw log and original attachments are append-only canonical data.
-- PostgreSQL handles precision retrieval; Khoj handles semantic retrieval and Ask.
-- Khoj is self-hosted, pinned, API-integrated, and not forked.
-- First-party services use Python 3.14; Khoj remains runtime-isolated.
-- OpenRouter is the initial LLM gateway; local models remain a compatible future adapter.
+- PostgreSQL handles precision retrieval and, as of `docs/adr/0010`, semantic retrieval (via a self-hosted embedding sidecar and pgvector) and Ask (via `OpenRouterProvider`/`TC_MODEL_ASK`); Khoj is retired.
+- First-party services use Python 3.14; the embedding sidecar is a separately versioned Python 3.12 process, runtime-isolated for the same reason Khoj previously was (`docs/adr/0010`, pending a `cp314` torch wheel).
+- OpenRouter is the LLM gateway for organize, select, query_plan, and ask; local models remain a compatible future adapter.
 - Daily digest cutoff defaults to 20:00 local, using successful-cutoff capture windows.
 - Entity documents evolve through immutable full-snapshot revisions.
-- Khoj UI is used first; a unified custom UI is Phase 4.
+- A unified custom UI is Phase 4, calling the first-party `/v1` gateway only; there is no Khoj UI dependency to sequence around.
 - Organize context is assembled from a complete entity index plus additive body selection, with locally computed embeddings as a second-wave signal.
 
 ### Deferred with explicit trigger
 
 - Exact model slugs: select during implementation by a small structured-output evaluation and budget check.
 - Off-site backup provider: select before VPS or after one month of valued data, whichever comes first.
-- Strict-filter Ask evidence injection: resolve during Khoj contract spike; never silently weaken filters.
+- Reranking and document chunking for semantic search: explicitly deferred by `docs/adr/0010`; revisit only if golden-set retrieval quality proves insufficient without them.
+- Cloud embedding adapter: designed for (`EmbeddingPort`, `docs/adr/0010` §4) but not built; trigger is unacceptable local sidecar performance on the owner's hardware.
 - OCR/vision/transcription: new release only after capture habit validation.
 - Entity merge across weak aliases: require review workflow and quality data.
 - Cross-day non-entity rolling documents: evaluate after entity documents are used.
@@ -898,13 +910,14 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 |---|---|
 | ADR-0001 | Append-only canonical event log |
 | ADR-0002 | Discord Gateway as capture adapter |
-| ADR-0003 | PostgreSQL precision retrieval plus Khoj semantic/Ask |
+| ADR-0003 | PostgreSQL precision retrieval plus Khoj semantic/Ask — **superseded by ADR-0010** for the semantic/Ask half; the PostgreSQL-precision-retrieval half remains accepted |
 | ADR-0004 | Immutable full-snapshot document revisions |
 | ADR-0005 | Workspace-scoped single-user-first schema |
 | ADR-0006 | OpenRouter behind a provider port, with safe and custom model-selection modes |
-| ADR-0007 | Custom unified UI over stable gateway, no Khoj fork |
+| ADR-0007 | Custom unified UI over stable gateway |
+| ADR-0010 | Retire Khoj — self-hosted embedding (pgvector + sidecar) and Ask via `OpenRouterProvider`/`TC_MODEL_ASK` |
 
-Implementation should create these ADR files when the first code for each decision lands; this design remains the summary authority.
+Implementation should create these ADR files when the first code for each decision lands; this design remains the summary authority. (ADR numbers 0008-0009 exist under `docs/adr/` for decisions not yet reflected in this index table; this table is not exhaustive of every accepted ADR, only the ones tracked here since Release 1 planning.)
 
 ## 21. References verified 2026-08-30
 
