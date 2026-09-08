@@ -10,9 +10,9 @@
 
 Build a self-hosted personal memory system whose critical path is Discord capture, not organization. Every accepted message is written immediately to an append-only canonical log. At 20:00 in the owner's configured timezone, a background pipeline organizes new captures into an immutable daily digest and versioned, evolving entity documents, then sends the digest back through Discord.
 
-PostgreSQL owns canonical facts, provenance, revisions, deterministic filters, and lexical search. Self-hosted Khoj owns semantic indexing, its current search/Ask interface, reranking, and RAG conversations. A first-party retrieval coordinator combines the two without modifying Khoj. A later custom web UI will call only the coordinator's stable API and will present capture history, exact search, semantic search, Ask, revisions, and operations in one interface.
+PostgreSQL owns canonical facts, provenance, revisions, deterministic filters, lexical search, and — since `docs/adr/0010` — semantic indexing via its `pgvector` extension. A small first-party embedding sidecar computes vectors locally; a first-party retrieval coordinator runs exact and semantic search as two SQL-adjacent paths against the same database and fuses them, and routes Ask through the project's own `OpenRouterProvider`. A later custom web UI will call only the coordinator's stable API and will present capture history, exact search, semantic search, Ask, revisions, and operations in one interface.
 
-This split is deliberate. Khoj currently provides semantic retrieval, cross-encoder reranking, Ask/RAG, and query filters for dates embedded in entries, include/exclude words, and files. It does not expose a stable public custom-retriever plug-in contract or the typed time, entity, source, and document-revision filters required here. Forking Khoj is explicitly not part of the baseline because it would add upgrade and AGPL source-distribution obligations. Integration remains API-based.
+This design previously delegated semantic indexing, reranking, and Ask/RAG to a self-hosted third-party system, Khoj, integrated API-only and never forked (`docs/adr/0003`). `docs/adr/0010` retired that dependency: Khoj's lack of a stable custom-retriever contract and its own typed filters could not express the time/entity/source/document-revision filters this project needs any better than a first-party SQL query already does, its Ask path required a second, ungoverned LLM credential outside this project's own model-review discipline (`docs/adr/0006`), and its embedding step — always intended to run locally and cheaply (section 9.2) — needed no external system at all to keep running locally. Owning retrieval outright, rather than integrating a second system's opaque behavior, is now the accepted design; see `docs/adr/0010` for the full decision record and migration path.
 
 ### 1.1 Release 1 definition of done
 
@@ -26,7 +26,7 @@ Release 1 is complete only when all of the following are demonstrated on a clean
 - Every generated claim is traceable to one or more raw thought IDs.
 - Re-running a capture window creates a new run and new revisions without destroying previous output.
 - Search supports semantic similarity plus exact phrase, include/exclude terms, date range, time range, source, document type, and entity filters.
-- Khoj Ask answers from indexed generated documents and displays references.
+- Ask answers from indexed generated documents (self-hosted embedding search plus OpenRouter generation, `docs/adr/0010`) and displays validated references.
 - Backup, export, restore, and a model-provider failure are exercised successfully.
 
 ## 2. Problem and product goal
@@ -69,12 +69,12 @@ The product goal is to make capture nearly effortless while moving structure, en
 2. **Raw means immutable.** Corrections are new events linked to old events; they are not updates.
 3. **Derived means disposable but auditable.** Every derived version records run, model, prompt, and sources.
 4. **Reversion is forward motion.** Restoring an older document creates a new revision whose parent is the current revision and whose content matches the selected historical revision.
-5. **One stable application API.** Discord, Khoj, and the future UI are adapters around first-party use cases.
+5. **One stable application API.** Discord, the embedding sidecar, and the future UI are adapters around first-party use cases.
 6. **Precise before impressive.** Deterministic filters and citations are requirements; chat polish is secondary.
-7. **Provider isolation.** LLM, embeddings, Discord, Khoj, and storage are ports with replaceable adapters.
+7. **Provider isolation.** LLM, embeddings, Discord, and storage are ports with replaceable adapters.
 8. **Single-user first, workspace-scoped always.** Every domain row carries workspace ownership so later isolation and shared brains do not require re-keying the database.
 9. **Local by default.** Services bind to loopback and outbound disclosure is explicit.
-10. **Version external systems.** Khoj images, models, prompts, schemas, and migrations are pinned; upgrades are tested, not floated.
+10. **Version external systems.** Container images (embedding sidecar, PostgreSQL/pgvector), models, prompts, schemas, and migrations are pinned; upgrades are tested, not floated.
 
 ## 4. Scope and user experience
 
@@ -102,7 +102,7 @@ Discord receives:
 - run status and capture-window times;
 - a short digest designed to fit Discord message limits, split on section boundaries when needed;
 - entity/project updates;
-- source thought identifiers and a link to Khoj when configured;
+- source thought identifiers and a reference to the relevant document, resolvable through `/v1/documents` or Discord `/search`;
 - a clear partial/failure notice instead of an invented result.
 
 ### 4.3 Search and Ask
@@ -110,16 +110,16 @@ Discord receives:
 The system exposes one retrieval API with three modes:
 
 - `exact`: PostgreSQL date/time/entity/type/source filters plus phrase, prefix, full-text, and trigram matching;
-- `semantic`: Khoj search over exported Markdown;
+- `semantic`: pgvector cosine-similarity search over each document's current-revision embedding, computed by the local embedding sidecar (`docs/adr/0010`);
 - `hybrid`: both paths in parallel, normalized and fused with Reciprocal Rank Fusion (RRF).
 
-Khoj's existing web interface is the Release 1 human interface for semantic search and Ask. The first-party `/v1/search` and `/v1/ask` contracts are the seam for a later unified UI.
+Discord slash commands (`/search`, `/ask`) are the Release 1 human interface for semantic search and Ask — there is no separate third-party web UI in this design. The first-party `/v1/search` and `/v1/ask` contracts are the seam for a later unified UI.
 
 ### 4.4 Future unified interface
 
-A custom UI is moderate work because it does not implement retrieval. It calls the gateway and renders a normalized model. Expected screens are Capture History, Daily Digests, Entities, Search, Ask, Revision History/Diff, Runs, and Settings. The gateway owns auth, query parsing, citations, pagination, and streaming; the browser never contacts PostgreSQL, OpenRouter, or Khoj directly.
+A custom UI is moderate work because it does not implement retrieval. It calls the gateway and renders a normalized model. Expected screens are Capture History, Daily Digests, Entities, Search, Ask, Revision History/Diff, Runs, and Settings. The gateway owns auth, query parsing, citations, pagination, and streaming; the browser never contacts PostgreSQL, OpenRouter, or the embedding sidecar directly.
 
-Do not fork or visually embed Khoj as the primary plan. Use Khoj's documented HTTP APIs behind the gateway. If an endpoint is not stable, isolate it in `KhojClient` contract tests. A future upstream contribution is welcome, but no core feature depends on its acceptance.
+Retrieval (exact and semantic search, Ask) is first-party code behind the gateway, not a third-party UI to fork or embed. If a future embedding-model or provider swap changes behavior, isolate it in the sidecar's own contract tests. A future dedicated reranking or retrieval-quality improvement is welcome, but no core feature depends on it landing (`docs/adr/0010` §1).
 
 ## 5. Architecture
 
@@ -127,16 +127,16 @@ Do not fork or visually embed Khoj as the primary plan. Use Khoj's documented HT
 flowchart LR
     D[Discord user] -->|Gateway events| B[Discord bot]
     B -->|commands| A[Application API/use cases]
-    A --> P[(Canonical PostgreSQL)]
+    A --> P[(Canonical PostgreSQL + pgvector)]
     B --> O[(Attachment store)]
     W[Worker/scheduler] --> P
     W --> O
     W -->|structured completions| R[OpenRouter]
-    W -->|Markdown index updates| K[Self-hosted Khoj]
-    K -->|chat and embeddings| R
-    U[Khoj UI now / custom UI later] --> G[Retrieval gateway]
-    G -->|exact filters| P
-    G -->|semantic search and Ask| K
+    W -->|embedding requests| E[Embedding sidecar]
+    E -->|vector| P
+    U[Discord /search, /ask now; custom UI later] --> G[Retrieval gateway]
+    G -->|exact + semantic filters| P
+    G -->|Ask evidence + generation| R
     G -->|normalized cited results| U
     W -->|digest| D
 ```
@@ -147,17 +147,16 @@ flowchart LR
 |---|---|---|
 | `api` | REST gateway, health, run commands, raw/document reads, normalized search/Ask | stateless |
 | `discord-bot` | Gateway connection, capture adapter, acknowledgement, slash commands, digest delivery | stateless except Discord connection |
-| `worker` | persistent schedules, organization, export, Khoj sync, retries, digest dispatch | leases and run rows in PostgreSQL |
-| `postgres` | canonical log, derived revisions, provenance, entities, exact search, schedules | canonical state |
-| `khoj` | semantic index, reranking, Ask/RAG, current UI | regenerable index and conversations |
-| `khoj-db` | Khoj-owned schema | regenerable/config state; logically isolated |
+| `worker` | persistent schedules, organization, export, embedding sync, retries, digest dispatch | leases and run rows in PostgreSQL |
+| `postgres` | canonical log, derived revisions, provenance, entities, exact search, schedules, semantic index (`pgvector`, `docs/adr/0010`) | canonical state |
+| `embedding-sidecar` | local embedding computation for search/Ask (`docs/adr/0010`) | stateless |
 | `attachments` volume | content-addressed original files | canonical binary state |
 
-The two databases may share one PostgreSQL server locally but must use separate databases and roles. First-party migrations never touch Khoj tables. A VPS deployment may split them without application changes.
+There is a single PostgreSQL database; the embedding sidecar is a stateless compute service with no database of its own to isolate — unlike the retired Khoj-era topology, there is no second schema or server to keep separate. A VPS deployment may still split PostgreSQL onto its own host without application changes.
 
 ### 5.2 Language and framework allocation
 
-- **Python 3.14.x:** all first-party services and libraries. Pin the patch version in `.python-version` and container base image; upgrade through CI.
+- **Python 3.14.x:** all first-party services and libraries except the embedding sidecar (below). Pin the patch version in `.python-version` and container base image; upgrade through CI.
 - **FastAPI:** HTTP transport and OpenAPI. Business rules remain framework-free.
 - **Pydantic v2:** boundary validation and LLM structured-output schemas.
 - **SQLAlchemy 2 async + psycopg 3:** persistence. Use explicit repository methods; no database calls from Discord event handlers outside application use cases.
@@ -165,13 +164,13 @@ The two databases may share one PostgreSQL server locally but must use separate 
 - **discord.py:** Discord Gateway, commands, attachments, and responses.
 - **APScheduler 3.x initially:** scheduling in the worker with a PostgreSQL-backed lease. Replace with a queue only when concurrency or load justifies it.
 - **pytest, Hypothesis, Ruff, mypy:** verification and quality gates.
-- **Markdown:** portable generated-document interchange and Khoj indexing format.
+- **Markdown:** portable generated-document interchange format. Embeddings are computed directly from stored `body_markdown` (section 8.4); there is no separate export/index-file step.
 
-Khoj is pinned as an OCI image. Its current source package declares Python `>=3.10,<3.13`; it must not share the first-party Python 3.14 environment.
+The embedding sidecar (`docs/adr/0010`) is pinned as its own first-party OCI image, built for Python 3.12 (`sentence-transformers`/`torch` do not yet ship Python 3.14 wheels); it must not share the first-party Python 3.14 environment.
 
 ### 5.3 Dependency direction
 
-`domain` has no framework imports. `application` depends on domain ports. `infrastructure` implements PostgreSQL, Discord, object storage, OpenRouter, and Khoj adapters. `apps/*` wires dependencies. This hexagonal boundary is what makes Discord replaceable and permits local models later.
+`domain` has no framework imports. `application` depends on domain ports. `infrastructure` implements PostgreSQL, Discord, object storage, OpenRouter, and embedding-sidecar adapters. `apps/*` wires dependencies. This hexagonal boundary is what makes Discord replaceable and permits local models later.
 
 ## 6. Canonical data model
 
@@ -365,7 +364,7 @@ Automatic alias merges are forbidden below a configurable confidence threshold. 
 
 Use a transactional outbox so a database commit and Discord acknowledgement/digest intent cannot diverge. `outbox_events` contains event type, aggregate ID, JSON payload, attempt count, lease, next attempt, and delivery timestamp. Workers use `FOR UPDATE SKIP LOCKED`.
 
-`capture_windows` records cutoff boundaries and the successful organize run. `khoj_index_items` maps each exported Markdown filename and SHA-256 to document/revision and last synced time - the *last successful* sync only (migration 0007); Khoj's own `PUT /api/content` response carries nothing worth persisting beyond that (`docs/adr/0003`'s contract-spike findings), and a failed sync attempt stays on the triggering outbox event's own `attempts`/`last_error` rather than this table, since a document's very first attempt could fail before any filename/revision/sha is even known. A revision becomes searchable only after successful index acknowledgement. `run_context_selections` (section 7.3.5) records per-run organize context assembly and is diagnostic, not canonical.
+`capture_windows` records cutoff boundaries and the successful organize run. `document_embeddings` (section 8.4, `docs/adr/0010`) holds one row per document — keyed by `document_id`, not `revision_id` — carrying whichever revision's vector was most recently embedded successfully, its `embedding_model_id`, and `updated_at`; a failed sync attempt stays on the triggering outbox event's own `attempts`/`last_error` rather than this table, since a document's very first attempt could fail before any embedding exists at all. A revision becomes searchable only once `document_embeddings.revision_id` matches `documents.current_revision_id` — every semantic-search query enforces this equality directly rather than trusting the sync loop to always be caught up (section 8.4's currentness guarantee). `run_context_selections` (section 7.3.5) records per-run organize context assembly and is diagnostic, not canonical.
 
 ## 7. Core workflows
 
@@ -401,7 +400,7 @@ If blob storage succeeds and the database transaction fails, a garbage-collectio
 8. Verify every referenced thought belongs to the window/workspace and every input thought is either covered or explicitly classified `unorganized`. Record context recall for the run.
 9. Write full document revisions and provenance in one transaction. Never write a partial document set after validation failure.
 10. Export changed revisions to deterministic Markdown files.
-11. Index changed files in Khoj and record item hashes, decoupled from this run entirely (`docs/adr/0003`'s "Index sync run-tracking scope" addendum): one `khoj.sync_requested` outbox event per document, delivered by an independent worker poller. Canonical revisions remain valid and sync retries independently; failure never touches this run's own status.
+11. Embed changed documents' current revisions and upsert their `document_embeddings` row, decoupled from this run entirely (`docs/adr/0010`, replacing ADR-0003's Khoj-era "Index sync run-tracking scope" addendum with the same decoupled-outbox shape): one `embedding.sync_requested` outbox event per document, delivered by an independent worker poller (`EmbeddingSyncLoop`). Canonical revisions remain valid and sync retries independently; failure never touches this run's own status.
 12. Enqueue the Discord digest and mark success only after canonical commit. Discord delivery can retry without rerunning the LLM.
 
 ### 7.3 Context assembly for organization
@@ -505,7 +504,7 @@ A document that was referenced while `index_only` is a retrieval miss. Without t
 
 Once assembly is bounded this way, run cost is dominated by *output* tokens - the bodies actually rewritten - which is why invariant 5 is the largest single cost lever in the pipeline. Assembly configuration (`context.max_body_tokens`, `context.max_selected_documents`, `context.timeline_tail_entries`, `context.recency_windows`, `context.cooccurrence_threshold`, `context.embedding_enabled`, `context.embedding_top_k`) is workspace-scoped and versioned with the prompt.
 
-Embedding selection is a planned second-wave signal, not a deferral. Entity-document embeddings are computed from each revision's `Summary` and `Current state` sections at revision-write time, inside the transaction that writes the revision, so they are fresh by construction. This is distinct from the Khoj semantic index, which covers generated documents and is by construction one run stale at organize time; organize must not depend on it, and depending on it would invert the Phase 1 / Phase 2 order.
+Embedding selection is a planned second-wave signal, not a deferral. Entity-document embeddings are computed from each revision's `Summary` and `Current state` sections at revision-write time, inside the transaction that writes the revision, so they are fresh by construction. This is distinct from the pgvector-backed document semantic index (section 8, `docs/adr/0010`), which covers generated documents and is by construction one run stale at organize time; organize must not depend on it, and depending on it would invert the Phase 1 / Phase 2 order.
 
 The embedding model runs locally rather than through OpenRouter. Text embedding is inexpensive to host, and keeping it local removes per-run cost, removes a network round trip from the organize path, and avoids disclosing document content to a second provider (section 12.1). At Release 1 corpus size the vectors are stored as `float4[]` alongside the revision and compared by direct cosine similarity; pgvector is unnecessary until a linear scan is measurably expensive, and the pinned `postgres` image does not carry the extension. Changing the embedding model requires a `reembed` run and is recorded in `runs.embedding_model_id`.
 
@@ -548,7 +547,32 @@ If the embedding sidecar is unavailable, hybrid search degrades to exact search 
 
 ### 7.6 Ask sequence
 
-Ask assembles evidence through the same `EmbeddingSearchPort` search described in 7.5 (with query filters applied directly in SQL, not appended to a second system's query string) and sends the assembled question, evidence, and citations to `OpenRouterProvider` using the reviewed `TC_MODEL_ASK` slug (`docs/adr/0006`'s safe-mode/ZDR controls apply exactly as they do to `organize`/`select`/`query_plan`). The gateway streams the answer and normalizes references. Strict filters are always honored, because they are ordinary SQL predicates on the same query that produces the semantic channel — there is no second system whose filter-expressiveness must first be probed, so the Khoj-era "capability code" fallback for an unsupported filter no longer applies to the semantic channel; a request only degrades if the embedding sidecar or `TC_MODEL_ASK` itself is unavailable. See `docs/adr/0010` for the full replacement design and migration path.
+Ask assembles evidence through the same `EmbeddingSearchPort` search described in 7.5 (with query filters applied directly in SQL, not appended to a second system's query string), then generates an answer over that evidence through `OpenRouterProvider` using the reviewed `TC_MODEL_ASK` slug (`docs/adr/0006`'s safe-mode/ZDR controls apply exactly as they do to `organize`/`select`/`query_plan`). Strict filters are always honored, because they are ordinary SQL predicates on the same query that produces the semantic channel — there is no second system whose filter-expressiveness must first be probed, so the Khoj-era "capability code" fallback for an unsupported filter no longer applies to the semantic channel; a request only degrades if the embedding sidecar or `TC_MODEL_ASK` itself is unavailable.
+
+**Evidence packet.** `EmbeddingSearchPort.search`'s top-N hits (bounded by `context.ask_evidence_top_k`, a new workspace-scoped config value alongside the existing `context.*` settings in 7.3.6) are assembled into a numbered evidence list before any model call:
+
+```python
+class AskEvidenceItem(BaseModel):
+    index: int              # 1-based, stable for this request only
+    document_id: UUID
+    revision_id: UUID
+    title: str
+    snippet: str            # bounded excerpt of body_markdown, not the full body
+```
+
+**Empty-evidence behavior.** If the evidence list is empty, `TC_MODEL_ASK` is never called. Ask returns a fixed, non-generated response (`AskAnswer.answer = "No indexed documents matched this question."`, `evidence: []`) — the same "never invent a result" discipline principle 6 and `docs/DESIGN.md` 1's grounding requirement already apply everywhere else. This differs from Khoj's own behavior, which called its configured chat model even with nothing indexed and relied on the model itself producing a canned no-notes reply (ADR-0003's "Ask proxy" amendment); this design makes the same outcome structural rather than dependent on model behavior.
+
+**Prompt and streamed output.** The prompt instructs the model to answer only from the numbered evidence items and to mark every claim drawn from evidence with an inline bracketed citation matching that item's `index` (for example `[2]`), the same "quoted data, not instructions" framing principle 12.2 already requires for organize prompts. The gateway streams the answer's prose tokens as they generate (`docs/DESIGN.md`'s existing streaming requirement), exactly as `OpenRouterProvider` streams `organize`/`select` completions today — no new wire protocol.
+
+**Citation validation, after the stream completes.** The full answer text is scanned for citation markers matching `\[(\d+)\]`. Each marker is resolved against the evidence packet's `index` values:
+
+- A marker resolving to a real evidence item becomes a validated `AskReference` (carrying that item's `document_id`/`revision_id`/`title`) in the response's `references` list.
+- A marker with no matching `index` (a model inventing a citation number, or citing evidence trimmed by `ask_evidence_top_k`) is dropped from `references` and left as plain, non-clickable text in the answer — never surfaced as if it were a real citation, and never causes the request to fail.
+- An answer with citation markers but zero valid resolutions still returns its prose (a partial-grounding case, not a hard error) with `references: []` and a `citations_unverified: true` flag, so a caller can choose to warn rather than silently present ungrounded prose as if it were cited.
+
+**Traceability.** A validated `AskReference` names a `document_id`/`revision_id`; that revision's `revision_sources` rows (section 6.3) already link it to the raw `thought_id`s that produced it. Resolving an Ask citation down to raw source thoughts — the same traceability `docs/DESIGN.md` 1's Release 1 definition of done requires for every generated claim — reuses this existing table; no new provenance mechanism is needed.
+
+**Degradation.** If `TC_MODEL_ASK`'s call itself fails or times out after evidence was found (embedding search succeeded, generation did not), Ask returns `degraded: true` with the evidence list still attached, so a caller can fall back to showing raw search results rather than nothing. See `docs/adr/0010` for the full replacement design and migration path.
 
 ## 8. Embedding integration contract
 
@@ -576,16 +600,15 @@ through design version 1.8.
 
 ### 8.4 Stored row shape
 
-Each document's current revision has one row carrying its embedding vector, joined to `document_revisions` by `revision_id`:
+Every document has at most one row, keyed by `document_id` — not `revision_id` — carrying whichever revision was most recently embedded successfully:
 
 ```sql
 CREATE TABLE document_embeddings (
-  revision_id uuid PRIMARY KEY REFERENCES document_revisions(id),
-  document_id uuid NOT NULL REFERENCES documents(id),
-  workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  document_id uuid PRIMARY KEY REFERENCES documents(id),
+  revision_id uuid NOT NULL REFERENCES document_revisions(id),
   embedding vector(384) NOT NULL,
   embedding_model_id text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX document_embeddings_hnsw_idx
@@ -594,16 +617,45 @@ CREATE INDEX document_embeddings_hnsw_idx
 
 (Exact column list and vector dimensionality are finalized in the Slice 1
 migration; `vector(384)` matches `thenlper/gte-small`'s output
-dimensionality, `docs/adr/0010` §5's recommended model.) Only the current
-revision has a row — reverting a document deletes the superseded row's
-claim to "current" implicitly by writing a new revision and re-embedding
-it, the same "only the current revision is searchable" invariant the Khoj
-era enforced via reindex, now enforced by a foreign key to
-`documents.current_revision_id` instead of a second system's upload state.
+dimensionality, `docs/adr/0010` §5's recommended model.) There is no
+`workspace_id` column here — `workspace_id` is never stored redundantly
+against a row it could drift out of sync with; every query joins
+`document_embeddings -> documents` to obtain and filter on it, so a
+row's workspace/document identity is exactly whatever `documents` already
+says it is, not a second, independently writable foreign key that could
+disagree with the first. This is a stronger guarantee than a same-value
+foreign key would have given, since two independently-set foreign keys
+(the shape this section described through design version 1.9's first
+`docs/adr/0010` draft) can be individually valid yet mutually inconsistent
+— a bug this schema makes structurally unrepresentable instead of merely
+untested.
+
+**Currentness is enforced two ways, not by a single foreign key,**
+because embedding sync is asynchronous by design (7.2 step 11's decoupled
+outbox) and cannot be forced into the same transaction as the revision
+write that supersedes a prior one:
+
+1. **Write-path guard against stale overwrite.** `EmbeddingSyncLoop`'s
+   writer upserts by `document_id`
+   (`INSERT ... ON CONFLICT (document_id) DO UPDATE ...`) and only applies
+   the update when the incoming `document_revisions.revision_number` is
+   strictly greater than the currently stored row's revision number
+   (compared via a join in the same statement). An at-least-once,
+   out-of-order outbox redelivery for an already-superseded revision can
+   therefore never overwrite a newer embedding with an older one.
+2. **Read-path guard against sync lag.** Every semantic-search query joins
+   on `document_embeddings.revision_id = documents.current_revision_id` as
+   a hard filter, not merely `document_embeddings.document_id =
+   documents.id`. A document whose embedding sync has not yet caught up to
+   its latest revision is simply absent from semantic results until it
+   does — the existing "a revision becomes searchable only after
+   successful index acknowledgement" behavior (6.5) — rather than ever
+   appearing with superseded content attached to a current-looking result.
+
 There is no exported Markdown file or filename convention in this design —
 the embedding is computed directly from the revision's stored
-`body_markdown` and written in the same transaction that updates
-`document_embeddings`, one step instead of export-then-index.
+`body_markdown`, read at sync time, not from a stale copy captured when
+the outbox event was originally enqueued.
 
 ### 8.5 Upgrade policy
 
@@ -626,7 +678,7 @@ Embedding runs locally via a first-party sidecar service (`docs/adr/0010`), not 
 
 ### 9.3 Multilingual upgrade seam
 
-Persist BCP-47 language tags per thought and model IDs per index generation. The English FTS configuration is selected by a mapping function, not hard-coded throughout repositories. A future migration may add language-specific generated columns or external tokenization for languages without whitespace segmentation. Embedding configuration is workspace/index-version scoped. Multilingual support therefore requires a new tokenizer/FTS strategy and a Khoj reindex, not a schema rewrite.
+Persist BCP-47 language tags per thought and model IDs per index generation. The English FTS configuration is selected by a mapping function, not hard-coded throughout repositories. A future migration may add language-specific generated columns or external tokenization for languages without whitespace segmentation. Embedding configuration is workspace/index-version scoped. Multilingual support therefore requires a new tokenizer/FTS strategy and a `reembed` run (8.5), not a schema rewrite.
 
 ## 10. API contract
 
@@ -646,7 +698,7 @@ All first-party endpoints are under `/v1`, return RFC 9457-style problem details
 | `POST` | `/v1/runs/organize` | force organization; optional window, dry-run, provisional |
 | `GET` | `/v1/runs/{id}` | status, models, prompts, usage, errors |
 | `GET` | `/v1/search` | exact/semantic/hybrid normalized search |
-| `POST` | `/v1/ask` | streamed Khoj Ask with explicit filter capability status |
+| `POST` | `/v1/ask` | streamed Ask (self-hosted embedding evidence plus OpenRouter generation, `docs/adr/0010`) with validated citations and explicit degradation status |
 | `GET` | `/v1/entities` | entities, aliases, document links |
 | `POST` | `/v1/entities/{id}/aliases` | owner-approved alias |
 | `POST` | `/v1/admin/khoj-sync` | force current-document export/index sync |
@@ -718,20 +770,20 @@ The settings and README must state these boundaries plainly. Release 1 has no cl
 
 ### 12.3 Retention
 
-Default retention is indefinite for raw thoughts and attachments because recoverability is a core goal. Khoj indexes and derived exports may be deleted and rebuilt. A future deletion feature requires a separate ADR covering backups, tombstones, Discord copies, and legal expectations; it must never be introduced as a routine cleanup.
+Default retention is indefinite for raw thoughts and attachments because recoverability is a core goal. The pgvector-backed semantic index may be deleted and rebuilt via a `reembed` run (8.5). A future deletion feature requires a separate ADR covering backups, tombstones, Discord copies, and legal expectations; it must never be introduced as a routine cleanup.
 
 ### 12.4 Future VPS controls
 
-Use Linux, automatic security updates, a firewall exposing only 80/443, Caddy or equivalent TLS termination, Tailscale or OIDC for private admin access, rootless/non-root containers, read-only filesystems where possible, resource limits, fail2ban/rate limits, monitored backups, and no public PostgreSQL/Khoj ports. VPS deployment is prepared but not executed in Release 1.
+Use Linux, automatic security updates, a firewall exposing only 80/443, Caddy or equivalent TLS termination, Tailscale or OIDC for private admin access, rootless/non-root containers, read-only filesystems where possible, resource limits, fail2ban/rate limits, monitored backups, and no public PostgreSQL/embedding-sidecar ports. VPS deployment is prepared but not executed in Release 1.
 
 ## 13. Local deployment
 
-Development target is Windows with WSL2 and Docker Desktop; production-like execution occurs in Linux containers. Compose services use health checks, restart policies, named volumes, and an internal network. Only the gateway and Khoj UI bind to loopback host ports.
+Development target is Windows with WSL2 and Docker Desktop; production-like execution occurs in Linux containers. Compose services use health checks, restart policies, named volumes, and an internal network. Only the gateway and the minimal operator debug UI (`docs/adr/0009`) bind to loopback host ports.
 
 Suggested Compose profiles:
 
 - `core`: postgres, api, bot, worker;
-- `ai`: Khoj and its database/config;
+- `ai`: the embedding sidecar (`docs/adr/0010`);
 - `observability`: optional local metrics/log tooling;
 - `backup`: one-shot backup and restore-test jobs.
 
@@ -742,8 +794,8 @@ Configuration groups:
 - Discord: token, owner user ID, guild/channel IDs.
 - Workspace: name, timezone, 20:00 cutoff.
 - Database: DSN and pool sizes.
-- OpenRouter: key, base URL, tested model IDs, budgets.
-- Khoj: internal URL, API key, pinned digest, timeouts.
+- OpenRouter: key, base URL, tested model IDs (including `TC_MODEL_ASK`), budgets.
+- Embedding sidecar: internal URL, pinned image digest, timeouts.
 - Attachments: root, limits, allowed/blocked MIME policy.
 - Retrieval: result limits, RRF constant, fuzzy threshold.
 
@@ -758,7 +810,7 @@ Configuration groups:
 | Attachment copy interrupted | no commit/ack; temporary file removed later |
 | OpenRouter unavailable | run fails before derived commit; catch-up/manual retry |
 | Invalid model JSON | one repair attempt, then fail loudly |
-| Khoj unavailable | canonical documents commit; sync retries; exact search remains available |
+| Embedding sidecar unavailable | canonical documents commit; embedding sync retries; exact search remains available |
 | Discord unavailable for digest | outbox retries without rerunning organization |
 | Machine off at 20:00 | catch-up windows on startup |
 | Worker crash mid-run | lease expires; retry inspects run state; no partial derived transaction |
@@ -767,7 +819,7 @@ Configuration groups:
 
 ### 14.2 Observability
 
-Use structured JSON logs with request/run IDs and OpenTelemetry-compatible traces. Metrics include capture latency/errors, outbox age, unprocessed windows, run duration/status, coverage, Khoj sync lag, search latency by channel, degraded queries, OpenRouter tokens/cost, attachment bytes, and backup age. Release 1 may expose Prometheus text metrics locally; alerts can initially be Discord owner messages with deduplication.
+Use structured JSON logs with request/run IDs and OpenTelemetry-compatible traces. Metrics include capture latency/errors, outbox age, unprocessed windows, run duration/status, coverage, embedding sync lag, search latency by channel, degraded queries, OpenRouter tokens/cost, attachment bytes, and backup age. Release 1 may expose Prometheus text metrics locally; alerts can initially be Discord owner messages with deduplication.
 
 Never include raw bodies, generated documents, model prompts, API keys, or signed attachment URLs in logs.
 
@@ -788,14 +840,14 @@ Backups have retention tiers (for example 14 daily, 8 weekly, 12 monthly) only a
 - Unit: timezone/cutoff computation, normalization, idempotency decisions, revision construction, query planning, rank fusion, diff/revert behavior.
 - Property: arbitrary Unicode text, timestamps around DST, repeated delivery, revision chains, and RRF invariants.
 - Integration: PostgreSQL constraints/migrations/FTS, transactional outbox, attachment atomicity, OpenRouter mock server, Discord adapter fixtures.
-- Khoj contract: pinned container, batch index, delete/reindex, date/word/file filters, search schema, Ask streaming, references, authentication, unavailable behavior.
-- End-to-end: Discord fixture -> capture -> forced organization -> revision -> Khoj index -> search -> Ask -> digest outbox.
+- Embedding sidecar contract: pinned image, `embed` request/response schema, failure modes, unavailable behavior (`docs/adr/0010`, replacing the prior Khoj contract suite).
+- End-to-end: Discord fixture -> capture -> forced organization -> revision -> embedding sync -> search -> Ask -> digest outbox.
 - Security: authorization boundaries, secret scan, dependency scan, malicious filenames, oversized uploads, prompt-injection fixtures, log-redaction checks.
 - Recovery: database/blob backup and automated scratch restore.
 
 ### 15.2 Retrieval golden set
 
-Build at least 30 owner-written questions with expected thought/document IDs and filters. Include exact names, misspellings, date-only, time-of-day, entity, semantic paraphrase, negation, superseded revisions, and “no answer” cases. CI runs deterministic exact tests; scheduled/local evaluation runs Khoj semantic recall@5 and MRR because model execution may be slower.
+Build at least 30 owner-written questions with expected thought/document IDs and filters. Include exact names, misspellings, date-only, time-of-day, entity, semantic paraphrase, negation, superseded revisions, and “no answer” cases. CI runs deterministic exact tests; scheduled/local evaluation runs pgvector-backed semantic recall@5 and MRR (`docs/adr/0010`) because model execution may be slower.
 
 ### 15.3 Organization evaluation
 
@@ -818,7 +870,7 @@ GitHub Actions (or equivalent) on every change:
 3. mypy strict for domain/application packages;
 4. pytest unit/property tests;
 5. PostgreSQL integration tests with migrations from empty and previous release;
-6. Khoj API contract smoke test against the pinned digest;
+6. embedding sidecar contract smoke test against the pinned digest;
 7. build non-root OCI images and generate an SBOM;
 8. vulnerability scan with explicit severity policy.
 
@@ -832,20 +884,21 @@ Branches are short-lived. Any implementation that changes an accepted architectu
 apps/api                  FastAPI routes, streaming, dependency wiring
 apps/discord_bot          Discord event/command transport only
 apps/worker               scheduler and outbox consumer entrypoints
+services/embedding_sidecar  first-party Python 3.12 FastAPI service, own pyproject.toml/Dockerfile (docs/adr/0010)
 packages/domain           immutable domain types, policies, ports
 packages/application      capture, organize, search, ask, restore use cases
-packages/infrastructure   postgres, filesystem, Discord, OpenRouter, Khoj adapters
+packages/infrastructure   postgres, filesystem, Discord, OpenRouter, embedding-sidecar adapters
 prompts                   versioned system/user templates and JSON schemas
 migrations                first-party Alembic history
 deploy/compose            base, local, and future VPS overlays
 tests/unit                pure logic
 tests/integration         database/adapters
-tests/contract/khoj       pinned Khoj behavior
+tests/contract/embedding  pinned embedding-sidecar behavior
 tests/eval                golden retrieval and organization fixtures
 docs/adr                  implementation decisions
 ```
 
-No Khoj source is vendored. Generated memories, attachments, local exports, caches, databases, secrets, and rendered design intermediates are ignored by Git.
+No third-party retrieval or chat service source is vendored — the embedding sidecar is entirely first-party code. Generated memories, attachments, local exports, caches, databases, secrets, and rendered design intermediates are ignored by Git.
 
 ## 18. Delivery plan and gates
 
@@ -919,13 +972,25 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 
 Implementation should create these ADR files when the first code for each decision lands; this design remains the summary authority. (ADR numbers 0008-0009 exist under `docs/adr/` for decisions not yet reflected in this index table; this table is not exhaustive of every accepted ADR, only the ones tracked here since Release 1 planning.)
 
-## 21. References verified 2026-08-30
+## 21. References
+
+Verified 2026-08-30, retained for historical context of the retired Khoj-era design (`docs/adr/0003`, superseded by `docs/adr/0010` for semantic search/Ask):
 
 - Khoj query filters (word, date, and file): https://docs.khoj.dev/miscellaneous/query-filters/
 - Khoj semantic search and configurable local/OpenAI-compatible models: https://docs.khoj.dev/features/search/
 - Khoj Ask/RAG behavior and references: https://docs.khoj.dev/features/chat/
 - Khoj self-hosting: https://docs.khoj.dev/get-started/setup/
 - Khoj source/package compatibility and AGPL license: https://github.com/khoj-ai/khoj
+
+Verified 2026-09-08, current architecture (`docs/adr/0010`):
+
+- pgvector extension and HNSW indexing: https://github.com/pgvector/pgvector
+- sentence-transformers: https://www.sbert.net/
+- `thenlper/gte-small` model card: https://huggingface.co/thenlper/gte-small
+- PyTorch Python 3.14 wheel tracking issue: https://github.com/pytorch/pytorch/issues/156856
+
+Verified 2026-08-30, still current:
+
 - Discord Gateway and privileged message-content intent: https://docs.discord.com/developers/events/gateway
 - Discord message/attachment behavior: https://docs.discord.com/developers/resources/message
 - OpenRouter OpenAI-compatible quickstart: https://openrouter.ai/docs/quickstart
@@ -946,7 +1011,7 @@ Implementation should create these ADR files when the first code for each decisi
 - [ ] Restore creates a new revision and preserves the full chain.
 - [ ] Exact search covers every documented filter.
 - [ ] Hybrid search exposes channel scores and degraded state.
-- [ ] Khoj index contains current revisions only.
+- [ ] Semantic (pgvector) index contains current revisions only.
 - [ ] Ask references resolve to current documents and raw sources.
 - [ ] Strict filters are either honored or rejected explicitly.
 - [ ] OpenRouter failure, timeout, invalid JSON, and budget limit are tested.
@@ -956,4 +1021,4 @@ Implementation should create these ADR files when the first code for each decisi
 
 ## Appendix B - Definition of a safe change
 
-A change is safe when raw data remains readable, existing revisions remain reachable, migrations work from every supported release, current Markdown can be rebuilt deterministically, Khoj can be reindexed from that export, API compatibility is preserved or versioned, and the relevant failure/recovery test passes. If any condition is unknown, the change is not ready to merge.
+A change is safe when raw data remains readable, existing revisions remain reachable, migrations work from every supported release, current Markdown can be rebuilt deterministically, the semantic index can be rebuilt from canonical revisions via a `reembed` run, API compatibility is preserved or versioned, and the relevant failure/recovery test passes. If any condition is unknown, the change is not ready to merge.

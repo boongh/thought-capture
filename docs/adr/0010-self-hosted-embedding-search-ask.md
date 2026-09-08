@@ -166,14 +166,40 @@ single-workspace model).
 
 ### 3. One vector per document revision, not per chunk
 
-Each `document_revisions` row (or its current-revision projection —
-implementation detail for Slice 1) gets exactly one embedding vector,
-computed from the same content Khoj indexed under `docs/DESIGN.md` 8.3
-(the exported Markdown body). Superseded revisions are not re-embedded or
-kept queryable through semantic search, matching `docs/DESIGN.md` 8.3's
-existing "only the current revision is present in the live index" rule —
-this ADR keeps that invariant, just enforced against a Postgres table
-instead of a Khoj upload.
+Each *document* — not each revision — gets exactly one stored embedding
+row, always holding whichever revision was most recently embedded
+successfully. Concretely, `document_embeddings` is keyed by `document_id`
+(primary key), carries `revision_id` as a plain `NOT NULL` foreign key to
+`document_revisions`, and carries no independent `workspace_id` column at
+all: every read joins `document_embeddings -> documents` for `workspace_id`
+rather than trusting a second, separately-writable copy of it that could
+drift out of sync with the row's actual owner. This is stricter than a
+same-value foreign key would be — two independently-set foreign keys can
+each individually reference something valid while still disagreeing with
+each other about which document/workspace they jointly describe, which is
+exactly the failure mode an early draft of this ADR left open (see
+`docs/DESIGN.md` 8.4 for the exact schema and full rationale).
+
+Currentness — "only the current revision is searchable" — is not a static
+constraint a foreign key can express, because embedding sync is
+asynchronous by design (`docs/DESIGN.md` 7.2 step 11's decoupled outbox,
+unchanged from ADR-0003's shape) and therefore cannot be forced into the
+same transaction as the revision write that supersedes a prior one. It is
+enforced two ways instead: the sync writer's upsert only replaces a row
+when the incoming revision's `revision_number` is strictly newer than
+whatever is already stored (rejecting out-of-order, at-least-once outbox
+redelivery of a superseded revision), and every semantic-search query
+additionally filters on `document_embeddings.revision_id =
+documents.current_revision_id`, so a document whose sync has not yet
+caught up is simply absent from results rather than ever surfacing with
+stale content attached to a current-looking hit. See `docs/DESIGN.md` 8.4
+for the full mechanism.
+
+Superseded revisions are not re-embedded or kept queryable through
+semantic search, matching the design's former Khoj-era "only the current
+revision is present in the live index" rule (`docs/DESIGN.md` 8.3 through
+design version 1.8) — this ADR keeps that invariant, just enforced by the
+write/read guarantees above instead of a Khoj upload/reindex cycle.
 
 Record `embedding_model_id` on every stored row. The `runs` table already
 has this column (`docs/DESIGN.md` 6.3, `packages/infrastructure/src/
@@ -290,6 +316,56 @@ provider-retention gate) does not reappear here because the new design
 reuses infrastructure already hardened for `organize`/`select`, rather than
 wrapping a second, differently-shaped external chat API.
 
+### 8. Ask's evidence packet and citation-validation contract
+
+Replacing Khoj's `/notes` chat mode with a raw `OpenRouterProvider`
+completion removes Khoj's own reference-producing behavior along with it
+— Khoj returned a structured `references.context` list the adapter only
+had to parse (`docs/DESIGN.md`'s prior 7.6, ADR-0003's Ask-proxy
+amendment). A plain chat-completion model returns free text; grounding and
+citation validity have to be engineered back in explicitly rather than
+inherited from the provider, or `docs/DESIGN.md` 1's "every generated
+claim is traceable" requirement silently stops being enforced the moment
+Khoj is removed.
+
+**Evidence packet.** Before any model call, `EmbeddingSearchPort.search`'s
+top-N hits are assembled into a numbered list (`AskEvidenceItem`: `index`,
+`document_id`, `revision_id`, `title`, a bounded `snippet` of
+`body_markdown` — not the full body). `index` is 1-based and stable only
+for the duration of one request.
+
+**Empty evidence never reaches the model.** Zero hits short-circuits to a
+fixed, non-generated response before `TC_MODEL_ASK` is called at all —
+the same structural "never invent a result" guarantee `docs/DESIGN.md`
+7.6 states, but enforced by code rather than by trusting a canned
+model-side reply the way Khoj's own no-notes-indexed behavior did.
+
+**Citation contract.** The prompt requires every evidentiary claim to
+carry an inline bracketed marker matching the cited item's `index` (e.g.
+`[2]`), following the existing "quoted data, not instructions" framing
+already used for organize prompts (`docs/DESIGN.md` 12.2). The provider
+streams prose exactly as it already does for `organize`/`select`. After
+the stream completes, a validation pass resolves every `\[(\d+)\]` marker
+against the evidence packet's `index` values: a marker resolving to a real
+item becomes a validated `AskReference`; a marker that resolves to nothing
+(a fabricated or out-of-range citation) is dropped from `references` and
+left as inert text, never surfaced as a working citation, and never fails
+the request outright. An answer with markers but zero valid resolutions
+still returns its prose with `references: []` and `citations_unverified:
+true`, so a caller can choose to flag it rather than present unvalidated
+prose as if it were cited.
+
+**Traceability closes through existing data, not a new mechanism.** A
+validated `AskReference` names a `document_id`/`revision_id`; that
+revision's `revision_sources` rows (`docs/DESIGN.md` 6.3, unchanged by
+this ADR) already link it to the raw `thought_id`s that produced it —
+resolving an Ask citation down to source thoughts reuses that table
+directly.
+
+See `docs/DESIGN.md` 7.6 for the full sequence, including the streamed
+response shape and the mid-stream degrade case (evidence found, generation
+failed).
+
 ## Architecture overview
 
 ```
@@ -351,10 +427,12 @@ an open-ended "maybe later."
 
 This ADR authorizes the design change; it does not itself add code. Slice
 1 onward must each state, per this repository's implementation-behavior
-requirements: which pieces of §2-§7 they implement, what tests exercise
+requirements: which pieces of §2-§8 they implement, what tests exercise
 them (`tests/unit`, `tests/integration` against a real pgvector-enabled
 Postgres, a sidecar contract-test suite analogous to `tests/contract/khoj`
-but against first-party code), and confirmation via `scripts/check.ps1`/
+but against first-party code, and — for §8 specifically — a citation-
+validation test asserting a fabricated/out-of-range marker never becomes a
+returned `AskReference`), and confirmation via `scripts/check.ps1`/
 `scripts/check.sh`. Full Khoj removal (container, adapter code, compose
 files, credentials) is verified once the pgvector/sidecar/OpenRouter-Ask
 path passes `docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at
