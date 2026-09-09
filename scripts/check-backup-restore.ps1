@@ -71,10 +71,51 @@ try {
         --profile core up --build migrate
     if ($LASTEXITCODE -ne 0) { throw "migrate failed (exit $LASTEXITCODE)" }
 
+    # Seeds one synthetic file (CLAUDE.md: "use synthetic memory content in
+    # fixtures") into the attachments volume before running backup, so this
+    # check exercises the real attachment-copy/hash-manifest code path -
+    # without this, every run before it was seeded had zero attachments,
+    # and backup.sh's "no attachments were present" branch (an empty
+    # manifest, nothing copied) was the ONLY path this check ever proved
+    # worked. A review of this PR correctly found that gap: an empty
+    # backup passing proves nothing about whether a real one, with real
+    # attachments, actually works.
+    $AttachmentContent = "synthetic attachment for check-backup-restore.ps1 - $(Get-Date -AsUTC -Format 'yyyyMMddTHHmmssZ')"
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $AttachmentSha256 = [System.BitConverter]::ToString(
+        $Sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($AttachmentContent))
+    ).Replace("-", "").ToLowerInvariant()
+    docker run --rm -v "${BackupProject}_attachments:/data" alpine:3.20 `
+        sh -c 'mkdir -p /data/ab && printf "%s" "$0" > /data/ab/synthetic.txt' "$AttachmentContent"
+    if ($LASTEXITCODE -ne 0) { throw "failed to seed the synthetic attachment (exit $LASTEXITCODE)" }
+
     Write-Host "--- running backup" -ForegroundColor Cyan
     docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
         --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
     if ($LASTEXITCODE -ne 0) { throw "backup failed (exit $LASTEXITCODE)" }
+
+    Write-Host "--- asserting the seeded attachment was actually copied and hashed" -ForegroundColor Cyan
+    $BackupRoot = if ($env:TC_BACKUP_ROOT) { $env:TC_BACKUP_ROOT } else { "deploy/compose/backups" }
+    $CopiedAttachment = Join-Path $BackupRoot "attachments/ab/synthetic.txt"
+    if (-not (Test-Path -LiteralPath $CopiedAttachment)) {
+        throw "backup did not copy the seeded attachment to $CopiedAttachment"
+    }
+    $CopiedContent = Get-Content -Raw -LiteralPath $CopiedAttachment
+    if ($CopiedContent -ne $AttachmentContent) {
+        throw "copied attachment content does not match what was seeded"
+    }
+    $LatestManifestName = (Get-Content -Raw -LiteralPath (Join-Path $BackupRoot "latest.txt")).Trim()
+    $LatestManifest = Get-Content -Raw -LiteralPath (Join-Path $BackupRoot $LatestManifestName)
+    if ($LatestManifest -notmatch '"attachments_manifest_file":\s*"([^"]+)"') {
+        throw "could not find attachments_manifest_file in $LatestManifestName"
+    }
+    $AttachmentsManifestFile = Join-Path $BackupRoot $Matches[1]
+    $ManifestLines = Get-Content -LiteralPath $AttachmentsManifestFile
+    if (-not ($ManifestLines -match "^$AttachmentSha256  \./ab/synthetic\.txt$")) {
+        Write-Host ($ManifestLines -join "`n")
+        throw "attachment manifest $AttachmentsManifestFile does not record the seeded file's sha256 ($AttachmentSha256)"
+    }
+    Write-Host "OK: seeded attachment present and hash-valid after backup"
 
     Write-Host "--- starting postgres-scratch (project: $RestoreProject)" -ForegroundColor Cyan
     docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `

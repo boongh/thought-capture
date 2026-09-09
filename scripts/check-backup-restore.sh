@@ -65,9 +65,44 @@ printf -- '--- running migrations (schema + workspace seed)\n'
 docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
   --profile core up --build migrate
 
+# Seeds one synthetic file (CLAUDE.md: "use synthetic memory content in
+# fixtures") into the attachments volume before running backup, so this
+# check exercises the real attachment-copy/hash-manifest code path -
+# without this, every run before it was seeded had zero attachments, and
+# backup.sh's "no attachments were present" branch (an empty manifest,
+# nothing copied) was the ONLY path this check ever proved worked. A review
+# of this PR correctly found that gap: an empty backup passing proves
+# nothing about whether a real one, with real attachments, actually works.
+attachment_content="synthetic attachment for check-backup-restore.sh - $(date -u +%Y%m%dT%H%M%SZ)"
+attachment_sha256="$(printf '%s' "$attachment_content" | sha256sum | cut -d' ' -f1)"
+docker run --rm -v "${backup_project}_attachments:/data" alpine:3.20 \
+  sh -c "mkdir -p /data/ab && printf '%s' \"\$0\" > /data/ab/synthetic.txt" "$attachment_content"
+
 printf -- '--- running backup\n'
 docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
   --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
+
+printf -- '--- asserting the seeded attachment was actually copied and hashed\n'
+backup_root="${TC_BACKUP_ROOT:-deploy/compose/backups}"
+copied_attachment="$backup_root/attachments/ab/synthetic.txt"
+if [[ ! -f "$copied_attachment" ]]; then
+  printf 'FAIL: backup did not copy the seeded attachment to %s\n' "$copied_attachment" >&2
+  exit 1
+fi
+copied_content="$(cat "$copied_attachment")"
+if [[ "$copied_content" != "$attachment_content" ]]; then
+  printf 'FAIL: copied attachment content does not match what was seeded\n' >&2
+  exit 1
+fi
+latest_manifest="$backup_root/$(cat "$backup_root/latest.txt")"
+attachments_manifest_file="$backup_root/$(grep -oE '"attachments_manifest_file": *"[^"]*"' "$latest_manifest" | sed -E 's/.*"([^"]+)"$/\1/')"
+if ! grep -q "^${attachment_sha256}  \./ab/synthetic\.txt$" "$attachments_manifest_file"; then
+  printf 'FAIL: attachment manifest %s does not record the seeded file'"'"'s sha256 (%s)\n' \
+    "$attachments_manifest_file" "$attachment_sha256" >&2
+  cat "$attachments_manifest_file" >&2
+  exit 1
+fi
+printf 'OK: seeded attachment present and hash-valid after backup\n'
 
 printf -- '--- starting postgres-scratch (project: %s)\n' "$restore_project"
 docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \

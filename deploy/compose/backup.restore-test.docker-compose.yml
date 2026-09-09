@@ -21,7 +21,21 @@ name: thought-capture-restore-test
 
 services:
   postgres-scratch:
-    image: postgres:18.6-trixie
+    # The SAME image deploy/compose/docker-compose.yml's own `postgres`
+    # service builds - not stock `postgres:18.6-trixie`. A real backup of
+    # the merged system (docs/adr/0010 §2) contains `CREATE EXTENSION
+    # vector` from migration 0008; restoring that into a Postgres without
+    # pgvector installed would fail pg_restore outright, which is exactly
+    # the gap a review of this PR found: this service used to be stock
+    # Postgres, so restore-test could only ever have validated a database
+    # shaped like the pre-pgvector schema, never the one this project
+    # actually runs. Reusing the same `image:` tag (not a separate
+    # Dockerfile copy) means these two services can never drift apart on
+    # which pgvector version is installed.
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: thought-capture-postgres:local
     restart: "no"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
