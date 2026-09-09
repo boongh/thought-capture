@@ -220,17 +220,28 @@ run_restore_test
 # ---------------------------------------------------------------------------
 printf -- '--- round 2: concurrent writer during backup (race regression)\n'
 writer_stop_file="$(mktemp -u)"
+# Records one line per successfully COMMITted insert (review finding: the
+# prior version fired-and-forgot with `|| true`, so a writer that failed on
+# every attempt - e.g. a schema/constraint mismatch - would silently pass
+# this round without ever having exercised the race at all). 'api' is a
+# real allowed `thoughts.source` value (migrations/versions/
+# 0001_canonical_capture_layer.py's CHECK); the previous 'race-test' value
+# violated that CHECK, so this loop was silently failing every iteration.
+writer_success_log="$(mktemp -u)"
+: >"$writer_success_log"
 (
   i=0
   while [[ ! -f "$writer_stop_file" ]]; do
     i=$((i + 1))
-    docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+    if docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
       exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres \
       psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c \
       "INSERT INTO thoughts (workspace_id, author_user_id, source, source_message_id, body, client_created_at, client_timezone, client_local_date, client_local_time, received_at, content_language)
-       SELECT w.id, u.id, 'race-test', 'race-test-$i-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en'
+       SELECT w.id, u.id, 'api', 'race-test-$i-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en'
        FROM workspaces w JOIN users u ON true LIMIT 1" \
-      >/dev/null 2>&1 || true
+      >/dev/null 2>&1; then
+      printf '%s\n' "$i" >>"$writer_success_log"
+    fi
     sleep 0.1
   done
 ) &
@@ -242,6 +253,18 @@ docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
 : >"$writer_stop_file"
 wait "$writer_pid" 2>/dev/null || true
 rm -f "$writer_stop_file"
+
+# Asserts the race was actually exercised, not merely that the backup
+# succeeded - a writer that never committed anything (e.g. every insert
+# rejected) would make this round pass trivially without ever having
+# started a live snapshot against a moving target.
+writer_commit_count="$(wc -l <"$writer_success_log" | tr -d ' ')"
+rm -f "$writer_success_log"
+if [[ "$writer_commit_count" -lt 1 ]]; then
+  echo "FAIL: the concurrent writer never committed a row during the backup - race regression not actually exercised" >&2
+  exit 1
+fi
+printf -- '--- round 2: concurrent writer committed %s row(s) during the backup\n' "$writer_commit_count"
 
 printf -- '--- round 2: restore-test against the concurrently-written backup (expect success)\n'
 run_restore_test

@@ -44,10 +44,36 @@ attachments_source="/data/attachments"
 # `gosu`, not `su`/`sudo`: the same tool the official image's own
 # entrypoint already uses for this exact purpose, already present in this
 # image - re-execs this same script as `postgres` and never returns.
+# `gosu postgres /bin/bash "$0"`, not `gosu postgres "$0"` (review finding):
+# this script is bind-mounted read-only (deploy/compose/docker-compose.yml),
+# and a Windows host (Docker Desktop/WSL2, see the chmod comment near the
+# bottom of this file) does not reliably preserve the executable bit across
+# that mount even when it is set in the repo - `gosu postgres "$0"` asks the
+# kernel to exec the file directly and fails with "Permission denied" the
+# moment that bit is missing. Naming `/bin/bash` explicitly runs this
+# script's own text through the interpreter instead of relying on the
+# filesystem's executable bit or its shebang line.
 if [[ "$(id -u)" -eq 0 ]]; then
   mkdir -p "$backup_root"
   chown postgres:postgres "$backup_root"
-  exec gosu postgres "$0" "$@"
+
+  # Copy attachments while still root (review finding): the application
+  # container writes attachments as uid 10001 via `tempfile.mkstemp`
+  # (packages/infrastructure/src/tc_infrastructure/storage/blob_store.py),
+  # which creates files mode 0600 owned by that uid - unreadable to the
+  # `postgres` user (uid 999) this script drops to below. Root can read any
+  # file regardless of owner, so this narrowly-scoped step runs once here,
+  # before the privilege drop, and only ever hands the postgres user the
+  # resulting copies (chowned immediately after), never broader access to
+  # the source attachments tree itself.
+  attachments_dir="$backup_root/attachments"
+  mkdir -p "$attachments_dir"
+  if [[ -d "$attachments_source" ]] && [[ -n "$(ls -A "$attachments_source" 2>/dev/null)" ]]; then
+    cp -au "$attachments_source"/. "$attachments_dir"/
+  fi
+  chown -R postgres:postgres "$attachments_dir"
+
+  exec gosu postgres /bin/bash "$0" "$@"
 fi
 
 mkdir -p "$backup_root"
@@ -269,14 +295,12 @@ if [[ "$psql_session_failed" -ne 0 ]]; then
   exit 1
 fi
 
-echo "--- attachments: incremental copy + sha256 manifest"
-# `cp -au`: only copies a file when it is missing from the destination or
-# newer than the destination's copy - an incremental copy without depending
-# on rsync, which the postgres:18.6-trixie image does not ship.
-mkdir -p "$attachments_dir"
-if [[ -d "$attachments_source" ]] && [[ -n "$(ls -A "$attachments_source" 2>/dev/null)" ]]; then
-  cp -au "$attachments_source"/. "$attachments_dir"/
-fi
+echo "--- attachments: sha256 manifest"
+# The incremental copy itself already happened above, while still root
+# (review finding: attachments are owned by uid 10001, the application
+# container's user, and are unreadable to the `postgres` user this section
+# now runs as - only root could read them). Only the manifest is written
+# here, over whatever `$attachments_dir` holds as of that root-owned copy.
 manifest_file="$attachments_dir/../attachments-$timestamp.sha256"
 if [[ -n "$(find "$attachments_dir" -type f -print -quit 2>/dev/null)" ]]; then
   (cd "$attachments_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$manifest_file"

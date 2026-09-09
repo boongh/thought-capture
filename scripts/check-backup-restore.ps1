@@ -241,15 +241,24 @@ try {
     # not for anything to do with the race itself.
     # -------------------------------------------------------------------
     Write-Host "--- round 2: concurrent writer during backup (race regression)" -ForegroundColor Cyan
+    # The job writes one integer to its output stream per successfully
+    # COMMITted insert (review finding: the prior version never checked the
+    # psql exit code, so a writer failing on every attempt - e.g. a
+    # schema/constraint mismatch - would silently pass this round without
+    # ever having exercised the race). 'api' is a real allowed
+    # `thoughts.source` value (migrations/versions/
+    # 0001_canonical_capture_layer.py's CHECK); the previous 'race-test'
+    # value violated that CHECK, so every insert was failing.
     $WriterJob = Start-Job -ScriptBlock {
         param($EnvFile, $BackupProject, $ComposeFile)
         $i = 0
         while ($true) {
             $i++
-            $sql = "INSERT INTO thoughts (workspace_id, author_user_id, source, source_message_id, body, client_created_at, client_timezone, client_local_date, client_local_time, received_at, content_language) SELECT w.id, u.id, 'race-test', 'race-test-' || $i || '-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en' FROM workspaces w JOIN users u ON true LIMIT 1"
+            $sql = "INSERT INTO thoughts (workspace_id, author_user_id, source, source_message_id, body, client_created_at, client_timezone, client_local_date, client_local_time, received_at, content_language) SELECT w.id, u.id, 'api', 'race-test-' || $i || '-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en' FROM workspaces w JOIN users u ON true LIMIT 1"
             docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
                 exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres `
                 psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c $sql *> $null
+            if ($LASTEXITCODE -eq 0) { Write-Output $i }
             Start-Sleep -Milliseconds 100
         }
     } -ArgumentList $EnvFile, $BackupProject, $ComposeFile
@@ -261,8 +270,16 @@ try {
     }
     finally {
         Stop-Job -Job $WriterJob -ErrorAction SilentlyContinue
-        Remove-Job -Job $WriterJob -Force -ErrorAction SilentlyContinue
     }
+
+    # Asserts the race was actually exercised, not merely that the backup
+    # succeeded - a writer that never committed anything would make this
+    # round pass trivially without ever having started a live snapshot
+    # against a moving target.
+    $WriterCommitCount = (Receive-Job -Job $WriterJob -ErrorAction SilentlyContinue | Measure-Object).Count
+    Remove-Job -Job $WriterJob -Force -ErrorAction SilentlyContinue
+    if ($WriterCommitCount -lt 1) { throw "the concurrent writer never committed a row during the backup - race regression not actually exercised" }
+    Write-Host "--- round 2: concurrent writer committed $WriterCommitCount row(s) during the backup"
 
     Write-Host "--- round 2: restore-test against the concurrently-written backup (expect success)" -ForegroundColor Cyan
     $ExitCode = Invoke-RestoreTest
