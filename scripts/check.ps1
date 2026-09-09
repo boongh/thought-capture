@@ -303,6 +303,19 @@ try {
     # (Docker being up does not imply this profile was ever started) and an
     # unreachable Khoj is a skip, not a hard failure, until Phase 2 makes it
     # required.
+    #
+    # `--ignore=tests/contract/embedding_sidecar`, not a `tests/contract/khoj`
+    # path filter: some Khoj contract tests deliberately live under
+    # `tests/integration` instead (test_khoj_index_sync_contract.py,
+    # test_khoj_semantic_search_contract.py - see either file's own
+    # docstring), because they need the disposable-database fixtures only
+    # `tests/integration/conftest.py` provides, while still carrying
+    # `pytest.mark.contract` so a skip here is required, not silent. A bare
+    # `tests/contract/khoj` path scope was found to never collect them at
+    # all (Codex review of PR #31) - this selects everything marked
+    # `contract` except the embedding sidecar's own suite (which gets its
+    # own gate below), matching what the original unscoped
+    # `pytest -m contract` collected before this stage was split in two.
     # -----------------------------------------------------------------------
     Write-Host ""
     Write-Host "--- contract tests (khoj)" -ForegroundColor Cyan
@@ -319,7 +332,7 @@ try {
     if ($KhojUp) {
         $env:TC_REQUIRE_CONTRACT = "1"
         try {
-            & $Uv run pytest -m contract tests/contract/khoj
+            & $Uv run pytest -m contract --ignore=tests/contract/embedding_sidecar
             if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (khoj) (exit $LASTEXITCODE)" }
         }
         finally {
