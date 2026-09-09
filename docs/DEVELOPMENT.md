@@ -43,7 +43,7 @@ packages/
   infrastructure/      PostgreSQL, OpenRouter, and object-store adapters
 migrations/            Alembic migrations
 tests/                 unit, integration, and contract tests
-docs/                  design, operations, and architecture decisions
+docs/                  design, operations, architecture decisions, and incidents
 deploy/compose/        local Compose stack and optional service overlays
 ```
 
@@ -54,3 +54,5 @@ Claude is the primary abstract architect and planner; Codex independently evalua
 Changes must preserve the accepted design. A change to an architecture decision requires an ADR and a corresponding update to `docs/DESIGN.md`.
 
 Never commit secrets, exported memories, attachments, backups, or other personal-memory content. Use synthetic data in tests and keep message bodies, tokens, and signed attachment URLs out of normal diagnostic output.
+
+`docs/incidents/` records operational mistakes the same way `docs/adr/` records design decisions — what happened, why, and what mechanically prevents it recurring. In particular, never run `docker compose down -v` (or `docker volume rm`) with an implicit or default project name; use `scripts/compose-teardown.sh`/`.ps1` for throwaway or manual-verification teardown instead (see `docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md`).

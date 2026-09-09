@@ -111,3 +111,11 @@ Change report:
 ```
 
 The technical report must name important new or changed functions and endpoints, state what each does, and explain at a useful architectural level how it works. It must also mention migrations, configuration changes, external-service behavior, and breaking changes when applicable. Write `None` for categories that genuinely do not apply; do not omit them. Never include secrets, tokens, personal-memory content, or sensitive diagnostic data in a commit message.
+
+## Docker and local infrastructure
+
+`docs/incidents/` records operational mistakes — human or agent — the same way `docs/adr/` records design decisions: what happened, why it happened, and what mechanically prevents it from happening again. Read it when working with local infrastructure; add to it when something like this happens again, rather than only fixing the immediate case.
+
+- Never run `docker compose down -v` (or `docker volume rm`) with an implicit or default project name. Use `scripts/compose-teardown.sh` / `scripts/compose-teardown.ps1` for any throwaway or manual-verification teardown — it refuses to run without an explicit `-p <project-name>`, and refuses outright, with no override, to remove volumes under this repo's real project name (`thought-capture`). See `docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md` for why: an unscoped teardown during manual verification deleted the real local development stack's Postgres and attachments volumes.
+- Give every manual or throwaway Docker container, Compose project, and host port a name/value distinct from the real local dev stack's — never reuse its container names, project name, or published ports for exploratory testing.
+- Before any command that removes containers or volumes, run a read-only inspection (`docker ps -a`, `docker compose -p <name> ps`, `docker volume ls`) in the same turn as the destructive command — not relying on an inspection run earlier in a long session.
