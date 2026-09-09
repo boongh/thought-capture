@@ -15,7 +15,14 @@
 #   ai            Khoj and its own database (docs/adr/0003) - a SEPARATE file,
 #                 deploy/compose/khoj.docker-compose.yml, passed with a second
 #                 `-f`; see that file's own header for why it is not here.
-#   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
+#   backup        one-shot local pg_dump + attachment manifest/copy
+#                 (deploy/compose/backup/backup.sh). Restore validation runs
+#                 from a SEPARATE file, deploy/compose/
+#                 backup.restore-test.docker-compose.yml, against its own
+#                 throwaway Postgres under a different project name - see
+#                 that file's header for why. Scheduling, off-site
+#                 replication, retention tiers, and encryption key custody
+#                 (docs/DESIGN.md 14.3/19) remain Phase 3, not built here.
 #
 # Networks (docs/DESIGN.md 13: "an internal network"; review finding - this
 # file previously declared no `networks:` at all, so every service landed on
@@ -315,6 +322,31 @@ networks:
   # networks comment.
   embedding:
     internal: true
+
+  # One-shot: dumps postgres and copies attachments to a HOST directory
+  # (TC_BACKUP_ROOT), never a Docker named volume - deliberately, so a
+  # volume-scoped teardown can never take the backup down with it
+  # (docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md).
+  # Run via scripts/backup.sh/.ps1, not `docker compose up` directly - the
+  # wrapper resolves TC_BACKUP_ROOT the same way every time.
+  backup:
+    image: postgres:18.6-trixie
+    profiles: ["backup"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tc_migrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
+    volumes:
+      - ${TC_BACKUP_ROOT:-./backups}:/backups
+      - attachments:/data/attachments:ro
+      - ./backup/backup.sh:/backup.sh:ro
+    entrypoint: ["/bin/bash", "/backup.sh"]
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   postgres-data:

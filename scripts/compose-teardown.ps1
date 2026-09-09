@@ -41,7 +41,15 @@ downgraded back to false by a later token.
 scripts/compose-teardown.ps1 -p tc-scratch-1234 down -v
 #>
 
-$ErrorActionPreference = "Stop"
+# Deliberately NOT $ErrorActionPreference = "Stop": with it set, Windows
+# PowerShell 5.1 turns ANY line a native command writes to stderr into a
+# terminating NativeCommandError - even on exit code 0, and even for
+# `docker compose`'s own routine warnings (e.g. "TC_DISCORD_BOT_TOKEN is not
+# set, defaulting to blank"). Confirmed directly: with "Stop" set, a real
+# `docker compose down` that succeeded and only warned still crashed this
+# script instead of tearing anything down - the opposite of what a teardown
+# guard must do. Real failure is still caught below via `exit $LASTEXITCODE`,
+# which reflects docker's own actual exit code regardless of this setting.
 
 # Must match deploy/compose/docker-compose.yml's own `name:` field.
 $RealProjectName = "thought-capture"

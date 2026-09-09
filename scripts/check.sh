@@ -138,6 +138,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Backup and restore validation (docs/incidents/0001-docker-compose-down-
+# deleted-the-real-dev-stack.md): proves scripts/backup.sh's dump can
+# actually be restored, not merely that pg_dump exits 0. Runs against its
+# own throwaway, uniquely-named/-ported project - see
+# scripts/check-backup-restore.sh's own header for why it does not reuse
+# scripts/backup.sh/restore-test.sh directly.
+# ---------------------------------------------------------------------------
+printf '\n--- backup and restore validation\n'
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if ! scripts/check-backup-restore.sh; then
+    printf 'FAIL: backup and restore validation\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "OK: backup and restore validation"
+else
+  skipped+=("backup and restore validation (Docker engine unavailable)")
+  printf '%s\n' "SKIPPED: Docker engine unavailable"
+fi
+
+# ---------------------------------------------------------------------------
 # Compose config sanity: the 'ai' profile's required TC_KHOJ_* variables must
 # never block a core-only deployment (review remediation, PR #17 - Compose
 # interpolates every service in every `-f` file before applying `--profile`

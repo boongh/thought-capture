@@ -169,6 +169,25 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # Backup and restore validation (docs/incidents/0001-docker-compose-down-
+    # deleted-the-real-dev-stack.md): proves scripts/backup.ps1's dump can
+    # actually be restored, not merely that pg_dump exits 0. Runs against its
+    # own throwaway, uniquely-named/-ported project - see
+    # scripts/check-backup-restore.ps1's own header for why it does not
+    # reuse scripts/backup.ps1/restore-test.ps1 directly.
+    # -----------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- backup and restore validation" -ForegroundColor Cyan
+    if ($DockerUp) {
+        Invoke-Step "backup and restore validation" { & "$PSScriptRoot/check-backup-restore.ps1" }
+        Write-Host "OK: backup and restore validation"
+    }
+    else {
+        $Script:Skipped += "backup and restore validation (Docker engine unavailable)"
+        Write-Host "SKIPPED: Docker engine unavailable" -ForegroundColor Yellow
+    }
+
+    # -----------------------------------------------------------------------
     # Compose config sanity: the 'ai' profile's required TC_KHOJ_* variables
     # must never block a core-only deployment (review remediation, PR #17 -
     # Compose interpolates every service in every `-f` file before applying

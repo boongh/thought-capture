@@ -272,6 +272,18 @@ something this project's code can check in advance - the API only learns
 that when a chat call actually fails, at which point `TC_ASK_ENABLED=true`
 still reports `enabled: true, degraded: true`, not `enabled: false`.
 
-Backup and restore jobs and the future unified custom UI are not runnable
-yet. The `backup` Compose profile described in the design is likewise not
-defined yet.
+Local backup and restore validation ARE runnable (docs/incidents/0001-docker-
+compose-down-deleted-the-real-dev-stack.md's residual-risk finding): `scripts/
+backup.sh`/`.ps1` runs the `backup` Compose profile - `pg_dump` in custom
+format, written atomically to a HOST directory (`TC_BACKUP_ROOT`, never a
+Docker volume), plus an attachment manifest/incremental copy.
+`scripts/restore-test.sh`/`.ps1` then proves that backup actually restores,
+against a throwaway, isolated Postgres under its own Compose project - never
+`thought-capture` - checking schema/every foreign key (a single-transaction
+`pg_restore`), every table's row count, and every attachment's blob hash.
+
+What is still NOT built, and remains docs/DESIGN.md 17's separately-gated
+Phase 3 (Operational hardening): scheduling (nightly/quarterly cron), weekly
+off-site replication, retention tiers, and encryption key custody - each has
+its own still-open owner decision (docs/DESIGN.md 19: off-site provider and
+retention tiers). The future unified custom UI is also not runnable yet.

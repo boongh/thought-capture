@@ -44,39 +44,17 @@ This is the same category of failure `docs/adr/0001` already named for a differe
 
 Neither of these is a control that can be relied on next time. They were luck (low-value data, small blast radius, an unrelated command surfaced the problem quickly) rather than anything that would have caught this before it happened.
 
-## Prevention — proposed, pending the owner's review
+## Prevention
 
-Two independent layers, matching `docs/adr/0001`'s own "convention is not enough, enforce it mechanically" shape:
+Three independent layers, matching `docs/adr/0001`'s own "convention is not enough, enforce it mechanically" shape - the first two stop the mistake from happening; the third means it survives one anyway:
 
-1. **A guarded wrapper for compose teardown** (`scripts/compose-teardown.sh` / `scripts/compose-teardown.ps1`, added alongside this record): refuses to run at all without an explicit `-p <project-name>`, and refuses outright — no override flag, no bypass — to run a volume-destroying teardown (`-v`/`--volumes`) against this repo's real project name (`thought-capture`, matching `docker-compose.yml`'s own `name:` field). This is the mechanical guarantee: even under time pressure, mid-session, many tool calls into an unrelated task, the exact command that caused this incident is refused by the tool itself rather than depending on the operator (human or agent) remembering to add `-p`.
-2. **An explicit, named policy in `CLAUDE.md`** (added alongside this record) requiring any throwaway/manual Docker Compose verification to use `scripts/compose-teardown.sh`/`.ps1` (or an explicit, unique `-p`) rather than bare `docker compose down`, and requiring a read-only inspection (`docker ps -a` / `docker compose -p <name> ps`) immediately before any command that removes containers or volumes, in the same turn as the destructive command — not relying on an inspection run earlier in a long session.
+1. **A guarded wrapper for compose teardown** (`scripts/compose-teardown.sh` / `scripts/compose-teardown.ps1`): refuses to run at all without an explicit `-p <project-name>`, and refuses outright — no override flag, no bypass — to run a volume-destroying teardown (`-v`/`--volumes`, in every form Docker's own flag parser accepts, not only the bare one) against this repo's real project name (`thought-capture`, matching `docker-compose.yml`'s own `name:` field). This is the mechanical guarantee: even under time pressure, mid-session, many tool calls into an unrelated task, the exact command that caused this incident is refused by the tool itself rather than depending on the operator (human or agent) remembering to add `-p`. Covered by an automated test suite (`tests/unit/test_compose_teardown_guard.py`) exercising both scripts against a stubbed `docker` - the first version of this guard shipped without one, and a later review found a real bypass (`-v=true`) manual testing had missed; the tests exist specifically so that class of gap gets caught before review, not after.
+2. **An explicit, named policy in `CLAUDE.md`** requiring any throwaway/manual Docker Compose verification to use `scripts/compose-teardown.sh`/`.ps1` (or an explicit, unique `-p`) rather than bare `docker compose down`, and requiring a read-only inspection (`docker ps -a` / `docker compose -p <name> ps`) immediately before any command that removes containers or volumes, in the same turn as the destructive command — not relying on an inspection run earlier in a long session.
+3. **Local backup and restore validation** (`scripts/backup.sh`/`.ps1`, `scripts/restore-test.sh`/`.ps1`, `deploy/compose/backup/`): a review of this PR correctly pushed back that layers 1-2 only prevent, they do not give the owner a way to undo a deletion that happens anyway - through a different mistake, a deliberate use of the still-available unwrapped command, or a bug in the guard itself. `scripts/backup.sh` runs `pg_dump` (custom format, atomic write) plus an attachment manifest/incremental copy to a HOST directory (`TC_BACKUP_ROOT`) that a volume-scoped teardown cannot reach, because it was never a Docker volume to begin with. `scripts/restore-test.sh` then proves that backup actually restores - into a throwaway, isolated Postgres under its own Compose project (never `thought-capture`), verifying schema/every foreign key via a single-transaction `pg_restore`, every table's row count, and every attachment's blob hash - rather than trusting that `pg_dump` exiting 0 means the data is recoverable. Deliberately not built here, and left as `docs/DESIGN.md` §17 Phase 3's own separately-gated work: scheduling (nightly/quarterly cron), weekly off-site replication, retention tiers, and encryption key custody - `docs/DESIGN.md` §19 leaves the off-site provider and retention tiers as still-open owner decisions, and building either without that decision would mean guessing at it. A backup that only ever runs when someone remembers to invoke it is a real, known limitation of this slice, not an oversight - see the open question below.
 
 Deliberately **not** proposed: disabling or gating `docker compose down` globally, or requiring interactive confirmation for every Docker command. Both would blunt a tool this project's own workflow (and this session's own extensive manual container verification) genuinely depends on, for a failure mode that a narrowly-targeted guard fully closes. The guard is scoped to exactly the one command shape that caused this incident (`down` plus a volume flag plus the real project name), not Docker or Compose in general.
 
-## Residual risk: this prevents, it does not enable recovery
+## Open questions for the owner
 
-The guard closes the one command shape that caused this incident. It does
-not, by itself, satisfy `docs/DESIGN.md` §2.1's recovery target (RPO <= 24
-hours, RTO <= 2 hours) or give the owner a way to undo a deletion that
-happens anyway - through a different mistake, a deliberate use of the
-still-available unwrapped command, or a bug in the guard itself. That gap is
-real: `docs/OPERATING.md` (the "Backup and restore jobs... are not runnable
-yet" line) and `docs/DESIGN.md` §14.3 both already record that nightly
-`pg_dump`, attachment manifests, and quarterly restore drills are designed
-but not built.
-
-Building that now, inside this PR, would be scope creep against this
-project's own working agreement (`CLAUDE.md`'s "smallest vertical slice") -
-it is a substantially larger, separately-scoped piece of work with its own
-undecided inputs (`docs/DESIGN.md` §19: off-site backup provider and
-retention tiers are explicitly deferred pending the owner), tracked as its
-own gate in `docs/DESIGN.md` §17 Phase 3 ("Operational hardening... Gate:
-recovery objectives and failure matrix are demonstrated"). This incident is
-the concrete argument for prioritizing that phase sooner rather than later,
-not a substitute for it. Recorded here so the gap is visible next to the
-incident it would have mitigated, rather than left implicit in a separate
-document.
-
-## Open question for the owner
-
-Whether `scripts/compose-teardown.sh`/`.ps1`'s refusal should be a hard stop with no override (as drafted), or should support an explicit, loudly-worded override flag for the rare legitimate case of intentionally wiping the real dev stack's data. Drafted as a hard stop for now — the underlying `docker compose -p thought-capture down -v` command is still available directly for that case, unwrapped, so nothing is actually prevented, only made to require a deliberate, explicit choice rather than an easy default.
+- Whether `scripts/compose-teardown.sh`/`.ps1`'s refusal should be a hard stop with no override (as drafted), or should support an explicit, loudly-worded override flag for the rare legitimate case of intentionally wiping the real dev stack's data. Drafted as a hard stop for now — the underlying `docker compose -p thought-capture down -v` command is still available directly for that case, unwrapped, so nothing is actually prevented, only made to require a deliberate, explicit choice rather than an easy default.
+- Whether `scripts/backup.sh` needs scheduling (a cron entry, a systemd timer, a reminder) before it meaningfully reduces risk in practice, or whether manual/on-demand invocation is acceptable until `docs/DESIGN.md` §17 Phase 3's nightly automation lands. As shipped, a backup is only as recent as the last time someone ran the script by hand.
