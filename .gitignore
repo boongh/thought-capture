@@ -11,6 +11,10 @@ dist/
 build/
 attachments/
 backups/
+# scripts/check-backup-restore.sh's per-run isolated backup root
+# (deploy/compose/.tc-check-backup-restore-XXXXXXXX) - normally deleted on
+# exit, this only guards against a leftover from an interrupted run.
+deploy/compose/.tc-check-backup-restore-*/
 exports/
 rendered/
 *.log

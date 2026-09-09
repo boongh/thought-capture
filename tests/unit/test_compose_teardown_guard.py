@@ -82,7 +82,27 @@ def docker_stub_dir_sh(tmp_path: Path) -> Path:
 def docker_stub_dir_ps(tmp_path: Path) -> Path:
     stub_dir = tmp_path / "stub-bin-ps"
     stub_dir.mkdir()
-    (stub_dir / "docker.cmd").write_text(DOCKER_STUB_CMD, newline="\r\n")
+    if sys.platform == "win32":
+        # Windows PowerShell/pwsh resolves a bare `docker` invocation through
+        # PATHEXT (which includes .cmd) - this is what scripts/compose-
+        # teardown.ps1 actually goes through when run here.
+        (stub_dir / "docker.cmd").write_text(DOCKER_STUB_CMD, newline="\r\n")
+    else:
+        # On Linux/macOS (this repo's own CI runs pwsh on ubuntu-latest),
+        # PowerShell does NOT do Windows' PATHEXT-based extension
+        # resolution for external commands - it only finds a bare `docker`
+        # if a file literally named `docker` is on PATH and marked
+        # executable. A `docker.cmd`-only stub dir is invisible to it there,
+        # so every `docker` call fell through to whatever REAL `docker`
+        # happened to be on the CI runner's PATH instead of this test's
+        # stub - exactly the review finding this branch fixes (16
+        # PowerShell pass-through tests failing on the Ubuntu runner,
+        # because they were never actually exercising the stub at all).
+        # Same content/log format as the Bash stub, since the Bash-target
+        # stub script and this one need to behave identically here.
+        docker_stub = stub_dir / "docker"
+        docker_stub.write_text(DOCKER_STUB_SH, newline="\n")
+        docker_stub.chmod(0o755)
     return stub_dir
 
 

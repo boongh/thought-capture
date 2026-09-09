@@ -29,17 +29,18 @@
 # Compose's implicit `default` bridge, which has a gateway and full outbound
 # NAT):
 #   default       unchanged behavior - postgres/migrate/api/discord-bot/
-#                 worker, each of which either needs no egress at all or
-#                 already needs it (discord-bot -> Discord, worker ->
+#                 worker/backup, each of which either needs no egress at all
+#                 or already needs it (discord-bot -> Discord, worker ->
 #                 OpenRouter).
 #   embedding     internal: true - no gateway, no egress, no reachability
 #                 from outside this Compose project. embedding-sidecar's
 #                 entire purpose is to see private document text
 #                 (docs/adr/0010 §5) and has no authentication of its own,
 #                 so it gets this network and NOTHING else. api/worker -
-#                 docs/adr/0010 §5's designated callers - are attached to
-#                 BOTH networks: `embedding` to reach the sidecar, `default`
-#                 for everything else they already needed it for.
+#                 docs/adr/0010 §5's designated callers, re-confirmed against
+#                 the ADR at implementation time - are attached to BOTH
+#                 networks: `embedding` to reach the sidecar, `default` for
+#                 everything else they already needed it for.
 #   deploy/compose/embedding-sidecar.contract-test.docker-compose.yml adds a
 #   SECOND, non-internal network to embedding-sidecar ONLY under that overlay
 #   (applied only by scripts/check.*/CI's contract-test steps), because an
@@ -312,17 +313,6 @@ services:
     # embedding write path) - see this file's own header networks comment.
     networks: [default, embedding]
 
-networks:
-  # Declared explicitly so it can be named and referenced by services above -
-  # Compose creates this automatically even with no top-level `networks:` key
-  # at all, so declaring it here changes nothing about its own behavior.
-  default: {}
-  # No egress, no gateway, reachable only by services on this project that
-  # explicitly join it (docs/DESIGN.md 13). See this file's own header
-  # networks comment.
-  embedding:
-    internal: true
-
   # One-shot: dumps postgres and copies attachments to a HOST directory
   # (TC_BACKUP_ROOT), never a Docker named volume - deliberately, so a
   # volume-scoped teardown can never take the backup down with it
@@ -330,7 +320,15 @@ networks:
   # Run via scripts/backup.sh/.ps1, not `docker compose up` directly - the
   # wrapper resolves TC_BACKUP_ROOT the same way every time.
   backup:
-    image: postgres:18.6-trixie
+    # Digest-pinned, not the bare mutable tag (review finding): this
+    # service handles the database password and the full plaintext
+    # backup/attachment data, so it must not silently pick up whatever
+    # `postgres:18.6-trixie` happens to point to on any given day - the
+    # same convention deploy/compose/postgres/Dockerfile's own `FROM` line
+    # already follows for the image this project builds. Kept in sync with
+    # that same digest; see that Dockerfile's own header for how to
+    # re-resolve it when the minor version bumps.
+    image: postgres:18.6-trixie@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
     profiles: ["backup"]
     restart: "no"
     depends_on:
@@ -347,6 +345,17 @@ networks:
     entrypoint: ["/bin/bash", "/backup.sh"]
     security_opt:
       - no-new-privileges:true
+
+networks:
+  # Declared explicitly so it can be named and referenced by services above -
+  # Compose creates this automatically even with no top-level `networks:` key
+  # at all, so declaring it here changes nothing about its own behavior.
+  default: {}
+  # No egress, no gateway, reachable only by services on this project that
+  # explicitly join it (docs/DESIGN.md 13). See this file's own header
+  # networks comment.
+  embedding:
+    internal: true
 
 volumes:
   postgres-data:

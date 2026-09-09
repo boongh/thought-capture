@@ -303,19 +303,20 @@ try {
             }
 
             # ---------------------------------------------------------------
-            # Embedding sidecar network isolation (review finding): a
-            # regression that silently drops embedding-sidecar's `embedding:
-            # internal: true` network attachment, or the contract-test
-            # overlay's second network that restores its published port,
-            # would otherwise only surface as an unreachable-sidecar SKIP
-            # below - indistinguishable from "the operator simply hasn't
-            # started 'core' yet". This is a static config check
-            # (client-side only, same as the sanity checks above), so it
-            # catches the regression even when nothing is running.
-            # `--format json` + ConvertFrom-Json, not text matching:
-            # compose's rendered YAML nests a service's own `networks:` and
-            # the top-level `networks:` definitions differently, and a text
-            # scan risks confusing one for the other.
+            # Embedding sidecar network isolation (review finding, Finding
+            # 4): a regression that silently drops embedding-sidecar's
+            # `embedding: internal: true` network attachment, or the
+            # contract-test overlay's second network that restores its
+            # published port, would otherwise only surface as an
+            # unreachable-sidecar SKIP below - indistinguishable from "the
+            # operator simply hasn't started 'core' yet". This is a static
+            # config check (client-side only, same as the sanity checks
+            # above), so it catches the regression even when nothing is
+            # running. `--format json` + ConvertFrom-Json, not text
+            # matching: compose's rendered YAML nests a service's own
+            # `networks:` and the top-level `networks:` definitions
+            # differently, and a text scan risks confusing one for the
+            # other.
             # ---------------------------------------------------------------
             $baseConfigJson = & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml `
                 --profile core config --format json 2>$null

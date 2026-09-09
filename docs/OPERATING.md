@@ -275,12 +275,26 @@ still reports `enabled: true, degraded: true`, not `enabled: false`.
 Local backup and restore validation ARE runnable (docs/incidents/0001-docker-
 compose-down-deleted-the-real-dev-stack.md's residual-risk finding): `scripts/
 backup.sh`/`.ps1` runs the `backup` Compose profile - `pg_dump` in custom
-format, written atomically to a HOST directory (`TC_BACKUP_ROOT`, never a
-Docker volume), plus an attachment manifest/incremental copy.
-`scripts/restore-test.sh`/`.ps1` then proves that backup actually restores,
-against a throwaway, isolated Postgres under its own Compose project - never
-`thought-capture` - checking schema/every foreign key (a single-transaction
-`pg_restore`), every table's row count, and every attachment's blob hash.
+format at one consistent database snapshot, written atomically to a HOST
+directory (`TC_BACKUP_ROOT`, never a Docker volume), plus an attachment
+manifest/incremental copy and a `tc_app` grant catalog recorded from that same
+snapshot. `scripts/restore-test.sh`/`.ps1` then proves that backup actually
+restores, against a throwaway, isolated Postgres under its own Compose project
+- never `thought-capture` - checking schema/every foreign key (a
+single-transaction `pg_restore`), every table's row count, every attachment's
+blob hash, and that the restored `tc_app` role's grants match the backup-time
+catalog and are actually usable (a live connection as `tc_app` can read
+`thoughts` but is refused writing `users` or updating a thought's body).
+
+**Recovery ordering matters.** The dump now carries `tc_app`'s privileges
+(GRANT statements from migrations 0001-0008) rather than stripping them, so a
+restore target must have the `tc_app` role provisioned - via
+`deploy/compose/initdb/01-roles.sh`, the same script the real stack's own
+`postgres` service runs at cluster creation - **before** `pg_restore` runs.
+Bring Postgres up first (so its init scripts provision the role), then
+restore; restoring into a cluster with no `tc_app` now fails loudly instead
+of quietly producing a database whose application role has a login but zero
+table privileges. That failure mode is intended, not a regression.
 
 What is still NOT built, and remains docs/DESIGN.md 17's separately-gated
 Phase 3 (Operational hardening): scheduling (nightly/quarterly cron), weekly

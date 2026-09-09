@@ -13,6 +13,18 @@ be using - so this brings up its own throwaway, uniquely-named,
 uniquely-ported project instead, with a synthetic env (same pattern
 check.ps1's own "compose config sanity" step already uses), and tears it
 down unconditionally on exit.
+
+TC_BACKUP_ROOT isolation (review finding): this check used to leave
+TC_BACKUP_ROOT unset in its synthetic env file, which meant Compose
+resolved the `backup`/`restore-test` services' bind mount from the
+operator's ambient environment or the real default
+(deploy/compose/backups) - so a routine check.ps1 run overwrote the
+operator's actual `latest.txt` with a synthetic backup, and its negative
+test round deliberately left that pointer referencing a corrupt one. This
+script now creates its OWN per-run temp directory, injects it into both the
+container side (via the synthetic env file) and the host side (this script
+reads its own variable, never a `$env:TC_BACKUP_ROOT`-or-default fallback
+onto the real root), and deletes it on exit.
 #>
 
 
@@ -30,12 +42,51 @@ $RestoreProject = "thought-capture-check-restore-test"
 $ComposeFile = "deploy/compose/docker-compose.yml"
 $RestoreComposeFile = "deploy/compose/backup.restore-test.docker-compose.yml"
 
+# Per-run, isolated backup root - an absolute Windows path (system temp,
+# via .NET's GetTempPath) with backslashes converted to forward slashes so
+# Compose accepts it as a bind-mount source. This is safe here in a way
+# scripts/check-backup-restore.sh's own `mktemp -d` is NOT: confirmed
+# directly in this session against a live Docker Desktop instance - a
+# native Windows absolute path (e.g. "C:/Users/.../AppData/Local/Temp/...")
+# written into a synthetic env file and read by `docker compose` (invoked
+# natively, not via Git Bash) bind-mounts correctly, while Git Bash's own
+# `mktemp -d` produces an MSYS-style "/tmp/..." path that Git Bash itself
+# resolves correctly for ITS OWN file checks but that Docker Desktop's
+# WSL2 backend silently resolves as a path INSIDE its own Linux VM when it
+# is merely file content (not a Git-Bash-translated argv) - the reason
+# check-backup-restore.sh creates its isolated root under deploy/compose/
+# instead. This script is unaffected because it never goes through Git
+# Bash's own path translation layer at all.
+#
+# A marker file inside it is what cleanup below checks before ever calling
+# Remove-Item -Recurse on it, so a future edit that changes how this
+# variable is computed can never silently turn cleanup into a recursive
+# delete of an operator path.
+$BackupRoot = Join-Path ([System.IO.Path]::GetTempPath()) "tc-check-backup-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $BackupRoot -ErrorAction Stop | Out-Null
+$BackupRoot = $BackupRoot -replace '\\', '/'
+$BackupRootMarker = Join-Path $BackupRoot ".tc-check-backup-restore-marker"
+New-Item -ItemType File -Path $BackupRootMarker -ErrorAction Stop | Out-Null
+
+# Positive guard (review finding, step 4): assert the isolated root can
+# never collide with the real default backup root (deploy/compose/backups,
+# resolved relative to $ComposeFile's directory - the project directory
+# Compose uses for a relative TC_BACKUP_ROOT-or-default bind-mount source).
+# A freshly generated GUID under the system temp directory should never
+# produce this path, but the check exists so a change to either side fails
+# loudly instead of silently checking against the real root again.
+$RealBackupRootDefault = (Join-Path (Resolve-Path (Split-Path $ComposeFile)) "backups") -replace '\\', '/'
+if ($BackupRoot -eq $RealBackupRootDefault) {
+    throw "the isolated backup root resolved to the real default backup root ($RealBackupRootDefault) - refusing to run"
+}
+
 $EnvFile = New-TemporaryFile -ErrorAction Stop
 @"
 POSTGRES_PASSWORD=check-only-not-a-real-secret
 TC_APP_DB_PASSWORD=check-only-not-a-real-secret
 POSTGRES_PORT=15498
 TC_DISCORD_OWNER_USER_ID=100000000000000001
+TC_BACKUP_ROOT=$BackupRoot
 "@ | Set-Content -Path $EnvFile -Encoding utf8 -ErrorAction Stop
 
 function Invoke-Cleanup {
@@ -50,6 +101,14 @@ function Invoke-Cleanup {
     & "$PSScriptRoot/compose-teardown.ps1" --env-file $EnvFile -p $BackupProject `
         -f $ComposeFile --profile core --profile backup down -v --remove-orphans *> $null
     Remove-Item -Path $EnvFile -ErrorAction SilentlyContinue
+    # Only ever remove a directory THIS run created: guarded on both a
+    # non-empty variable and the marker file this run itself wrote above,
+    # so a future edit that changes $BackupRoot's value earlier in the
+    # script can never turn this into a recursive delete of an unrelated
+    # path.
+    if ($BackupRoot -and (Test-Path -LiteralPath $BackupRootMarker)) {
+        Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $ExitCode = 1
@@ -110,7 +169,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "backup failed (exit $LASTEXITCODE)" }
 
     Write-Host "--- asserting the seeded attachment was actually copied and hashed" -ForegroundColor Cyan
-    $BackupRoot = if ($env:TC_BACKUP_ROOT) { $env:TC_BACKUP_ROOT } else { "deploy/compose/backups" }
     $CopiedAttachment = Join-Path $BackupRoot "attachments/ab/synthetic.txt"
     if (-not (Test-Path -LiteralPath $CopiedAttachment)) {
         throw "backup did not copy the seeded attachment to $CopiedAttachment"
@@ -134,7 +192,7 @@ try {
 
     # A fresh postgres-scratch every round, not reused across rounds - the
     # same bug scripts/restore-test.ps1's own comment/commit explains
-    # applies equally between the two rounds run here.
+    # applies equally between the rounds run here.
     function Invoke-RestoreTest {
         # A PowerShell function's return value is the aggregate of
         # EVERYTHING written to its output stream during execution, not
@@ -162,6 +220,56 @@ try {
     if ($ExitCode -ne 0) { throw "round 1 restore-test failed (exit $ExitCode), but the backup was complete - expected success" }
 
     # -------------------------------------------------------------------
+    # Race regression (review finding, Finding 3): backup.sh used to take
+    # its pg_dump snapshot, then count rows through SEPARATE, later
+    # connections. A capture committed in between made the recorded count
+    # higher than the dump actually held, and restore-test.sh failed a
+    # perfectly valid backup. This starts a continuous writer BEFORE the
+    # backup begins and keeps it running for the backup's entire duration
+    # (not a single, hard-to-time insert), so the race window is covered
+    # regardless of exactly how long pg_dump takes - on the old code this
+    # reliably fails restore-test; on the snapshot-consistent code
+    # (backup.sh now exports one snapshot and counts rows in that same
+    # still-open transaction) it reliably passes.
+    #
+    # Deliberately runs as round 2, BEFORE the orphan-blob negative test
+    # below: that test permanently inserts a `blobs` row with no backing
+    # file into $BackupProject's database (never rolled back), and this
+    # round needs a database that isn't already broken that way - confirmed
+    # directly while building this: running it after the negative test
+    # failed restore-test for the orphan blob's real, pre-existing reason,
+    # not for anything to do with the race itself.
+    # -------------------------------------------------------------------
+    Write-Host "--- round 2: concurrent writer during backup (race regression)" -ForegroundColor Cyan
+    $WriterJob = Start-Job -ScriptBlock {
+        param($EnvFile, $BackupProject, $ComposeFile)
+        $i = 0
+        while ($true) {
+            $i++
+            $sql = "INSERT INTO thoughts (workspace_id, author_user_id, source, source_message_id, body, client_created_at, client_timezone, client_local_date, client_local_time, received_at, content_language) SELECT w.id, u.id, 'race-test', 'race-test-' || $i || '-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en' FROM workspaces w JOIN users u ON true LIMIT 1"
+            docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
+                exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres `
+                psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c $sql *> $null
+            Start-Sleep -Milliseconds 100
+        }
+    } -ArgumentList $EnvFile, $BackupProject, $ComposeFile
+
+    try {
+        docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
+            --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
+        if ($LASTEXITCODE -ne 0) { throw "round 2 backup failed (exit $LASTEXITCODE)" }
+    }
+    finally {
+        Stop-Job -Job $WriterJob -ErrorAction SilentlyContinue
+        Remove-Job -Job $WriterJob -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "--- round 2: restore-test against the concurrently-written backup (expect success)" -ForegroundColor Cyan
+    $ExitCode = Invoke-RestoreTest
+    if ($ExitCode -ne 0) { throw "round 2 restore-test failed (exit $ExitCode) against a backup taken while a writer committed rows concurrently" }
+    Write-Host "OK: restore-test passed against a backup taken while a writer committed rows concurrently"
+
+    # -------------------------------------------------------------------
     # Negative test (review finding): restore-test.sh's manifest re-check
     # can only ever re-verify files that WERE copied - a copy step that
     # silently omits a blob the database still references would produce a
@@ -175,8 +283,12 @@ try {
     # content that was never written to the attachments volume at all,
     # rather than reproducing an actual copy bug. From restore-test.sh's
     # point of view the two are indistinguishable.
+    #
+    # Deliberately runs LAST: this permanently corrupts $BackupProject's
+    # database (the orphan `blobs` row is never rolled back), so nothing
+    # after it may depend on a clean database.
     # -------------------------------------------------------------------
-    Write-Host "--- round 2: seeding a database-referenced blob with no backing file (negative test)" -ForegroundColor Cyan
+    Write-Host "--- round 3: seeding a database-referenced blob with no backing file (negative test)" -ForegroundColor Cyan
     $OrphanContent = "synthetic orphan blob for check-backup-restore.ps1's negative test - never written to attachments - $([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))"
     $OrphanSha256 = [System.BitConverter]::ToString(
         $Sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($OrphanContent))
@@ -191,13 +303,13 @@ try {
         "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$OrphanSha256', $OrphanSize, 'text/plain', '$OrphanStorageKey')"
     if ($LASTEXITCODE -ne 0) { throw "failed to seed the orphan blobs row (exit $LASTEXITCODE)" }
 
-    Write-Host "--- round 2: running backup again (the dump now references the orphan blob)" -ForegroundColor Cyan
+    Write-Host "--- round 3: running backup again (the dump now references the orphan blob)" -ForegroundColor Cyan
     docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
         --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
-    if ($LASTEXITCODE -ne 0) { throw "round 2 backup failed (exit $LASTEXITCODE)" }
+    if ($LASTEXITCODE -ne 0) { throw "round 3 backup failed (exit $LASTEXITCODE)" }
 
-    Write-Host "--- round 2: running restore-test against the orphan-blob backup (expect FAILURE)" -ForegroundColor Cyan
-    $Round2Output = & {
+    Write-Host "--- round 3: running restore-test against the orphan-blob backup (expect FAILURE)" -ForegroundColor Cyan
+    $Round3Output = & {
         docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `
             down -v --remove-orphans *> $null
         docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `
@@ -205,16 +317,16 @@ try {
         docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `
             run --rm restore-test 2>&1
     } | Out-String
-    $Round2ExitCode = $LASTEXITCODE
-    Write-Host $Round2Output
+    $Round3ExitCode = $LASTEXITCODE
+    Write-Host $Round3Output
 
-    if ($Round2ExitCode -eq 0) {
+    if ($Round3ExitCode -eq 0) {
         throw "restore-test succeeded against a backup missing a database-referenced blob (sha256=$OrphanSha256) - it should have failed"
     }
-    if ($Round2Output -notmatch [regex]::Escape($OrphanSha256)) {
-        throw "restore-test failed (exit $Round2ExitCode), as expected, but its output never named the missing blob (sha256=$OrphanSha256) - the failure may be for the wrong reason"
+    if ($Round3Output -notmatch [regex]::Escape($OrphanSha256)) {
+        throw "restore-test failed (exit $Round3ExitCode), as expected, but its output never named the missing blob (sha256=$OrphanSha256) - the failure may be for the wrong reason"
     }
-    Write-Host "OK: restore-test correctly failed (exit $Round2ExitCode) on a database-referenced blob missing from the backup"
+    Write-Host "OK: restore-test correctly failed (exit $Round3ExitCode) on a database-referenced blob missing from the backup"
     $ExitCode = 0
 }
 catch {
