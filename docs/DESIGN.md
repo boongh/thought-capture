@@ -931,8 +931,12 @@ Development target is Windows with WSL2 and Docker Desktop; production-like exec
 
 Suggested Compose profiles:
 
-- `core`: postgres, api, bot, worker;
-- `ai`: the embedding sidecar (`docs/adr/0010`);
+- `core`: postgres, api, bot, worker, and the embedding sidecar
+  (`docs/adr/0010` §5) - first-party and required for semantic search,
+  unlike Khoj below not an optional dependency, so it ships in `core`
+  rather than behind the same flag as the system it is replacing;
+- `ai`: Khoj and its own database, kept buildable during the migration
+  ADR-0010's "Migration and rollback" describes, until it is retired;
 - `observability`: optional local metrics/log tooling;
 - `backup`: one-shot backup and restore-test jobs.
 

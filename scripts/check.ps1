@@ -282,6 +282,52 @@ try {
             finally {
                 Remove-Item -LiteralPath $llmEnv -ErrorAction SilentlyContinue
             }
+
+            # ---------------------------------------------------------------
+            # Embedding sidecar network isolation (review finding): a
+            # regression that silently drops embedding-sidecar's `embedding:
+            # internal: true` network attachment, or the contract-test
+            # overlay's second network that restores its published port,
+            # would otherwise only surface as an unreachable-sidecar SKIP
+            # below - indistinguishable from "the operator simply hasn't
+            # started 'core' yet". This is a static config check
+            # (client-side only, same as the sanity checks above), so it
+            # catches the regression even when nothing is running.
+            # `--format json` + ConvertFrom-Json, not text matching:
+            # compose's rendered YAML nests a service's own `networks:` and
+            # the top-level `networks:` definitions differently, and a text
+            # scan risks confusing one for the other.
+            # ---------------------------------------------------------------
+            $baseConfigJson = & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml `
+                --profile core config --format json 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $baseConfigJson) {
+                throw "FAIL: compose config sanity (rendering 'core' base config as JSON failed)"
+            }
+            $overlayConfigJson = & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml `
+                -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml `
+                --profile core config --format json 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $overlayConfigJson) {
+                throw "FAIL: compose config sanity (rendering 'core' + contract-test overlay config as JSON failed)"
+            }
+            $baseConfig = ($baseConfigJson -join "`n") | ConvertFrom-Json
+            $overlayConfig = ($overlayConfigJson -join "`n") | ConvertFrom-Json
+
+            $baseSidecarNetworks = $baseConfig.services.'embedding-sidecar'.networks
+            $baseSidecarNetworkNames = @($baseSidecarNetworks.PSObject.Properties.Name)
+            if ($baseSidecarNetworkNames -notcontains "embedding") {
+                throw "FAIL: compose config sanity (embedding-sidecar is not attached to the 'embedding' network in the base compose file)"
+            }
+            if (@($baseSidecarNetworkNames | Where-Object { $_ -ne "embedding" }).Count -gt 0) {
+                throw "FAIL: compose config sanity (embedding-sidecar is attached to more than just 'embedding' in the base compose file: $($baseSidecarNetworkNames -join ', '))"
+            }
+            $embeddingNetwork = $baseConfig.networks.embedding
+            if (-not $embeddingNetwork -or -not $embeddingNetwork.internal) {
+                throw "FAIL: compose config sanity (the 'embedding' network is not internal: true in the base compose file)"
+            }
+            $overlaySidecarPorts = $overlayConfig.services.'embedding-sidecar'.ports
+            if (-not $overlaySidecarPorts -or @($overlaySidecarPorts).Count -eq 0) {
+                throw "FAIL: compose config sanity (embedding-sidecar has no published port under the contract-test overlay)"
+            }
         }
         finally {
             $ErrorActionPreference = $previousEap

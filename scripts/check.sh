@@ -234,6 +234,75 @@ if command -v docker >/dev/null 2>&1; then
     rm -f "$core_only_env" "$ai_error_file"
     exit 1
   fi
+
+  # -------------------------------------------------------------------
+  # Embedding sidecar network isolation (review finding): a regression
+  # that silently drops embedding-sidecar's `embedding: internal: true`
+  # network attachment, or the contract-test overlay's second network
+  # that restores its published port, would otherwise only surface as an
+  # unreachable-sidecar SKIP below - indistinguishable from "the operator
+  # simply hasn't started 'core' yet". This is a static config check
+  # (client-side only, same as the sanity checks above), so it catches
+  # the regression even when nothing is running. `--format json`, not
+  # text grep/awk: compose's rendered YAML nests a service's own
+  # `networks:` and the top-level `networks:` definitions differently,
+  # and a text scan risks confusing one for the other.
+  # -------------------------------------------------------------------
+  base_config_json="$(docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
+    --profile core config --format json 2>/dev/null)"
+  if [[ -z "$base_config_json" ]]; then
+    printf "FAIL: compose config sanity (rendering 'core' base config as JSON failed)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  overlay_config_json="$(docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
+    -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+    --profile core config --format json 2>/dev/null)"
+  if [[ -z "$overlay_config_json" ]]; then
+    printf "FAIL: compose config sanity (rendering 'core' + contract-test overlay config as JSON failed)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  python_bin="$(command -v python3 || command -v python || true)"
+  if [[ -z "$python_bin" ]]; then
+    printf "FAIL: compose config sanity (no python interpreter available to parse compose config JSON)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+  if ! "$python_bin" - "$base_config_json" "$overlay_config_json" <<'PYEOF'
+import json
+import sys
+
+base = json.loads(sys.argv[1])
+overlay = json.loads(sys.argv[2])
+
+base_sidecar = base["services"]["embedding-sidecar"]
+base_networks = base_sidecar.get("networks") or {}
+if "embedding" not in base_networks:
+    print("embedding-sidecar is not attached to the 'embedding' network in the base compose file", file=sys.stderr)
+    sys.exit(1)
+if set(base_networks) != {"embedding"}:
+    print(f"embedding-sidecar is attached to more than just 'embedding' in the base compose file: {sorted(base_networks)}", file=sys.stderr)
+    sys.exit(1)
+
+embedding_network = (base.get("networks") or {}).get("embedding") or {}
+if not embedding_network.get("internal"):
+    print("the 'embedding' network is not internal: true in the base compose file", file=sys.stderr)
+    sys.exit(1)
+
+overlay_sidecar = overlay["services"]["embedding-sidecar"]
+if not overlay_sidecar.get("ports"):
+    print("embedding-sidecar has no published port under the contract-test overlay", file=sys.stderr)
+    sys.exit(1)
+
+print("OK: embedding-sidecar network isolation config is as expected")
+PYEOF
+  then
+    printf "FAIL: compose config sanity (embedding-sidecar network isolation assertion failed - see above)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file"
+    exit 1
+  fi
+
   rm -f "$core_only_env" "$ai_error_file"
   printf '%s\n' "OK: compose config sanity"
 else

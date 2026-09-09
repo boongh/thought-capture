@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0008"
@@ -115,6 +116,35 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Preflight, before any DDL (review finding): restoring the narrower
+    # runs_kind_check below rejects any EXISTING `runs` row with
+    # kind='embedding_sync' - a real possibility once embedding sync starts
+    # recording runs in a later slice, not merely a hypothetical. Without
+    # this check, downgrade would first DROP document_embeddings (genuinely
+    # destructive - the sync-writer's own upsert history, not recoverable
+    # from the constraint alone) and only THEN fail on the ADD CONSTRAINT,
+    # leaving the schema downgraded halfway with no way to recover the
+    # dropped table's contents even by re-running upgrade(). Aborting here,
+    # before the DROP TABLE ever runs, means an unsafe downgrade changes
+    # nothing at all - matching this file's own upgrade() docstring
+    # principle ("a migration must never narrow a CHECK constraint in the
+    # same step it widens one") applied to the downgrade direction too.
+    connection = op.get_bind()
+    unsafe_run_count = connection.execute(
+        sa.text("SELECT count(*) FROM runs WHERE kind = 'embedding_sync'")
+    ).scalar_one()
+    if unsafe_run_count:
+        raise RuntimeError(
+            f"Cannot downgrade migration 0008: {unsafe_run_count} row(s) in "
+            "`runs` have kind='embedding_sync', which the constraint this "
+            "downgrade restores would reject. Downgrading would either fail "
+            "mid-migration after already dropping document_embeddings, or "
+            "silently require deleting those audit rows - neither is safe "
+            "to do automatically. Resolve manually (e.g. decide whether "
+            "those runs may be deleted, or recreate them under a "
+            "pre-existing `kind` value) before downgrading past 0008."
+        )
+
     op.execute(f"REVOKE ALL ON document_embeddings FROM {APP_ROLE}")
     op.execute("DROP TABLE IF EXISTS document_embeddings")
 
