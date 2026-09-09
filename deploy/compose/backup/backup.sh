@@ -22,6 +22,26 @@ set -euo pipefail
 
 backup_root="/backups"
 attachments_source="/data/attachments"
+
+mkdir -p "$backup_root"
+
+# Two concurrent invocations (a scheduled run overlapping a manual one, or
+# two manual runs) each write their own uniquely-timestamped dump/manifest/
+# row-counts files, so those never collide - but both would write the SAME
+# `latest.txt`, and interleaved writes to one file from two processes can
+# corrupt it (a reader could see a mix of both runs' bytes). `flock` here
+# serializes the two runs entirely rather than only guarding the final
+# `latest.txt` write: a second run waits for the first to finish instead of
+# running pg_dump against the source concurrently for no benefit. Bounded
+# wait, not indefinite - a genuinely stuck prior run should surface as a
+# clear failure here, not an invisible hang.
+lock_file="$backup_root/.backup.lock"
+exec 200>"$lock_file"
+if ! flock -w 300 200; then
+  echo "FAIL: could not acquire the backup lock ($lock_file) within 300s - another backup may be stuck" >&2
+  exit 1
+fi
+
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
 postgres_dir="$backup_root/postgres"
@@ -108,8 +128,20 @@ cat >"$manifest_json" <<JSON
 }
 JSON
 chmod 600 "$manifest_json"
-printf '%s\n' "$(basename "$manifest_json")" >"$backup_root/latest.txt"
-chmod 600 "$backup_root/latest.txt"
+
+# Same atomic write-then-rename pattern as the dump file above, and for the
+# same reason: `latest.txt` is the ONE file every run overwrites in place
+# (dump/manifest/row-counts are each uniquely timestamped, so they never
+# collide even without the lock above). A reader (restore-test.sh, or an
+# operator) must never be able to observe a half-written pointer - the
+# flock above already prevents two backup.sh runs from doing this to each
+# other, but a direct write here would still leave a window where a reader
+# with no lock of its own could see a torn file if it happened to read at
+# the exact wrong instant.
+latest_tmp="$backup_root/.tmp-latest.txt"
+printf '%s\n' "$(basename "$manifest_json")" >"$latest_tmp"
+chmod 600 "$latest_tmp"
+mv "$latest_tmp" "$backup_root/latest.txt"
 
 # Best-effort: a Windows bind mount (Docker Desktop/WSL2) does not enforce
 # POSIX permission bits the way a native Linux host filesystem does, so this

@@ -104,10 +104,72 @@ if ! grep -q "^${attachment_sha256}  \./ab/synthetic\.txt$" "$attachments_manife
 fi
 printf 'OK: seeded attachment present and hash-valid after backup\n'
 
-printf -- '--- starting postgres-scratch (project: %s)\n' "$restore_project"
-docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
-  up -d --build --force-recreate --wait postgres-scratch
+# A fresh postgres-scratch every round, not reused across rounds: the same
+# bug this guards against for repeated script invocations
+# (scripts/restore-test.sh's own comment/commit explains it) applies
+# equally between the two rounds run here.
+run_restore_test() {
+  docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
+    down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
+    up -d --build --force-recreate --wait postgres-scratch
+  docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
+    run --rm restore-test
+}
 
-printf -- '--- running restore-test\n'
-docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
-  run --rm restore-test
+printf -- '--- round 1: restore-test against a complete backup (expect success)\n'
+run_restore_test
+
+# ---------------------------------------------------------------------------
+# Negative test (review finding): restore-test.sh's manifest re-check can
+# only ever re-verify files that WERE copied - a copy step that silently
+# omits a blob the database still references would produce a manifest with
+# nothing to complain about, and restore-test would pass while the restored
+# `blobs` row points at a file that exists nowhere in the backup. Proves
+# deploy/compose/backup/restore-test.sh's newer "every database-referenced
+# blob" check (queries the restored `blobs` table directly, independent of
+# the manifest) actually catches that - not just that the happy path above
+# passes, which an empty or trivially-complete manifest could also do.
+#
+# Simulates the omission the cheap way: insert a `blobs` row for content
+# that was never written to the attachments volume at all, rather than
+# reproducing an actual copy bug. From restore-test.sh's point of view the
+# two are indistinguishable - either way, the database says a blob should
+# exist and the backup directory does not have it.
+# ---------------------------------------------------------------------------
+printf -- '--- round 2: seeding a database-referenced blob with no backing file (negative test)\n'
+orphan_content="synthetic orphan blob for check-backup-restore.sh's negative test - never written to attachments - $(date -u +%Y%m%dT%H%M%SZ)"
+orphan_sha256="$(printf '%s' "$orphan_content" | sha256sum | cut -d' ' -f1)"
+orphan_size="$(printf '%s' "$orphan_content" | wc -c)"
+# Matches packages/infrastructure/src/tc_infrastructure/storage/blob_store.py's
+# own `storage_key_for`: two 2-character fan-out levels, then the full hash.
+orphan_storage_key="${orphan_sha256:0:2}/${orphan_sha256:2:2}/${orphan_sha256}"
+docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+  exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres \
+  psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c \
+  "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$orphan_sha256', $orphan_size, 'text/plain', '$orphan_storage_key')"
+
+printf -- '--- round 2: running backup again (the dump now references the orphan blob)\n'
+docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+  --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
+
+printf -- '--- round 2: running restore-test against the orphan-blob backup (expect FAILURE)\n'
+round_2_output="$(mktemp)"
+round_2_exit=0
+run_restore_test >"$round_2_output" 2>&1 || round_2_exit=$?
+cat "$round_2_output"
+
+if [[ "$round_2_exit" -eq 0 ]]; then
+  printf 'FAIL: restore-test succeeded against a backup missing a database-referenced blob (sha256=%s) - it should have failed\n' \
+    "$orphan_sha256" >&2
+  rm -f "$round_2_output"
+  exit 1
+fi
+if ! grep -q "$orphan_sha256" "$round_2_output"; then
+  printf 'FAIL: restore-test failed (exit %s), as expected, but its output never named the missing blob (sha256=%s) - the failure may be for the wrong reason\n' \
+    "$round_2_exit" "$orphan_sha256" >&2
+  rm -f "$round_2_output"
+  exit 1
+fi
+rm -f "$round_2_output"
+printf 'OK: restore-test correctly failed (exit %s) on a database-referenced blob missing from the backup\n' "$round_2_exit"

@@ -24,6 +24,18 @@
 #   4. Every attachment file's sha256 still matches backup.sh's manifest,
 #      the "blob hashes" docs/DESIGN.md 14.3 names for the eventual
 #      quarterly drill.
+#   5. Every row the RESTORED database's own `blobs` table names - not the
+#      manifest - has a matching file in the backup with the right sha256
+#      and size. This is deliberately independent of step 4: the manifest
+#      is generated FROM whatever backup.sh actually copied, so a blob the
+#      copy step silently omitted (a bug, a permissions error, an attachment
+#      written between the copy and the manifest scan) would simply not
+#      appear in the manifest either - step 4 would have nothing to
+#      complain about, and restore-test would pass while the restored
+#      `blobs`/`thought_attachments` rows point at a file that does not
+#      exist anywhere in the backup. Querying the database itself is the
+#      only source of truth for "what SHOULD be here," matching how the row
+#      counts in step 2 already use the database's own bookkeeping.
 set -euo pipefail
 
 backup_root="/backups"
@@ -97,5 +109,37 @@ if [[ -s "$attachments_manifest" ]]; then
 else
   echo "OK: no attachments were present at backup time, nothing to verify"
 fi
+
+echo "--- verifying every database-referenced blob exists in the backup and matches"
+blob_mismatch=0
+blob_count=0
+while IFS='|' read -r blob_sha256 size_bytes storage_key; do
+  [[ -z "$blob_sha256" ]] && continue
+  blob_count=$((blob_count + 1))
+  blob_file="/backups/attachments/$storage_key"
+  if [[ ! -f "$blob_file" ]]; then
+    echo "FAIL: the restored database's blobs table references sha256=$blob_sha256 (storage_key=$storage_key), but no such file exists in the backup - the attachment copy silently omitted a blob the database still points at, which the manifest check above cannot catch (it only re-checks what WAS copied)" >&2
+    blob_mismatch=1
+    continue
+  fi
+  actual_size="$(stat -c%s "$blob_file")"
+  if [[ "$actual_size" != "$size_bytes" ]]; then
+    echo "FAIL: blob $blob_sha256 size mismatch (database says $size_bytes bytes, backup file $blob_file is $actual_size bytes)" >&2
+    blob_mismatch=1
+    continue
+  fi
+  actual_sha256="$(sha256sum "$blob_file" | cut -d' ' -f1)"
+  if [[ "$actual_sha256" != "$blob_sha256" ]]; then
+    echo "FAIL: file at $blob_file hashes to $actual_sha256, but the database's blobs row for it says $blob_sha256" >&2
+    blob_mismatch=1
+  fi
+done < <(PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 --quiet --tuples-only --no-align -F'|' \
+  --host=postgres-scratch --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" \
+  -c "SELECT sha256, size_bytes, storage_key FROM blobs ORDER BY sha256")
+
+if [[ "$blob_mismatch" -ne 0 ]]; then
+  exit 1
+fi
+echo "OK: every database-referenced blob ($blob_count) exists in the backup and matches its recorded hash/size"
 
 echo "OK: restore-test complete for $(basename "$manifest_json")"
