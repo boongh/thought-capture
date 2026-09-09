@@ -27,6 +27,16 @@ when combined with that pattern (confirmed while testing this script -
 `-p thought-capture down -v` arrived with only `down` left in the bound
 array). Reading `$args` directly bypasses parameter binding entirely.
 
+Also matches `-v=<value>`/`--volumes=<value>`, not just the bare
+`-v`/`--volumes` an earlier version of this script only matched - Docker's
+own flag parser (Cobra/pflag) accepts that form too, and `docker compose
+down --volumes=true`/`-v=true` were confirmed empirically to delete a real
+named volume while going undetected by an exact-string match. Fails closed:
+any `=`-form value other than pflag's own recognized falsy spellings
+(matching Go's strconv.ParseBool - 0/f/F/false/False/FALSE) is treated as
+volume-destroying, and the flag is only ever escalated true, never
+downgraded back to false by a later token.
+
 .EXAMPLE
 scripts/compose-teardown.ps1 -p tc-scratch-1234 down -v
 #>
@@ -36,24 +46,40 @@ $ErrorActionPreference = "Stop"
 # Must match deploy/compose/docker-compose.yml's own `name:` field.
 $RealProjectName = "thought-capture"
 
+function Test-Falsy {
+    param([string] $Value)
+    return $Value -in @("0", "f", "F", "false", "False", "FALSE")
+}
+
 $ProjectName = $null
 $HasVolumesFlag = $false
 $PassThroughArgs = @()
 
 $i = 0
 while ($i -lt $args.Count) {
-    switch ($args[$i]) {
-        { $_ -in @("-p", "--project-name") } {
+    $current = $args[$i]
+    switch -Regex ($current) {
+        '^(-p|--project-name)$' {
             $ProjectName = $args[$i + 1]
             $PassThroughArgs += $args[$i], $args[$i + 1]
             $i++
         }
-        { $_ -in @("-v", "--volumes") } {
+        '^(-p|--project-name)=(.*)$' {
+            $ProjectName = $Matches[2]
+            $PassThroughArgs += $current
+        }
+        '^(-v|--volumes)$' {
             $HasVolumesFlag = $true
-            $PassThroughArgs += $args[$i]
+            $PassThroughArgs += $current
+        }
+        '^(-v|--volumes)=(.*)$' {
+            if (-not (Test-Falsy $Matches[2])) {
+                $HasVolumesFlag = $true
+            }
+            $PassThroughArgs += $current
         }
         default {
-            $PassThroughArgs += $args[$i]
+            $PassThroughArgs += $current
         }
     }
     $i++

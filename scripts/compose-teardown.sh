@@ -25,6 +25,23 @@ set -euo pipefail
 # Must match deploy/compose/docker-compose.yml's own `name:` field.
 REAL_PROJECT_NAME="thought-capture"
 
+# Docker's own flag parser (Cobra/pflag) also accepts `-v=<value>` and
+# `--volumes=<value>`, not just the bare `-v`/`--volumes` this script
+# originally matched - confirmed empirically: `docker compose down
+# --volumes=true` and `-v=true` both deleted a real named volume in a
+# throwaway test stack while the prior exact-string `case` match here let
+# them through as unrecognized, un-flagged arguments. Fails closed: any
+# `=`-form value other than pflag's own recognized falsy spellings (matching
+# Go's strconv.ParseBool - 0/f/F/false/False/FALSE) is treated as
+# volume-destroying, and the flag is only ever escalated true, never
+# downgraded back to false by a later token.
+_is_falsy() {
+  case "$1" in
+    0 | f | F | false | False | FALSE) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 project_name=""
 has_volumes_flag=false
 args=()
@@ -36,8 +53,20 @@ while [[ $# -gt 0 ]]; do
       args+=("$1" "$2")
       shift 2
       ;;
+    -p=*|--project-name=*)
+      project_name="${1#*=}"
+      args+=("$1")
+      shift
+      ;;
     -v|--volumes)
       has_volumes_flag=true
+      args+=("$1")
+      shift
+      ;;
+    -v=*|--volumes=*)
+      if ! _is_falsy "${1#*=}"; then
+        has_volumes_flag=true
+      fi
       args+=("$1")
       shift
       ;;

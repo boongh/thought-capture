@@ -53,6 +53,30 @@ Two independent layers, matching `docs/adr/0001`'s own "convention is not enough
 
 Deliberately **not** proposed: disabling or gating `docker compose down` globally, or requiring interactive confirmation for every Docker command. Both would blunt a tool this project's own workflow (and this session's own extensive manual container verification) genuinely depends on, for a failure mode that a narrowly-targeted guard fully closes. The guard is scoped to exactly the one command shape that caused this incident (`down` plus a volume flag plus the real project name), not Docker or Compose in general.
 
+## Residual risk: this prevents, it does not enable recovery
+
+The guard closes the one command shape that caused this incident. It does
+not, by itself, satisfy `docs/DESIGN.md` §2.1's recovery target (RPO <= 24
+hours, RTO <= 2 hours) or give the owner a way to undo a deletion that
+happens anyway - through a different mistake, a deliberate use of the
+still-available unwrapped command, or a bug in the guard itself. That gap is
+real: `docs/OPERATING.md` (the "Backup and restore jobs... are not runnable
+yet" line) and `docs/DESIGN.md` §14.3 both already record that nightly
+`pg_dump`, attachment manifests, and quarterly restore drills are designed
+but not built.
+
+Building that now, inside this PR, would be scope creep against this
+project's own working agreement (`CLAUDE.md`'s "smallest vertical slice") -
+it is a substantially larger, separately-scoped piece of work with its own
+undecided inputs (`docs/DESIGN.md` §19: off-site backup provider and
+retention tiers are explicitly deferred pending the owner), tracked as its
+own gate in `docs/DESIGN.md` §17 Phase 3 ("Operational hardening... Gate:
+recovery objectives and failure matrix are demonstrated"). This incident is
+the concrete argument for prioritizing that phase sooner rather than later,
+not a substitute for it. Recorded here so the gap is visible next to the
+incident it would have mitigated, rather than left implicit in a separate
+document.
+
 ## Open question for the owner
 
 Whether `scripts/compose-teardown.sh`/`.ps1`'s refusal should be a hard stop with no override (as drafted), or should support an explicit, loudly-worded override flag for the rare legitimate case of intentionally wiping the real dev stack's data. Drafted as a hard stop for now — the underlying `docker compose -p thought-capture down -v` command is still available directly for that case, unwrapped, so nothing is actually prevented, only made to require a deliberate, explicit choice rather than an easy default.
