@@ -264,8 +264,16 @@ jobs:
       # apps/embedding_sidecar/Dockerfile fails CI too.
       # -----------------------------------------------------------------
       - name: Start the embedding sidecar ('core' compose profile)
+        # The contract-test overlay is what publishes this service to a
+        # host port at all - deploy/compose/docker-compose.yml deliberately
+        # does not, for normal use (that file's own header comment on
+        # `embedding-sidecar` has the full reasoning). Without this second
+        # `-f`, this step would start a sidecar this job could never reach
+        # from the runner's own `curl`/`pytest` below.
         run: |
-          docker compose -f deploy/compose/docker-compose.yml --profile core up -d --build embedding-sidecar
+          docker compose -f deploy/compose/docker-compose.yml \
+            -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+            --profile core up -d --build embedding-sidecar
 
       - name: Wait for the embedding sidecar to become ready
         run: |
@@ -277,7 +285,9 @@ jobs:
             sleep 3
           done
           echo "Embedding sidecar did not become ready in time" >&2
-          docker compose -f deploy/compose/docker-compose.yml --profile core logs embedding-sidecar
+          docker compose -f deploy/compose/docker-compose.yml \
+            -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+            --profile core logs embedding-sidecar
           exit 1
 
       - name: Contract tests
@@ -292,7 +302,9 @@ jobs:
         # project here is scoped to exactly what this job itself started.
         if: always()
         run: |
-          docker compose -f deploy/compose/docker-compose.yml --profile core down -v
+          docker compose -f deploy/compose/docker-compose.yml \
+            -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+            --profile core down -v
 
       - name: Stop Khoj
         if: always()

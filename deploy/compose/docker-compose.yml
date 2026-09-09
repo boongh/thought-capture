@@ -208,10 +208,19 @@ services:
   # index, no conversation state, no filter logic (docs/DESIGN.md 8.1): a
   # stateless embed(texts) -> vectors call, reachable from other `core`
   # services at http://embedding-sidecar:8081 on the internal network.
-  # Published on loopback only, matching postgres/api above - nothing here is
-  # reachable off-host. Nothing yet calls this service (no product-behavior
-  # change in this slice); it exists to prove the sidecar itself boots and
-  # answers correctly in isolation.
+  #
+  # Deliberately NOT published to any host port here, unlike postgres/api
+  # above: this service has no authentication of its own (docs/DESIGN.md
+  # 8.1) and has an extensive, still-incomplete-by-design DoS-hardening
+  # story (settings.py's own `limit_concurrency`/`h11_max_incomplete_event_size`
+  # docstrings) - "loopback only" still means "reachable by any process on
+  # the host", which is broader than this service actually needs day to
+  # day (only other containers on this network do). Nothing yet calls this
+  # service (no product-behavior change in this slice); it exists to prove
+  # the sidecar itself boots and answers correctly in isolation.
+  # `embedding-sidecar.contract-test.docker-compose.yml` is a separate
+  # overlay that adds a loopback-published port back, applied only by
+  # scripts/check.*/CI's contract-test steps - see that file's own header.
   embedding-sidecar:
     build:
       context: ../../apps/embedding_sidecar
@@ -219,8 +228,6 @@ services:
     image: thought-capture-embedding-sidecar:local
     profiles: ["core"]
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:${TC_EMBEDDING_SIDECAR_PORT:-8081}:8081"
     healthcheck:
       test:
         ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health').status==200 else 1)\""]

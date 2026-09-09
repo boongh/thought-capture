@@ -363,7 +363,7 @@ try {
         Write-Host "OK: contract tests (embedding sidecar)"
     }
     else {
-        $Script:Skipped += "contract tests (embedding sidecar) (unreachable at $EmbeddingSidecarUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build embedding-sidecar)"
+        $Script:Skipped += "contract tests (embedding sidecar) (unreachable at $EmbeddingSidecarUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml --profile core up -d --build embedding-sidecar)"
         Write-Host "SKIPPED: embedding sidecar unreachable at $EmbeddingSidecarUrl" -ForegroundColor Yellow
     }
 

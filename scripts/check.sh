@@ -278,7 +278,7 @@ if curl --silent --fail --max-time 3 "$embedding_sidecar_url/health" >/dev/null 
   fi
   printf '%s\n' "OK: contract tests (embedding sidecar)"
 else
-  skipped+=("contract tests (embedding sidecar) (unreachable at $embedding_sidecar_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build embedding-sidecar)")
+  skipped+=("contract tests (embedding sidecar) (unreachable at $embedding_sidecar_url; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml --profile core up -d --build embedding-sidecar)")
   printf '%s\n' "SKIPPED: embedding sidecar unreachable at $embedding_sidecar_url"
 fi
 

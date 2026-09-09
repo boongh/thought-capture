@@ -1,0 +1,19 @@
+# Publishes the embedding sidecar's port to loopback, for its own contract
+# tests (tests/contract/embedding_sidecar/) to reach it from the host.
+# Applied only by scripts/check.sh, scripts/check.ps1, and
+# .github/workflows/ci.yml's contract-test steps - NOT part of a normal
+# `--profile core up`, which deliberately does not publish this service to
+# any host port at all (deploy/compose/docker-compose.yml's own header
+# comment on `embedding-sidecar` has the full reasoning: this service has
+# no authentication of its own, so "reachable by any process on the host"
+# is broader exposure than day-to-day operation needs - only other
+# containers on the compose network do).
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+#     --profile core up -d --build embedding-sidecar
+
+services:
+  embedding-sidecar:
+    ports:
+      - "127.0.0.1:${TC_EMBEDDING_SIDECAR_PORT:-8081}:8081"
