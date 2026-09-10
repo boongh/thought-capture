@@ -291,13 +291,20 @@ the dump's sha256, each attachment's blob hash, the row counts, the grant
 catalog - compares the backup against values `backup.sh` recorded into the
 same directory as the backup itself. That catches corruption at rest. It does
 not catch tampering, because anything that could alter the dump could alter
-the recorded checksum beside it. The mitigation today is containment: the
-restore-validation stack runs on an `internal: true` network with no gateway,
-so restoring an untrusted dump cannot reach outward from that job. Signed or
-authenticated backups (docs/DESIGN.md 12.2 names `age`, with the private key
-held off the backup destination) are designed but not built, because they need
-a decided answer to where that key lives - still an open owner decision in
-docs/DESIGN.md 19. **Until that decision lands, restoring a backup that has
+the recorded checksum beside it. The mitigation today is network egress
+containment, stated precisely rather than as a stronger guarantee it is
+not: the restore-validation stack runs on an `internal: true` network with
+no gateway, so a tampered dump cannot exfiltrate anything or reach further
+hosts from that job. It does NOT sandbox local execution - `pg_restore`
+connects as the scratch cluster's own superuser, and a custom-format dump is
+a stream of SQL a superuser is permitted to run, so a hostile archive can
+still execute commands inside the throwaway `postgres-scratch` container
+(which has no state worth protecting and is discarded with the rest of the
+throwaway project). Signed or authenticated backups (docs/DESIGN.md 12.2
+names `age`, with the private key held off the backup destination) are
+designed but not built, because they need a decided answer to where that key
+lives - still an open owner decision in docs/DESIGN.md 19. **Until that
+decision lands, restoring a backup that has
 been off this host is gated on it, not on a green restore-test.**
 
 **Recovery ordering matters.** The dump now carries `tc_app`'s privileges

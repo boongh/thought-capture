@@ -49,6 +49,7 @@ EMBEDDING_CONTRACT_TEST_YML = (
 BACKUP_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "backup.sh"
 RESTORE_TEST_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "restore-test.sh"
 RESTORE_TEST_YML = REPO_ROOT / "deploy" / "compose" / "backup.restore-test.docker-compose.yml"
+OPERATING_MD = REPO_ROOT / "docs" / "OPERATING.md"
 
 # The exact fallback the review found: reading TC_BACKUP_ROOT with a default
 # of the real backup directory silently redirects onto the operator's real
@@ -66,27 +67,49 @@ def _strip_shell_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
+def _normalize_comment_prose(text: str) -> str:
+    """Strip each line's leading `# ` marker, then collapse all remaining
+    whitespace (including the newlines between wrapped lines) to single
+    spaces, so a multi-line `#`-commented sentence can be matched as one
+    string regardless of exactly where it wraps. A review found a narrower
+    version of this (only replacing the literal substring "\\n# ") was a
+    no-op against today's wrapping and would both miss a wrap that happens
+    mid-word-boundary differently and leave a literal `#` in the matched text
+    for a sentence that spans a line break, since plain `str.split()` alone
+    does not strip comment markers."""
+    stripped_lines = (line.lstrip().removeprefix("#").strip() for line in text.splitlines())
+    return " ".join(line for line in stripped_lines if line)
+
+
 def _strip_ps1_comments(text: str) -> str:
-    return _strip_shell_comments(text)
+    """Like `_strip_shell_comments`, plus PowerShell's `<# ... #>` block
+    comments - notably the file-header docstring, which is comment-heavy
+    prose explaining exactly the patterns these tests forbid. A review found
+    the original version of this only stripped `#` line comments, so a
+    forbidden marker quoted inside the header block would have gone
+    undetected as "live code" - direction of error was safe (a spurious
+    failure, not a spurious pass), but worth closing properly."""
+    without_blocks = re.sub(r"<#.*?#>", "", text, flags=re.DOTALL)
+    return _strip_shell_comments(without_blocks)
 
 
 class TestCheckBackupRestoreIsolation:
     def test_sh_injects_its_own_tc_backup_root(self) -> None:
-        text = CHECK_BACKUP_RESTORE_SH.read_text()
+        text = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
         assert "TC_BACKUP_ROOT=$backup_root_compose_value" in text, (
             "scripts/check-backup-restore.sh must write its own isolated "
             "TC_BACKUP_ROOT into the synthetic env file it hands to Compose"
         )
 
     def test_ps1_injects_its_own_tc_backup_root(self) -> None:
-        text = CHECK_BACKUP_RESTORE_PS1.read_text()
+        text = CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8")
         assert "TC_BACKUP_ROOT=$BackupRoot" in text, (
             "scripts/check-backup-restore.ps1 must write its own isolated "
             "TC_BACKUP_ROOT into the synthetic env file it hands to Compose"
         )
 
     def test_sh_never_falls_back_to_the_real_backup_root(self) -> None:
-        text = CHECK_BACKUP_RESTORE_SH.read_text()
+        text = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
         for marker in REAL_BACKUP_ROOT_FALLBACK_MARKERS:
             assert marker not in text, (
                 f"scripts/check-backup-restore.sh must never read the real "
@@ -96,7 +119,7 @@ class TestCheckBackupRestoreIsolation:
             )
 
     def test_ps1_never_falls_back_to_the_real_backup_root(self) -> None:
-        text = CHECK_BACKUP_RESTORE_PS1.read_text()
+        text = CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8")
         # The exact fallback the review found, ported to PowerShell: reading
         # $env:TC_BACKUP_ROOT with a default of the real backup directory. A
         # bare substring check on "deploy/compose/backups" would also trip
@@ -111,7 +134,7 @@ class TestCheckBackupRestoreIsolation:
         )
 
     def test_sh_deletes_only_a_directory_it_marked_itself(self) -> None:
-        text = CHECK_BACKUP_RESTORE_SH.read_text()
+        text = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
         assert ".tc-check-backup-restore-marker" in text, (
             "cleanup must only ever remove a directory this run created - "
             "guarded on a marker file the run itself wrote, not merely a "
@@ -120,7 +143,7 @@ class TestCheckBackupRestoreIsolation:
         assert "rm -rf" in text
 
     def test_ps1_deletes_only_a_directory_it_marked_itself(self) -> None:
-        text = CHECK_BACKUP_RESTORE_PS1.read_text()
+        text = CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8")
         assert ".tc-check-backup-restore-marker" in text, (
             "cleanup must only ever remove a directory this run created - "
             "guarded on a marker file the run itself wrote, not merely a "
@@ -135,7 +158,7 @@ class TestBackupRootIsReadThroughAContainer:
     assuming the invoking user can read root/postgres-owned 0700 paths."""
 
     def test_sh_has_no_host_side_file_assertion_on_the_backup_root(self) -> None:
-        text = CHECK_BACKUP_RESTORE_SH.read_text()
+        text = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
         code_only = _strip_shell_comments(text)
         for marker in ('[[ -f "$backup_root_host', '[[ ! -f "$backup_root_host'):
             assert marker not in code_only, (
@@ -149,7 +172,7 @@ class TestBackupRootIsReadThroughAContainer:
         assert 'grep -q "^${attachment_sha256}' not in code_only
 
     def test_ps1_has_no_host_side_file_assertion_on_the_backup_root(self) -> None:
-        code_only = _strip_ps1_comments(CHECK_BACKUP_RESTORE_PS1.read_text())
+        code_only = _strip_ps1_comments(CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8"))
         for marker in (
             "Test-Path -LiteralPath $CopiedAttachment",
             'Join-Path $BackupRoot "attachments/ab/synthetic.txt"',
@@ -162,14 +185,14 @@ class TestBackupRootIsReadThroughAContainer:
             )
 
     def test_both_read_the_backup_root_through_the_restore_test_service(self) -> None:
-        sh = CHECK_BACKUP_RESTORE_SH.read_text()
-        ps1 = CHECK_BACKUP_RESTORE_PS1.read_text()
+        sh = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
+        ps1 = CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8")
         for name, text in (("sh", sh), ("ps1", ps1)):
             assert "run --rm --no-deps -T --user" in text, (
                 f"scripts/check-backup-restore.{name} must run its backup-root "
                 f"assertions inside a container"
             )
-            assert "--entrypoint /bin/bash restore-test" in text, (
+            assert "--entrypoint bash restore-test" in text, (
                 f"scripts/check-backup-restore.{name} must reach the backup "
                 f"root through the restore-test service, which already mounts "
                 f"it read-only and already runs as its owning uid"
@@ -180,7 +203,7 @@ class TestBackupRootIsReadThroughAContainer:
             ("sh", CHECK_BACKUP_RESTORE_SH),
             ("ps1", CHECK_BACKUP_RESTORE_PS1),
         ):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             assert "999 700" in text, (
                 f"scripts/check-backup-restore.{name} must assert that the "
                 f"backup root really is uid-999/0700 - the permission bits are "
@@ -199,9 +222,51 @@ class TestBackupRootIsReadThroughAContainer:
                 f"identical to the property actually holding"
             )
 
+    def test_the_soft_pass_is_gated_on_an_independent_enforcement_probe(self) -> None:
+        """A second review round found the original version of this check
+        conflated two different questions: "does this platform enforce POSIX
+        bits at all" and "did backup.sh get its own chown/chmod right on the
+        real backup root". Collapsing them into one `stat` comparison against
+        the real root meant a genuine regression in backup.sh (a lost
+        `chmod 700`) was indistinguishable from "this platform doesn't
+        enforce permissions" and silently printed SKIP instead of FAIL.
+
+        The fix answers the platform question first, with a disposable
+        scratch fixture unrelated to the real backup root, and only treats a
+        mismatch on the real root as a hard failure once enforcement is
+        independently confirmed. These assertions pin that a scratch probe
+        exists and precedes the real-root comparison - not just that "SKIP"
+        and "999 700" appear somewhere in the file, which the buggy version
+        also satisfied.
+        """
+        for name, path in (
+            ("sh", CHECK_BACKUP_RESTORE_SH),
+            ("ps1", CHECK_BACKUP_RESTORE_PS1),
+        ):
+            code_only = _strip_shell_comments(path.read_text(encoding="utf-8"))
+            assert "tc-enforcement-probe" in code_only, (
+                f"scripts/check-backup-restore.{name} must probe permission "
+                f"enforcement with a scratch fixture independent of the real "
+                f"backup root, so a mismatch on the real root can never be "
+                f"mistaken for 'this platform doesn't enforce permissions'"
+            )
+            # Comments/prose elsewhere in the file explain the OLD, buggy
+            # comparison and legitimately quote "999 700" while doing so -
+            # comparing on code alone finds the actual runtime comparison,
+            # not a mention of it.
+            probe_index = code_only.index("tc-enforcement-probe")
+            real_root_comparison_index = code_only.index('"999 700"')
+            assert probe_index < real_root_comparison_index, (
+                f"scripts/check-backup-restore.{name} must run the "
+                f"platform-enforcement probe BEFORE comparing the real "
+                f"backup root against '999 700' - answering the platform "
+                f"question first is what makes a real-root mismatch a hard "
+                f"failure rather than a silent SKIP"
+            )
+
     def test_both_hand_permissions_back_before_deleting_the_backup_root(self) -> None:
-        sh = CHECK_BACKUP_RESTORE_SH.read_text()
-        ps1 = CHECK_BACKUP_RESTORE_PS1.read_text()
+        sh = CHECK_BACKUP_RESTORE_SH.read_text(encoding="utf-8")
+        ps1 = CHECK_BACKUP_RESTORE_PS1.read_text(encoding="utf-8")
         assert "chown -R $(id -u):$(id -g) /backups" in sh, (
             "scripts/check-backup-restore.sh's cleanup must hand the backup "
             "root back to the invoking uid from inside a container - the host "
@@ -213,10 +278,53 @@ class TestBackupRootIsReadThroughAContainer:
             "root from inside a container for the same reason as the .sh"
         )
         for name, text in (("sh", sh), ("ps1", ps1)):
-            assert "--user 0:0 --entrypoint /bin/bash backup" in text, (
+            assert "--user 0:0 --entrypoint bash backup" in text, (
                 f"scripts/check-backup-restore.{name} must do the handback "
                 f"through the `backup` service - it is the only one that "
                 f"mounts the backup root read-write"
+            )
+
+    def test_every_docker_compose_run_against_the_backup_service_passes_its_profiles(
+        self,
+    ) -> None:
+        """A second review round found every `docker compose run ... backup`
+        call in both scripts failing outright with "no such service:
+        postgres", because `backup`'s own `depends_on: postgres` gets dropped
+        from Compose's resolved model entirely when no matching profile is
+        active - `--no-deps` only skips STARTING a dependency, not resolving
+        whether it exists at all. This had silently no-op'd the permission
+        handback in cleanup on every single run (masked by `|| true`/`*>
+        $null`), invisible on Windows only because Docker Desktop for Windows
+        does not enforce the permissions the handback exists to undo in the
+        first place. Pins that every such call carries the required flags, so
+        a future call site added the same way cannot reintroduce this."""
+        for name, path in (
+            ("sh", CHECK_BACKUP_RESTORE_SH),
+            ("ps1", CHECK_BACKUP_RESTORE_PS1),
+        ):
+            code_only = _strip_shell_comments(path.read_text(encoding="utf-8"))
+            # Every occurrence of "--entrypoint bash backup" (this project's
+            # own way of invoking a one-shot command against the `backup`
+            # service) must be preceded, somewhere on the same logical
+            # docker-compose invocation, by the required profile flags.
+            # Checking the whole file for at least one occurrence of the
+            # paired pattern is enough here: both current call sites (the
+            # cleanup handback and, on the .sh, backup_root_write_exec) are
+            # the only two ways this project invokes the `backup` service
+            # this way, and both must carry the flags identically.
+            entrypoint_count = code_only.count("--entrypoint bash backup")
+            assert entrypoint_count >= 1, (
+                f"scripts/check-backup-restore.{name} should invoke the "
+                f"`backup` service via --entrypoint bash at least once"
+            )
+            profile_flagged_count = code_only.count("--profile core --profile backup")
+            assert profile_flagged_count >= entrypoint_count, (
+                f"scripts/check-backup-restore.{name} has {entrypoint_count} "
+                f"call(s) targeting the `backup` service via --entrypoint but "
+                f"only {profile_flagged_count} carrying '--profile core "
+                f"--profile backup' - every `docker compose run` against a "
+                f"profile-gated service needs its profiles even with "
+                f"--no-deps, or it fails with 'no such service: postgres'"
             )
 
 
@@ -238,7 +346,7 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
     """
 
     def test_the_privilege_drop_is_a_fork_not_a_one_way_exec(self) -> None:
-        text = BACKUP_SH.read_text()
+        text = BACKUP_SH.read_text(encoding="utf-8")
         code_only = _strip_shell_comments(text)
         assert "exec gosu" not in code_only, (
             "backup.sh must not `exec gosu` into the database phase: root has "
@@ -251,7 +359,7 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
         )
 
     def test_root_waits_for_the_snapshot_signal_before_copying(self) -> None:
-        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        code_only = _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
         wait_index = code_only.index("read -r -t 5 -u 3 snapshot_signal")
         copy_index = code_only.index("cp -au --parents -t")
         assert wait_index < copy_index, (
@@ -261,7 +369,7 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
         )
 
     def test_the_child_signals_only_after_exporting_the_snapshot(self) -> None:
-        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        code_only = _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
         export_index = code_only.index("SELECT pg_export_snapshot();")
         # The specific write, not the bare redirection: root's own
         # `exec 3<>"$snapshot_ready_fifo"` also contains that substring and
@@ -274,8 +382,10 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
         )
 
     def test_the_manifest_waits_for_the_copy_to_finish(self) -> None:
-        code_only = _strip_shell_comments(BACKUP_SH.read_text())
-        wait_index = code_only.index("read -r -t 600 -u 5 _copy_signal")
+        code_only = _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
+        wait_index = code_only.index(
+            'read -r -t "$copy_complete_timeout_seconds" -u 5 _copy_signal'
+        )
         manifest_index = code_only.index("find . -type f -print0 | sort -z | xargs -0 sha256sum")
         assert wait_index < manifest_index, (
             "backup.sh's database phase must block on 'copy complete' before "
@@ -284,7 +394,7 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
         )
 
     def test_in_flight_blob_temp_files_are_excluded_from_the_copy(self) -> None:
-        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        code_only = _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
         assert "! -name '.incoming-*'" in code_only, (
             "backup.sh must exclude BlobStore.put's in-flight temp files "
             "(mkstemp prefix '.incoming-') from the copy: they are never "
@@ -297,7 +407,7 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
             ("sh", CHECK_BACKUP_RESTORE_SH),
             ("ps1", CHECK_BACKUP_RESTORE_PS1),
         ):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             assert "INSERT INTO blobs" in text, (
                 f"scripts/check-backup-restore.{name}'s round 2 must commit "
                 f"real `blobs` rows concurrently with the backup - a writer "
@@ -319,14 +429,14 @@ class TestAttachmentCopyHappensAfterTheSnapshot:
 
 class TestEmbeddingSidecarNetworkIsolation:
     def test_base_compose_file_declares_an_internal_embedding_network(self) -> None:
-        text = DOCKER_COMPOSE_YML.read_text()
+        text = DOCKER_COMPOSE_YML.read_text(encoding="utf-8")
         assert "embedding:\n    internal: true" in text, (
             "deploy/compose/docker-compose.yml must declare a top-level "
             "'embedding' network with internal: true"
         )
 
     def test_embedding_sidecar_is_attached_only_to_the_embedding_network(self) -> None:
-        text = DOCKER_COMPOSE_YML.read_text()
+        text = DOCKER_COMPOSE_YML.read_text(encoding="utf-8")
         start = text.index("  embedding-sidecar:")
         # The next top-level (exactly 2-space-indented, non-blank) service
         # key ends this service's own block. A plain "\n  " substring search
@@ -345,7 +455,7 @@ class TestEmbeddingSidecarNetworkIsolation:
         )
 
     def test_contract_test_overlay_adds_a_second_non_internal_network(self) -> None:
-        text = EMBEDDING_CONTRACT_TEST_YML.read_text()
+        text = EMBEDDING_CONTRACT_TEST_YML.read_text(encoding="utf-8")
         assert "networks: [embedding, embedding-contract-test]" in text, (
             "the contract-test overlay must attach embedding-sidecar to a "
             "second, non-internal network for its own published port to "
@@ -367,7 +477,7 @@ class TestRestoreTestNetworkIsolation:
     """
 
     def _compose(self) -> dict[str, Any]:
-        return cast("dict[str, Any]", yaml.safe_load(RESTORE_TEST_YML.read_text()))
+        return cast("dict[str, Any]", yaml.safe_load(RESTORE_TEST_YML.read_text(encoding="utf-8")))
 
     def test_the_declared_network_is_internal(self) -> None:
         networks = self._compose()["networks"]
@@ -395,11 +505,39 @@ class TestRestoreTestNetworkIsolation:
     def test_restore_test_states_that_its_integrity_evidence_is_self_declared(
         self,
     ) -> None:
-        text = RESTORE_TEST_SH.read_text()
-        assert "does not defend against a tampered backup" in text.replace("\n# ", " "), (
+        text = RESTORE_TEST_SH.read_text(encoding="utf-8")
+        normalized = _normalize_comment_prose(text)
+        assert "does not defend against a tampered backup" in normalized, (
             "deploy/compose/backup/restore-test.sh's header must say plainly "
             "that its checksums live beside the dump they describe, so a green "
             "run is not provenance - signed backups are deferred behind "
             "docs/DESIGN.md 19's key-custody decision, and an operator must not "
             "read the deferral as 'already handled'"
+        )
+        assert "does NOT sandbox local execution" in normalized, (
+            "deploy/compose/backup/restore-test.sh's header must also say "
+            "that network isolation is not an execution sandbox - pg_restore "
+            "runs a tampered dump's SQL as the scratch cluster's own "
+            "superuser, so an operator must not read 'internal: true' as "
+            "'safe to restore anything'"
+        )
+
+    def test_operating_md_states_the_same_caveat_operators_actually_read(
+        self,
+    ) -> None:
+        """A review found the threat note lived only in restore-test.sh's
+        header, which operators are unlikely to open - the network fix could
+        regress its documentation in docs/OPERATING.md (what an operator
+        actually reads before restoring) while this suite stayed green,
+        because nothing guarded that surface. This guards it too."""
+        normalized = " ".join(OPERATING_MD.read_text(encoding="utf-8").split())
+        assert "is not provenance" in normalized, (
+            "docs/OPERATING.md must state, next to the restore instructions, "
+            "that a green restore-test is not provenance"
+        )
+        assert "does NOT sandbox local execution" in normalized, (
+            "docs/OPERATING.md must also carry the local-execution caveat, "
+            "not only the network-egress one - an operator who reads only "
+            "'internal: true network' could otherwise conclude restoring an "
+            "untrusted dump is safe outright"
         )

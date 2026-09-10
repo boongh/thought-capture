@@ -110,7 +110,7 @@ if ($BackupRoot -eq $RealBackupRootDefault) {
 # file never goes through argv encoding at all.
 $AssertScriptDir = Join-Path ([System.IO.Path]::GetTempPath()) "tc-check-assert-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $AssertScriptDir -ErrorAction Stop | Out-Null
-$AssertScriptDir = $AssertScriptDir -replace '\', '/'
+$AssertScriptDir = $AssertScriptDir -replace '\\', '/'
 
 function Write-AssertScript {
     param([string]$Name, [string]$Body)
@@ -150,9 +150,21 @@ function Invoke-Cleanup {
     # remaining lifetime is the delete on the next line. The `backup` service
     # is the one that mounts the backup root read-write; `restore-test`
     # mounts it :ro and so cannot change it.
+    #
+    # `--profile core --profile backup` is REQUIRED even with `--no-deps` - a
+    # second review round found this call failing outright with "no such
+    # service: postgres" without it (Compose drops a profile-gated service's
+    # `depends_on` target from the resolved model entirely when no matching
+    # profile is active; `--no-deps` only skips STARTING a dependency, not
+    # resolving whether it exists). This had been silently failing every run
+    # on THIS platform without anyone noticing, because Docker Desktop for
+    # Windows does not enforce the permissions this handback exists to undo
+    # in the first place - the delete below still succeeded regardless of
+    # whether the chmod ever ran.
     if ($BackupHasRun) {
         docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
-            run --rm --no-deps -T --user 0:0 --entrypoint /bin/bash backup `
+            --profile core --profile backup `
+            run --rm --no-deps -T --user 0:0 --entrypoint bash backup `
             -c "chmod -R a+rwX /backups" *> $null
     }
     & "$PSScriptRoot/compose-teardown.ps1" --env-file $EnvFile -p $RestoreProject `
@@ -252,6 +264,10 @@ try {
     # these need the scratch database; `-T` because there is no TTY in CI.
     # -------------------------------------------------------------------
     function Invoke-BackupRootExec {
+        # Reads only: `restore-test` mounts the backup root `:ro`
+        # (deploy/compose/backup.restore-test.docker-compose.yml) - a write
+        # here fails regardless of uid. Use Invoke-BackupRootWriteExec below
+        # for anything that writes.
         param(
             [Parameter(Mandatory)][string]$AsUser,
             [Parameter(Mandatory)][string]$ScriptName,
@@ -260,7 +276,25 @@ try {
         docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `
             run --rm --no-deps -T --user $AsUser `
             -v "${AssertScriptDir}:/assert:ro" @ExtraArgs `
-            --entrypoint /bin/bash restore-test "/assert/$ScriptName"
+            --entrypoint bash restore-test "/assert/$ScriptName"
+    }
+
+    function Invoke-BackupRootWriteExec {
+        # Same calling convention, but through the `backup` service instead
+        # of `restore-test`: `backup` is the only service that mounts the
+        # backup root read-write. `--profile core --profile backup` is
+        # required even with `--no-deps` - see Invoke-Cleanup's own use of
+        # this same pattern for why.
+        param(
+            [Parameter(Mandatory)][string]$AsUser,
+            [Parameter(Mandatory)][string]$ScriptName,
+            [string[]]$ExtraArgs = @()
+        )
+        docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
+            --profile core --profile backup `
+            run --rm --no-deps -T --user $AsUser `
+            -v "${AssertScriptDir}:/assert:ro" @ExtraArgs `
+            --entrypoint bash backup "/assert/$ScriptName"
     }
 
     Write-AssertScript "stat-backup-root.sh" @'
@@ -269,6 +303,18 @@ stat -c '%u %a' /backups
 
     Write-AssertScript "probe-unrelated-uid.sh" @'
 if cat /backups/latest.txt >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi
+'@
+
+    Write-AssertScript "write-enforcement-probe.sh" @'
+echo enforcement-probe >/backups/.tc-enforcement-probe && chown 4242:4242 /backups/.tc-enforcement-probe && chmod 600 /backups/.tc-enforcement-probe && echo PROBE-WRITTEN
+'@
+
+    Write-AssertScript "read-enforcement-probe.sh" @'
+if cat /backups/.tc-enforcement-probe >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi
+'@
+
+    Write-AssertScript "remove-enforcement-probe.sh" @'
+rm -f /backups/.tc-enforcement-probe
 '@
 
     Write-AssertScript "assert-attachment.sh" @'
@@ -298,26 +344,76 @@ echo "OK: seeded attachment present and hash-valid after backup"
 '@
 
     # -------------------------------------------------------------------
-    # Permission property (review finding F1, step 1). backup.sh's closing
-    # `chmod 700` is a real security property on Linux - the backup contains
-    # the full plaintext database and every attachment - so assert it
-    # deliberately instead of leaving it as the accident that used to break
-    # this pair of scripts. An unrelated, non-root uid must not be able to
-    # read even `latest.txt`.
+    # Permission property (review finding F1, step 1; corrected by a second
+    # review round after this script's own first version conflated two
+    # different questions). backup.sh's closing `chmod 700` is a real
+    # security property on Linux - the backup contains the full plaintext
+    # database and every attachment - so assert it deliberately instead of
+    # leaving it as the accident that used to break this pair of scripts. An
+    # unrelated, non-root uid must not be able to read even `latest.txt`.
     #
-    # Soft-passes where the bind mount does not enforce POSIX bits at all
-    # (Docker Desktop for Windows, i.e. almost every run of THIS script), and
-    # says so rather than passing silently: there the property is untestable,
-    # not satisfied. CI runs check-backup-restore.sh on Linux, where it is
-    # asserted for real.
+    # The two questions, kept deliberately separate:
+    #   (a) Does THIS PLATFORM's bind mount enforce POSIX ownership/mode at
+    #       all?
+    #   (b) Given that it does, did backup.sh actually leave the REAL backup
+    #       root at the correct 999/700?
+    #
+    # The original version of this check collapsed both into one comparison
+    # (stat the real backup root, soft-pass on anything but "999 700") -
+    # which meant a real regression in backup.sh's own chown/chmod was
+    # indistinguishable from "this platform doesn't enforce permissions" and
+    # silently printed SKIP instead of failing. (a) is answered first,
+    # independently, with a disposable scratch fixture that has nothing to do
+    # with the real backup root; only once enforcement is confirmed does this
+    # treat a mismatch on the real backup root as a hard failure.
+    #
+    # The probe file is written and chowned as ROOT (0:0) through the
+    # `backup` service (the only one with a read-write mount): by this point
+    # the backup root is already uid-999/mode-700 from the real backup that
+    # just ran, so a non-root uid could never write into it at all regardless
+    # of platform - only root's own privilege bypasses that check, the same
+    # way backup.sh's own root phase does. It is then read back as an
+    # UNRELATED uid (5252, neither root nor the 4242 it is chowned to)
+    # through `restore-test`.
     # -------------------------------------------------------------------
-    Write-Host "--- asserting the backup root is unreadable to an unrelated non-root uid" -ForegroundColor Cyan
-    $BackupRootOwnership = (Invoke-BackupRootExec -AsUser "0:0" -ScriptName "stat-backup-root.sh" 2>$null |
+    Write-Host "--- probing whether this platform enforces POSIX ownership/mode across the bind mount" -ForegroundColor Cyan
+    $EnforcementProbeWritten = (Invoke-BackupRootWriteExec -AsUser "0:0" -ScriptName "write-enforcement-probe.sh" 2>$null |
         Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
-    if ($BackupRootOwnership -ne "999 700") {
-        Write-Host "SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount (saw '$BackupRootOwnership', expected '999 700') - the restrictive-permission property cannot be asserted here; CI on Linux does assert it"
+    if ($EnforcementProbeWritten -ne "PROBE-WRITTEN") {
+        throw "could not write the permission-enforcement probe file through a container - the probe did not run"
+    }
+    $EnforcementHoldsVerdict = (Invoke-BackupRootExec -AsUser "5252:5252" -ScriptName "read-enforcement-probe.sh" 2>$null |
+        Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
+    Invoke-BackupRootWriteExec -AsUser "0:0" -ScriptName "remove-enforcement-probe.sh" *> $null
+    if (-not $EnforcementHoldsVerdict) {
+        throw "could not read the permission-enforcement probe back through a container - the probe did not run"
+    }
+
+    Write-Host "--- asserting the backup root is unreadable to an unrelated non-root uid" -ForegroundColor Cyan
+    if ($EnforcementHoldsVerdict -ne "NOT-READABLE") {
+        # Question (a) answered NO: this bind mount does not enforce POSIX
+        # bits for a container running as an unrelated uid at all (Docker
+        # Desktop for Windows, i.e. almost every run of THIS script). The
+        # real backup root's permissions cannot be asserted here - loudly
+        # SKIP rather than silently pass, and rather than mistake this for a
+        # regression in backup.sh, which is a separate question this
+        # platform cannot answer either way. CI runs check-backup-restore.sh
+        # on Linux, where it is asserted for real.
+        Write-Host "SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount at all (an unrelated uid could read a freshly-created 0600 file) - the restrictive-permission property cannot be asserted here; CI on Linux does assert it"
     }
     else {
+        # Question (a) answered YES: enforcement demonstrably works on this
+        # platform, so a mismatch on the REAL backup root from here on is a
+        # real regression in backup.sh, not a platform limitation - hard
+        # failure, no soft pass.
+        $BackupRootOwnership = (Invoke-BackupRootExec -AsUser "0:0" -ScriptName "stat-backup-root.sh" 2>$null |
+            Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
+        if (-not $BackupRootOwnership) {
+            throw "could not read the backup root's ownership through a container - the permission probe did not run"
+        }
+        if ($BackupRootOwnership -ne "999 700") {
+            throw "the backup root is not uid-999/mode-700 (saw '$BackupRootOwnership') on a platform that enforces POSIX permissions - backup.sh must leave it readable only by its owner"
+        }
         $UnrelatedUidVerdict = (Invoke-BackupRootExec -AsUser "4242:4242" -ScriptName "probe-unrelated-uid.sh" 2>$null |
             Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
         if ($UnrelatedUidVerdict -ne "NOT-READABLE") {

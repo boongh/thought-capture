@@ -110,21 +110,36 @@ TC_DISCORD_OWNER_USER_ID=100000000000000001
 TC_BACKUP_ROOT=$backup_root_compose_value
 ENV
 
-# MSYS argument conversion, disabled for every `docker`/`docker compose`
-# invocation below that passes a container-side absolute path as an ARGUMENT
-# (`--entrypoint /bin/bash`, and script text containing `/data/...`). Confirmed
-# directly on this platform: Git Bash rewrites a leading-slash argv element
-# into a Windows path before the native `docker.exe` ever sees it, so
-# `--entrypoint /bin/bash` arrives as `C:/Program Files/Git/bin/bash` and the
-# container fails to start with `stat C:/Program: no such file or directory`.
-# The compose files themselves are unaffected - a path inside YAML is file
-# CONTENT, never argv - which is why only the CLI-level invocations carry this.
-# Both variable spellings: MSYS_NO_PATHCONV is Git for Windows', and
-# MSYS2_ARG_CONV_EXCL is MSYS2's; on Linux both are simply unused.
-no_path_conv=(env MSYS_NO_PATHCONV=1 "MSYS2_ARG_CONV_EXCL=*")
+# PLATFORM TRAP - argv path translation. Every `--entrypoint` below names
+# `bash`, never `/bin/bash`, and that is load-bearing rather than a style
+# choice. Confirmed directly on this platform: Git Bash rewrites a
+# leading-slash argv element into a Windows path before the native
+# `docker.exe` ever sees it, so a `--entrypoint /bin/bash` arrives as
+# `C:/Program Files/Git/bin/bash` and the container refuses to start with
+# `stat C:/Program: no such file or directory`. A bare `bash` has no leading
+# slash, is never rewritten, and resolves on PATH inside every image used
+# here. Blanket-disabling the translation (MSYS_NO_PATHCONV /
+# MSYS2_ARG_CONV_EXCL) was tried first and is worse: it also stops the
+# translation this script DEPENDS on for `--env-file "$env_file"`, whose
+# `mktemp` path must be translated, and that failed with
+# `couldn't find env file: C:\tmp\tmp.XXXX`. The compose files themselves are
+# unaffected either way - a path inside YAML is file CONTENT, never argv -
+# which is why only these CLI-level invocations care.
 
 cleanup() {
   docker rm -f "$blob_writer_container" >/dev/null 2>&1 || true
+  # The `thoughts` writer subshell (round 2) loops until `$writer_stop_file`
+  # exists, which is only ever created on round 2's own success path. Any
+  # failure between starting it and that point - including round 2's backup
+  # itself failing, which is exactly the scenario this round exists to
+  # exercise - would otherwise leave an orphaned infinite loop invoking
+  # `docker compose exec` against a project this same cleanup is tearing
+  # down. Guarded on the variable being set: cleanup also runs on every exit
+  # path before round 2 ever starts the writer.
+  if [[ -n "${writer_pid:-}" ]]; then
+    kill "$writer_pid" 2>/dev/null || true
+    wait "$writer_pid" 2>/dev/null || true
+  fi
   # Ownership handback FIRST (review finding F1). backup.sh leaves this tree
   # owned by uid 999, mode 0700; on Linux the invoking user genuinely cannot
   # delete inside it, so every run used to leave a
@@ -133,9 +148,23 @@ cleanup() {
   # `backup` service is the one that mounts the backup root read-write;
   # `restore-test` mounts it :ro and so cannot chown it. Numeric ids, not
   # names: the invoking uid has no passwd entry inside the container.
+  #
+  # `--profile core --profile backup` is REQUIRED even with `--no-deps` - a
+  # second review round found this call failing outright with "no such
+  # service: postgres" without it, because Compose drops a profile-gated
+  # service (`backup`'s own `depends_on: postgres`) from the resolved model
+  # entirely when no matching profile is active, and `--no-deps` only skips
+  # STARTING a dependency, not resolving whether it exists. This had been
+  # silently failing every run (masked by `|| true`), invisible on Windows
+  # only because Docker Desktop for Windows does not enforce the permissions
+  # this handback exists to undo in the first place - `rm -rf` below still
+  # succeeded regardless of whether the chown ever ran. On real Linux CI,
+  # where the permissions ARE enforced, this would have left every run's
+  # backup root behind uncleaned.
   if [[ "$backup_has_run" -eq 1 ]]; then
-    "${no_path_conv[@]}" docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
-      run --rm --no-deps -T --user 0:0 --entrypoint /bin/bash backup \
+    docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+      --profile core --profile backup \
+      run --rm --no-deps -T --user 0:0 --entrypoint bash backup \
       -c "chown -R $(id -u):$(id -g) /backups && chmod -R u+rwX /backups" \
       >/dev/null 2>&1 || true
   fi
@@ -213,33 +242,119 @@ docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
 backup_root_exec() {
   # $1 = --user value, remaining args before the trailing script are extra
   # `docker compose run` flags. The last argument is the bash script text.
+  #
+  # Reads only: `restore-test` mounts the backup root `:ro`
+  # (deploy/compose/backup.restore-test.docker-compose.yml) - a write here
+  # fails with EROFS regardless of uid. Use `backup_root_write_exec` below for
+  # anything that writes.
   local as_user="$1"
   shift
   local script="${!#}"
   local flags=("${@:1:$#-1}")
-  "${no_path_conv[@]}" docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
-    run --rm --no-deps -T --user "$as_user" "${flags[@]}" \
-    --entrypoint /bin/bash restore-test -c "$script"
+  # "${flags[@]+"${flags[@]}"}", not a bare "${flags[@]}": bash before 4.4
+  # treats expanding an empty array under `set -u` as an unbound-variable
+  # error, and the first call site below (the ownership/enforcement probes)
+  # passes no extra flags at all.
+  docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
+    run --rm --no-deps -T --user "$as_user" ${flags[@]+"${flags[@]}"} \
+    --entrypoint bash restore-test -c "$script"
+}
+
+backup_root_write_exec() {
+  # Same calling convention as `backup_root_exec`, but through the `backup`
+  # service instead of `restore-test`: `backup` is the only service that
+  # mounts the backup root read-write (deploy/compose/docker-compose.yml) -
+  # the same reason cleanup's ownership handback below uses it rather than
+  # `restore-test`. `--profile core --profile backup` is required even with
+  # `--no-deps` - see the long comment on cleanup's own use of this same
+  # pattern for why (Compose drops a profile-gated service's dependency from
+  # the resolved model entirely, "no such service: postgres", unless a
+  # matching profile is active).
+  local as_user="$1"
+  shift
+  local script="${!#}"
+  local flags=("${@:1:$#-1}")
+  docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+    --profile core --profile backup \
+    run --rm --no-deps -T --user "$as_user" ${flags[@]+"${flags[@]}"} \
+    --entrypoint bash backup -c "$script"
 }
 
 # ---------------------------------------------------------------------------
-# Permission property (review finding F1, step 1). backup.sh's closing
-# `chmod 700` is a real security property on Linux - the backup contains the
-# full plaintext database and every attachment - so assert it deliberately
-# instead of leaving it as the accident that used to break this script. An
-# unrelated, non-root uid must not be able to read even `latest.txt`.
+# Permission property (review finding F1, step 1; corrected by a second review
+# round after this script's own first version conflated two different
+# questions). backup.sh's closing `chmod 700` is a real security property on
+# Linux - the backup contains the full plaintext database and every
+# attachment - so assert it deliberately instead of leaving it as the
+# accident that used to break this script. An unrelated, non-root uid must
+# not be able to read even `latest.txt`.
 #
-# Soft-passes where the bind mount does not enforce POSIX bits at all (Docker
-# Desktop for Windows), and says so rather than passing silently: on that
-# platform the property is untestable, not satisfied. CI runs on Linux, where
-# it is asserted for real.
+# The two questions, kept deliberately separate:
+#   (a) Does THIS PLATFORM's bind mount enforce POSIX ownership/mode at all?
+#   (b) Given that it does, did backup.sh actually leave the REAL backup root
+#       at the correct 999/700?
+#
+# The original version of this check collapsed both into one comparison
+# (`stat` the real backup root, soft-pass on anything but "999 700") - which
+# meant a real regression in backup.sh's own chown/chmod (say, a lost
+# `chmod 700`) was INDISTINGUISHABLE from "this platform doesn't enforce
+# permissions" and silently printed SKIP instead of FAIL. (a) is answered
+# first, independently, with a disposable scratch fixture that has nothing to
+# do with the real backup root; only once enforcement is confirmed does this
+# treat a mismatch on the real backup root as a hard failure.
 # ---------------------------------------------------------------------------
+printf -- '--- probing whether this platform enforces POSIX ownership/mode across the bind mount\n'
+# A throwaway probe file, unrelated to anything backup.sh writes. Written and
+# chowned as ROOT (0:0) through the `backup` service (the only one with a
+# read-write mount on the backup root) - by this point in the script the
+# backup root is already uid-999/mode-700 from the real backup that just ran,
+# so a non-root uid could never write into it at all regardless of platform;
+# only root's own privilege bypasses that check the same way backup.sh's own
+# root phase does. The probe is then read back as an UNRELATED uid (5252,
+# neither root nor the 4242 it is chowned to) through `restore-test` (whose
+# read-only mount is fine for reading). Whether 5252 can read it answers
+# question (a) on its own - it says nothing about whether backup.sh got its
+# own chown/chmod right.
+enforcement_probe_verdict="$(backup_root_write_exec 0:0 \
+  'echo enforcement-probe >/backups/.tc-enforcement-probe && chown 4242:4242 /backups/.tc-enforcement-probe && chmod 600 /backups/.tc-enforcement-probe && echo PROBE-WRITTEN' \
+  2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+if [[ "$enforcement_probe_verdict" != "PROBE-WRITTEN" ]]; then
+  printf 'FAIL: could not write the permission-enforcement probe file through a container - the probe did not run\n' >&2
+  exit 1
+fi
+enforcement_holds_verdict="$(backup_root_exec 5252:5252 \
+  'if cat /backups/.tc-enforcement-probe >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi' \
+  2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+backup_root_write_exec 0:0 'rm -f /backups/.tc-enforcement-probe' >/dev/null 2>&1 || true
+if [[ -z "$enforcement_holds_verdict" ]]; then
+  printf 'FAIL: could not read the permission-enforcement probe back through a container - the probe did not run\n' >&2
+  exit 1
+fi
+
 printf -- '--- asserting the backup root is unreadable to an unrelated non-root uid\n'
-backup_root_ownership="$(backup_root_exec 0:0 "stat -c '%u %a' /backups" 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
-if [[ "$backup_root_ownership" != "999 700" ]]; then
-  printf 'SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount (saw %s, expected "999 700") - the restrictive-permission property cannot be asserted here; CI on Linux does assert it\n' \
-    "\"$backup_root_ownership\""
+if [[ "$enforcement_holds_verdict" != "NOT-READABLE" ]]; then
+  # Question (a) answered NO: this bind mount does not enforce POSIX bits for
+  # a container running as an unrelated uid at all (Docker Desktop for
+  # Windows). The real backup root's permissions cannot be asserted here -
+  # loudly SKIP rather than silently pass, and rather than mistake this for a
+  # regression in backup.sh, which is a separate question this platform
+  # cannot answer either way.
+  printf 'SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount at all (an unrelated uid could read a freshly-created 0600 file) - the restrictive-permission property cannot be asserted here; CI on Linux does assert it\n'
 else
+  # Question (a) answered YES: enforcement demonstrably works on this
+  # platform, so a mismatch on the REAL backup root from here on is a real
+  # regression in backup.sh, not a platform limitation - hard FAIL, no soft
+  # pass.
+  backup_root_ownership="$(backup_root_exec 0:0 "stat -c '%u %a' /backups" 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+  if [[ -z "$backup_root_ownership" ]]; then
+    printf 'FAIL: could not read the backup root'"'"'s ownership through a container - the permission probe did not run\n' >&2
+    exit 1
+  fi
+  if [[ "$backup_root_ownership" != "999 700" ]]; then
+    printf 'FAIL: the backup root is not uid-999/mode-700 (saw "%s") on a platform that enforces POSIX permissions - backup.sh must leave it readable only by its owner\n' \
+      "$backup_root_ownership" >&2
+    exit 1
+  fi
   unrelated_uid_verdict="$(backup_root_exec 4242:4242 'if cat /backups/latest.txt >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi' 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
   if [[ "$unrelated_uid_verdict" != "NOT-READABLE" ]]; then
     printf 'FAIL: uid 4242 could read the backup root (%s) - backup.sh must leave it readable only by its owner\n' \
@@ -419,7 +534,7 @@ writer_pid=$!
 # cannot be reused for this.
 # ---------------------------------------------------------------------------
 docker rm -f "$blob_writer_container" >/dev/null 2>&1 || true
-"${no_path_conv[@]}" docker run -d --name "$blob_writer_container" \
+docker run -d --name "$blob_writer_container" \
   --network "${backup_project}_default" \
   -v "${backup_project}_attachments:/data/attachments" \
   -e PGPASSWORD=check-only-not-a-real-secret \

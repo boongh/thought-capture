@@ -22,6 +22,15 @@ set -euo pipefail
 
 backup_root="/backups"
 attachments_source="/data/attachments"
+# How long the database phase waits for root's attachment copy before failing
+# the backup outright (review finding, second round: the original fixed 600s
+# turned a slow-but-correct copy - e.g. the FIRST backup of a large
+# attachments tree over a bind mount - into a total backup loss, discarding
+# an already-complete dump/row-counts/grants for want of a few more minutes
+# of `cp`). Configurable rather than raised outright: the right value depends
+# on attachment volume and host I/O, which this script cannot know in
+# advance.
+copy_complete_timeout_seconds="${TC_BACKUP_COPY_TIMEOUT_SECONDS:-600}"
 
 # Two phases, two users, one process tree.
 #
@@ -158,7 +167,13 @@ if [[ "$(id -u)" -eq 0 ]] && [[ "$db_phase" -eq 0 ]]; then
     fi
     waited=$((waited + 5))
   done
-  if [[ -z "$snapshot_signal" ]]; then
+  # Exact match, not merely non-empty: a `read -t` that times out mid-line
+  # still returns non-zero (so the loop above does not `break` on it) but
+  # leaves whatever partial bytes it had already buffered in the variable -
+  # so a non-empty `$snapshot_signal` here does not by itself prove a
+  # complete, correct signal was received. Checking the literal expected text
+  # closes that gap and is self-documenting besides.
+  if [[ "$snapshot_signal" != "snapshot-ready" ]]; then
     kill "$db_phase_pid" 2>/dev/null || true
     wait "$db_phase_pid" 2>/dev/null || true
     echo "FAIL: the database phase did not signal 'snapshot exported' within 300s" >&2
@@ -211,6 +226,18 @@ mkdir -p "$backup_root"
 # invocation would silently produce a dump with no attachment copy behind it.
 if [[ -z "${TC_BACKUP_HANDSHAKE_DIR:-}" ]]; then
   echo "FAIL: the database phase was started without a handshake directory - it must be forked by this script's own root phase, never invoked directly" >&2
+  exit 1
+fi
+# Also refuses to run without the LOCK the root phase holds (review finding,
+# second round): a bare `TC_BACKUP_HANDSHAKE_DIR=... bash backup.sh
+# --db-phase` pointed at a self-supplied directory would otherwise pass the
+# check above while running outside the flock entirely - able to race a real
+# backup's `latest.txt` write, the exact corruption the lock exists to
+# prevent. fd 200 only exists here if it was inherited from the root phase's
+# `exec 200>"$lock_file"` across the `gosu` exec below, which is exactly the
+# invariant this phase depends on; a direct invocation has no such fd.
+if [[ ! -e /proc/self/fd/200 ]]; then
+  echo "FAIL: the database phase does not hold the backup lock (fd 200) - it must be forked by this script's own root phase, never invoked directly" >&2
   exit 1
 fi
 snapshot_ready_fifo="$TC_BACKUP_HANDSHAKE_DIR/snapshot-ready"
@@ -426,10 +453,10 @@ fi
 # Read-write open for the same reason root uses one: a read-only open on a
 # FIFO blocks before `read -t` ever starts counting, which would make this
 # wait unbounded in exactly the case it exists to survive.
-echo "--- attachments: waiting for the root-phase copy to complete"
+echo "--- attachments: waiting for the root-phase copy to complete (up to ${copy_complete_timeout_seconds}s)"
 exec 5<>"$copy_complete_fifo"
-if ! read -r -t 600 -u 5 _copy_signal; then
-  echo "FAIL: the root phase did not signal 'copy complete' within 600s - refusing to write a manifest that may not describe the copied tree" >&2
+if ! read -r -t "$copy_complete_timeout_seconds" -u 5 _copy_signal; then
+  echo "FAIL: the root phase did not signal 'copy complete' within ${copy_complete_timeout_seconds}s - refusing to write a manifest that may not describe the copied tree. If the attachments tree is large and the copy is genuinely still running, raise TC_BACKUP_COPY_TIMEOUT_SECONDS rather than retrying blindly." >&2
   exit 1
 fi
 
