@@ -34,6 +34,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any, cast
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,6 +47,8 @@ EMBEDDING_CONTRACT_TEST_YML = (
     REPO_ROOT / "deploy" / "compose" / "embedding-sidecar.contract-test.docker-compose.yml"
 )
 BACKUP_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "backup.sh"
+RESTORE_TEST_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "restore-test.sh"
+RESTORE_TEST_YML = REPO_ROOT / "deploy" / "compose" / "backup.restore-test.docker-compose.yml"
 
 # The exact fallback the review found: reading TC_BACKUP_ROOT with a default
 # of the real backup directory silently redirects onto the operator's real
@@ -348,3 +353,53 @@ class TestEmbeddingSidecarNetworkIsolation:
             "container's published host port (verified on Docker 29.2.1)"
         )
         assert "embedding-contract-test:\n    driver: bridge" in text
+
+
+class TestRestoreTestNetworkIsolation:
+    """Finding F5. The restore-validation stack declared no `networks:` at all,
+    so both services landed on Compose's implicit `default` bridge, which has a
+    gateway and full outbound NAT - while that job restores a dump whose only
+    integrity evidence is a checksum stored in the same mutable directory as
+    the dump, and then runs `pg_restore` over it. Parsed rather than
+    grepped: a service that silently loses its `networks:` key rejoins
+    `default` and undoes the fix without changing any string these tests would
+    otherwise match.
+    """
+
+    def _compose(self) -> dict[str, Any]:
+        return cast("dict[str, Any]", yaml.safe_load(RESTORE_TEST_YML.read_text()))
+
+    def test_the_declared_network_is_internal(self) -> None:
+        networks = self._compose()["networks"]
+        assert list(networks) == ["restore-test"], (
+            "deploy/compose/backup.restore-test.docker-compose.yml must declare "
+            "exactly one network, so a service cannot join a second, "
+            "egress-capable one by accident"
+        )
+        assert networks["restore-test"]["internal"] is True, (
+            "the restore-test network must be internal: true - nothing in this "
+            "stack has any reason to reach the internet, and it handles a dump "
+            "whose provenance nothing here can verify"
+        )
+
+    def test_every_service_joins_that_network_and_only_that_network(self) -> None:
+        services = self._compose()["services"]
+        assert set(services) == {"postgres-scratch", "restore-test"}
+        for name, service in services.items():
+            assert service.get("networks") == ["restore-test"], (
+                f"{name} must declare `networks: [restore-test]` - a service "
+                f"without a networks: key silently rejoins the egress-capable "
+                f"`default` network and undoes the isolation"
+            )
+
+    def test_restore_test_states_that_its_integrity_evidence_is_self_declared(
+        self,
+    ) -> None:
+        text = RESTORE_TEST_SH.read_text()
+        assert "does not defend against a tampered backup" in text.replace("\n# ", " "), (
+            "deploy/compose/backup/restore-test.sh's header must say plainly "
+            "that its checksums live beside the dump they describe, so a green "
+            "run is not provenance - signed backups are deferred behind "
+            "docs/DESIGN.md 19's key-custody decision, and an operator must not "
+            "read the deferral as 'already handled'"
+        )

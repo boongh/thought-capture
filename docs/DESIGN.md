@@ -1102,6 +1102,7 @@ Only on owner request: choose provider, TLS/private access, monitoring, encrypte
 
 - Exact model slugs: select during implementation by a small structured-output evaluation and budget check.
 - Off-site backup provider: select before VPS or after one month of valued data, whichever comes first.
+- Signed/authenticated backups (`age`, section 12.2): deferred behind the same key-custody decision as the off-site provider above - authenticated encryption is meaningless while there is no decided answer to where the private key lives. Until then, `restore-test`'s integrity evidence is self-declared (checksums stored beside the dump they describe), which defends against corruption at rest but not tampering; the current mitigation is that the restore-validation stack runs on an `internal: true` network with no gateway. **Any restore of a backup that has been off this host is gated on this decision**, not on a green restore-test.
 - Reranking and document chunking for semantic search: explicitly deferred by `docs/adr/0010`; revisit only if golden-set retrieval quality proves insufficient without them.
 - Cloud embedding adapter: designed for (`EmbeddingPort`, `docs/adr/0010` §4) but not built; trigger is unacceptable local sidecar performance on the owner's hardware.
 - OCR/vision/transcription: new release only after capture habit validation.

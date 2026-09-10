@@ -11,6 +11,23 @@
 # project. See docs/incidents/0001-docker-compose-down-deleted-the-real-
 # dev-stack.md for why that distinction is the entire point.
 #
+# WHAT THIS DOES NOT PROVE - provenance (review finding F5). Every integrity
+# check below compares the backup against checksums that backup.sh wrote into
+# the SAME mutable directory as the backup itself. That defends against
+# corruption at rest; it does not defend against a tampered backup, because
+# anyone who could alter the dump could alter the recorded sha256 alongside
+# it. A green restore-test is evidence the backup is internally consistent and
+# restorable, NOT evidence of where it came from. The current mitigation is
+# containment, not authentication: this job runs on an internal: true network
+# with no gateway (see this file's compose file), so a hostile dump cannot
+# reach anything outward from here. Authenticated/signed backups
+# (docs/DESIGN.md 12.2 names `age`, private key held off the backup
+# destination) are designed but not built - they need a decided answer to
+# where the private key lives, which docs/DESIGN.md 19 still lists as an open
+# owner decision alongside the off-site provider. Until that lands, do NOT
+# treat a green restore-test as a licence to restore a backup that has been
+# off this host.
+#
 # Validates, against the most recent backup.sh manifest found in the
 # bind-mounted /backups directory (read-only here):
 #   1. pg_restore succeeds inside a single transaction - any constraint

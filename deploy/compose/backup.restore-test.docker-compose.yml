@@ -17,6 +17,18 @@
 # not part of this project - not because anyone remembered a flag
 # (docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md is
 # exactly the failure mode this sidesteps by construction).
+#
+# Networks (review finding F5; the same convention and the same wording as
+# deploy/compose/docker-compose.yml's own `embedding` network): this file
+# declared no `networks:` at all, so both services landed on Compose's
+# implicit `default` bridge, which has a gateway and full outbound NAT. This
+# job restores a dump whose only integrity evidence is a checksum stored in
+# the same mutable directory as the dump, then runs `pg_restore` over it -
+# nothing here has any reason to reach the internet, so `restore-test`
+# below declares an internal: true network and both services join it and
+# nothing else. `postgres-scratch` publishes no host port and `restore-test`
+# needs no egress, so nothing legitimate breaks; image builds are unaffected,
+# because building does not run on this network.
 name: thought-capture-restore-test
 
 services:
@@ -73,6 +85,7 @@ services:
       start_period: 10s
     security_opt:
       - no-new-privileges:true
+    networks: [restore-test]
 
   restore-test:
     # Digest-pinned, not the bare mutable tag (review finding): this job
@@ -107,3 +120,11 @@ services:
     entrypoint: ["/bin/bash", "/restore-test.sh"]
     security_opt:
       - no-new-privileges:true
+    networks: [restore-test]
+
+networks:
+  # No egress, no gateway, reachable only by services on this project that
+  # explicitly join it (docs/DESIGN.md 13). See this file's own header
+  # networks comment.
+  restore-test:
+    internal: true
