@@ -13,6 +13,11 @@ from functools import lru_cache
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Two connection slots uvicorn's own accounting costs on top of whatever this
+# process admits - see `Settings._limit_concurrency_covers_admission` for
+# where each one comes from and how it was verified.
+_UVICORN_CONNECTION_SLOT_OVERHEAD = 2
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TC_EMBEDDING_")
@@ -144,35 +149,97 @@ class Settings(BaseSettings):
     # perimeter every other `core` service (postgres, api) in this stack
     # already relies on with no proxy in front of either. Revisit if this
     # service is ever exposed beyond that boundary.
-    h11_max_incomplete_event_size: int = Field(default=16_384, ge=1)
+    # Floor of 1 KiB, not 1: a value below that leaves no room for a
+    # realistic request line plus a Host header, so h11 gives up on EVERY
+    # connection mid-header and no HTTP request of any kind can complete -
+    # including the Docker healthcheck. That is the same "starts, reports
+    # healthy-ish, cannot serve" shape the rest of these bounds exist to
+    # prevent, so it is rejected rather than accepted as a tuning choice.
+    h11_max_incomplete_event_size: int = Field(default=16_384, ge=1024)
 
     @model_validator(mode="after")
     def _limit_concurrency_covers_admission(self) -> Settings:
-        """uvicorn's ceiling must be able to hold everything admission accepts.
+        """uvicorn's ceiling must be able to hold everything admission accepts,
+        *plus* the two slots its own accounting costs.
 
-        `limit_concurrency` is enforced by uvicorn *before* this process's own
-        code runs, so a value below `max_concurrent_encodes +
-        max_queued_encodes` makes the admission queue dead configuration:
-        uvicorn 503s the very requests `model.py` was sized to queue, and the
-        operator's `TC_EMBEDDING_MAX_QUEUED_ENCODES` silently does nothing.
+        `limit_concurrency` is enforced by uvicorn before this process's own
+        code runs, so too low a value makes the admission queue dead
+        configuration: uvicorn 503s the very requests `model.py` was sized to
+        queue, and the operator's `TC_EMBEDDING_MAX_QUEUED_ENCODES` silently
+        does nothing.
 
-        This is a hard startup failure rather than a warning for the same
-        reason the per-field bounds above exist at all: the failure mode this
-        whole class of misconfiguration produces is a *green* `/health` check
-        in front of a service that cannot do its job, and a warning would
-        reproduce exactly that.
+        The floor is `max_concurrent_encodes + max_queued_encodes + 2`, not
+        that total itself, and the +2 is not padding - both slots were read
+        out of the pinned uvicorn (`uvicorn/protocols/http/h11_impl.py`,
+        identical in `httptools_impl.py`):
+
+        * `connection_made` adds the connection to `self.connections`
+          unconditionally, *before* the limit is consulted, and the test is
+          ``len(self.connections) >= limit_concurrency``. So with
+          ``limit_concurrency == L`` the L-th simultaneously-open connection
+          is already 503'd, and only ``L - 1`` requests can ever reach
+          admission. One slot pays for that off-by-one.
+        * The test counts CONNECTIONS, not in-flight ``/embed`` requests. The
+          container healthcheck opens its own connection every few seconds; at
+          a full admission queue it would be the one turned away, and after
+          `retries` failures the sidecar is marked unhealthy under legitimate
+          load, failing `condition: service_healthy` for anything that depends
+          on it. The second slot keeps that connection available.
+
+        A hard startup failure rather than a warning, for the same reason the
+        per-field bounds above exist at all: this whole class of
+        misconfiguration produces a *green* `/health` in front of a service
+        that cannot do its job, and a warning would reproduce exactly that.
         """
-        required = self.max_concurrent_encodes + self.max_queued_encodes
+        admitted = self.max_concurrent_encodes + self.max_queued_encodes
+        required = admitted + _UVICORN_CONNECTION_SLOT_OVERHEAD
         if self.limit_concurrency < required:
             raise ValueError(
                 f"TC_EMBEDDING_LIMIT_CONCURRENCY={self.limit_concurrency} is below "
-                f"max_concurrent_encodes + max_queued_encodes ({self.max_concurrent_encodes} "
-                f"+ {self.max_queued_encodes} = {required}). uvicorn would reject with 503 "
-                "the requests the admission queue was sized to accept, making "
+                f"max_concurrent_encodes + max_queued_encodes + "
+                f"{_UVICORN_CONNECTION_SLOT_OVERHEAD} "
+                f"({self.max_concurrent_encodes} + {self.max_queued_encodes} + "
+                f"{_UVICORN_CONNECTION_SLOT_OVERHEAD} = {required}). uvicorn counts open "
+                "connections, not requests, and 503s at >= the limit rather than above "
+                "it, so anything lower rejects requests the admission queue was sized to "
+                "accept and can starve the container healthcheck under load - making "
                 "TC_EMBEDDING_MAX_QUEUED_ENCODES dead configuration. Raise "
-                "TC_EMBEDDING_LIMIT_CONCURRENCY to at least that total (comfortably above "
-                "it, so health checks alongside real traffic are not the ones turned away), "
-                "or lower the admission bounds."
+                "TC_EMBEDDING_LIMIT_CONCURRENCY to at least that total, or lower the "
+                "admission bounds."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _request_byte_cap_admits_the_advertised_batch(self) -> Settings:
+        """The byte cap must not silently shrink the advertised batch limits.
+
+        `MaxBodySizeMiddleware` enforces `max_request_bytes` before Pydantic
+        parses anything, so a cap below `max_batch_size * max_text_length` -
+        the raw character total of a request at exactly the advertised limits -
+        413s requests that `max_batch_size` and `max_text_length` both say are
+        acceptable. Those two then become partly dead configuration, by
+        exactly the argument `_limit_concurrency_covers_admission` makes about
+        the queue depth. The comparison is against the raw character total and
+        so ignores JSON structure/escaping overhead: this is the floor below
+        which the advertised limits are *definitely* unreachable, not a
+        promise that every request at the limit fits.
+
+        This also rules out the degenerate case the per-field `ge=1` bound
+        alone allowed: `TC_EMBEDDING_MAX_REQUEST_BYTES=1` starts happily,
+        answers `/health` with `status: ok` (a bodyless GET), and 413s every
+        single `/embed`.
+        """
+        required = self.max_batch_size * self.max_text_length
+        if self.max_request_bytes < required:
+            raise ValueError(
+                f"TC_EMBEDDING_MAX_REQUEST_BYTES={self.max_request_bytes} is below "
+                f"max_batch_size * max_text_length ({self.max_batch_size} * "
+                f"{self.max_text_length} = {required}), the raw character total of a "
+                "request at exactly the advertised limits. MaxBodySizeMiddleware would "
+                "413 requests those two settings say are acceptable, making them dead "
+                "configuration. Raise TC_EMBEDDING_MAX_REQUEST_BYTES to at least that "
+                "total (with headroom for JSON structure and escaping, as the default "
+                "has), or lower TC_EMBEDDING_MAX_BATCH_SIZE/TC_EMBEDDING_MAX_TEXT_LENGTH."
             )
         return self
 
