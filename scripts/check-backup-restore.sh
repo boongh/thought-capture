@@ -25,6 +25,24 @@
 # (via the synthetic env file) and the host side (this script reads its own
 # variable, never a `${TC_BACKUP_ROOT:-...}` fallback onto the real root),
 # and deletes it on exit.
+#
+# PLATFORM TRAP - POSIX permission bits (review finding F1; the second
+# platform trap in this file, alongside the `mktemp` path-translation one
+# documented below). deploy/compose/backup/backup.sh deliberately finishes by
+# chowning its output to `postgres` (uid 999) and chmod 700-ing the backup
+# root. A Linux bind mount enforces those bits for real, so the INVOKING user
+# (uid 1001 on a GitHub Actions runner) cannot stat, read, or delete anything
+# inside that tree; a Docker Desktop for Windows bind mount silently ignores
+# the same chown/chmod, so an identical host-side check passes locally. That
+# divergence is why this script's original host-side assertions were green on
+# Windows and red in CI with a misleading "backup did not copy the seeded
+# attachment" - the file WAS copied; the runner simply could not see it.
+# Consequently: any host-side file assertion against the backup root here is
+# platform-divergent by construction. Read the backup root through a CONTAINER
+# instead (the `restore-test` service already bind-mounts it read-only,
+# already runs as the uid that owns it, and Compose already resolves the path
+# correctly on both platforms), and hand ownership back through a container
+# before deleting it.
 set -euo pipefail
 
 script_directory="${BASH_SOURCE[0]%/*}"
@@ -89,6 +107,20 @@ TC_BACKUP_ROOT=$backup_root_compose_value
 ENV
 
 cleanup() {
+  # Ownership handback FIRST (review finding F1). backup.sh leaves this tree
+  # owned by uid 999, mode 0700; on Linux the invoking user genuinely cannot
+  # delete inside it, so every run used to leave a
+  # deploy/compose/.tc-check-backup-restore-* directory behind - and an `rm`
+  # that fails inside an EXIT trap can mask the real exit code too. The
+  # `backup` service is the one that mounts the backup root read-write;
+  # `restore-test` mounts it :ro and so cannot chown it. Numeric ids, not
+  # names: the invoking uid has no passwd entry inside the container.
+  if [[ "$backup_has_run" -eq 1 ]]; then
+    docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
+      run --rm --no-deps -T --user 0:0 --entrypoint /bin/bash backup \
+      -c "chown -R $(id -u):$(id -g) /backups && chmod -R u+rwX /backups" \
+      >/dev/null 2>&1 || true
+  fi
   scripts/compose-teardown.sh --env-file "$env_file" -p "$restore_project" \
     -f "$restore_compose_file" down -v --remove-orphans >/dev/null 2>&1 || true
   # --profile core --profile backup: `docker compose down` only acts on
@@ -109,6 +141,12 @@ cleanup() {
     rm -rf "$backup_root_host"
   fi
 }
+# Set to 1 the moment the first `backup` run has written into the isolated
+# backup root; `cleanup` reads it to decide whether an ownership handback is
+# needed at all (before that there is nothing to hand back, and the `run`
+# would pointlessly create this project's network on the way out of an early
+# failure).
+backup_has_run=0
 trap cleanup EXIT
 
 # Tear down first too, in case a prior run (e.g. a killed CI job) left either
@@ -141,29 +179,92 @@ docker run --rm -v "${backup_project}_attachments:/data" alpine:3.20 \
   sh -c "mkdir -p /data/ab && printf '%s' \"\$0\" > /data/ab/synthetic.txt" "$attachment_content"
 
 printf -- '--- running backup\n'
+backup_has_run=1
 docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
   --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
 
+# ---------------------------------------------------------------------------
+# Every assertion about the backup root runs INSIDE a container, never on the
+# host (review finding F1 - see this file's PLATFORM TRAP header note). The
+# `restore-test` service is reused for this because it already bind-mounts
+# ${TC_BACKUP_ROOT} read-only, already runs as the uid that owns those files,
+# and Compose already resolves that path correctly on both platforms - which
+# the host side does not. `--no-deps` because none of these need the scratch
+# database; `-T` because there is no TTY in CI.
+# ---------------------------------------------------------------------------
+backup_root_exec() {
+  # $1 = --user value, remaining args before the trailing script are extra
+  # `docker compose run` flags. The last argument is the bash script text.
+  local as_user="$1"
+  shift
+  local script="${!#}"
+  local flags=("${@:1:$#-1}")
+  docker compose --env-file "$env_file" -p "$restore_project" -f "$restore_compose_file" \
+    run --rm --no-deps -T --user "$as_user" "${flags[@]}" \
+    --entrypoint /bin/bash restore-test -c "$script"
+}
+
+# ---------------------------------------------------------------------------
+# Permission property (review finding F1, step 1). backup.sh's closing
+# `chmod 700` is a real security property on Linux - the backup contains the
+# full plaintext database and every attachment - so assert it deliberately
+# instead of leaving it as the accident that used to break this script. An
+# unrelated, non-root uid must not be able to read even `latest.txt`.
+#
+# Soft-passes where the bind mount does not enforce POSIX bits at all (Docker
+# Desktop for Windows), and says so rather than passing silently: on that
+# platform the property is untestable, not satisfied. CI runs on Linux, where
+# it is asserted for real.
+# ---------------------------------------------------------------------------
+printf -- '--- asserting the backup root is unreadable to an unrelated non-root uid\n'
+backup_root_ownership="$(backup_root_exec 0:0 "stat -c '%u %a' /backups" 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+if [[ "$backup_root_ownership" != "999 700" ]]; then
+  printf 'SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount (saw %s, expected "999 700") - the restrictive-permission property cannot be asserted here; CI on Linux does assert it\n' \
+    "\"$backup_root_ownership\""
+else
+  unrelated_uid_verdict="$(backup_root_exec 4242:4242 'if cat /backups/latest.txt >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi' 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+  if [[ "$unrelated_uid_verdict" != "NOT-READABLE" ]]; then
+    printf 'FAIL: uid 4242 could read the backup root (%s) - backup.sh must leave it readable only by its owner\n' \
+      "$unrelated_uid_verdict" >&2
+    exit 1
+  fi
+  printf 'OK: backup root is 0700/uid-999 and unreadable to an unrelated uid\n'
+fi
+
 printf -- '--- asserting the seeded attachment was actually copied and hashed\n'
-copied_attachment="$backup_root_host/attachments/ab/synthetic.txt"
-if [[ ! -f "$copied_attachment" ]]; then
-  printf 'FAIL: backup did not copy the seeded attachment to %s\n' "$copied_attachment" >&2
+attachment_assert_script="$(cat <<'CONTAINER_SCRIPT'
+set -euo pipefail
+copied="/backups/attachments/ab/synthetic.txt"
+if [[ ! -f "$copied" ]]; then
+  echo "FAIL: backup did not copy the seeded attachment to <backup root>/attachments/ab/synthetic.txt" >&2
+  ls -la /backups /backups/attachments >&2 || true
   exit 1
 fi
-copied_content="$(cat "$copied_attachment")"
-if [[ "$copied_content" != "$attachment_content" ]]; then
-  printf 'FAIL: copied attachment content does not match what was seeded\n' >&2
+if [[ "$(cat "$copied")" != "$EXPECTED_CONTENT" ]]; then
+  echo "FAIL: copied attachment content does not match what was seeded" >&2
   exit 1
 fi
-latest_manifest="$backup_root_host/$(cat "$backup_root_host/latest.txt")"
-attachments_manifest_file="$backup_root_host/$(grep -oE '"attachments_manifest_file": *"[^"]*"' "$latest_manifest" | sed -E 's/.*"([^"]+)"$/\1/')"
-if ! grep -q "^${attachment_sha256}  \./ab/synthetic\.txt$" "$attachments_manifest_file"; then
-  printf 'FAIL: attachment manifest %s does not record the seeded file'"'"'s sha256 (%s)\n' \
-    "$attachments_manifest_file" "$attachment_sha256" >&2
-  cat "$attachments_manifest_file" >&2
+latest_name="$(tr -d '[:space:]' </backups/latest.txt)"
+manifest_name="$(grep -oE '"attachments_manifest_file": *"[^"]*"' "/backups/$latest_name" | sed -E 's/.*"([^"]+)"$/\1/')"
+if [[ -z "$manifest_name" ]]; then
+  echo "FAIL: could not find attachments_manifest_file in $latest_name" >&2
   exit 1
 fi
-printf 'OK: seeded attachment present and hash-valid after backup\n'
+if ! grep -q "^${EXPECTED_SHA256}  \./ab/synthetic\.txt$" "/backups/$manifest_name"; then
+  echo "FAIL: attachment manifest $manifest_name does not record the seeded file's sha256 ($EXPECTED_SHA256)" >&2
+  cat "/backups/$manifest_name" >&2
+  exit 1
+fi
+echo "OK: seeded attachment present and hash-valid after backup"
+CONTAINER_SCRIPT
+)"
+if ! backup_root_exec postgres \
+  -e "EXPECTED_CONTENT=$attachment_content" \
+  -e "EXPECTED_SHA256=$attachment_sha256" \
+  "$attachment_assert_script"; then
+  printf 'FAIL: the container-side backup-root assertions failed (see above)\n' >&2
+  exit 1
+fi
 
 # A fresh postgres-scratch every round, not reused across rounds: the same
 # bug this guards against for repeated script invocations

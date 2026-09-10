@@ -25,6 +25,22 @@ script now creates its OWN per-run temp directory, injects it into both the
 container side (via the synthetic env file) and the host side (this script
 reads its own variable, never a `$env:TC_BACKUP_ROOT`-or-default fallback
 onto the real root), and deletes it on exit.
+
+PLATFORM TRAP - POSIX permission bits (review finding F1). backup.sh
+deliberately finishes by chowning its output to `postgres` (uid 999) and
+chmod 700-ing the backup root. A Linux bind mount enforces those bits for
+real, so the INVOKING user cannot stat, read, or delete anything inside that
+tree; a Docker Desktop for Windows bind mount silently ignores the same
+chown/chmod, so an identical host-side check passes here and fails in CI.
+That divergence is why this pair's original host-side assertions were green
+on Windows and red on Linux with a misleading "backup did not copy the seeded
+attachment" - the file WAS copied; the runner simply could not see it.
+Consequently: any host-side file assertion against the backup root is
+platform-divergent by construction. Read the backup root through a CONTAINER
+instead (the `restore-test` service already bind-mounts it read-only, already
+runs as the uid that owns it, and Compose already resolves the path correctly
+on both platforms), and relax permissions through a container before deleting
+it. scripts/check-backup-restore.sh does the same thing, the same way.
 #>
 
 
@@ -80,6 +96,35 @@ if ($BackupRoot -eq $RealBackupRootDefault) {
     throw "the isolated backup root resolved to the real default backup root ($RealBackupRootDefault) - refusing to run"
 }
 
+# Container-side assertion scripts live in their own throwaway directory,
+# bind-mounted read-only into the assertion containers below. Deliberately
+# NOT passed as `bash -c "<script text>"` arguments the way
+# scripts/check-backup-restore.sh does: Windows PowerShell 5.1's native-command
+# argument serialization mishandles a quoted string that itself contains
+# quotes and spaces (the same hazard already documented for the attachment
+# seed file further down), and these scripts are full of both. A bind-mounted
+# file never goes through argv encoding at all.
+$AssertScriptDir = Join-Path ([System.IO.Path]::GetTempPath()) "tc-check-assert-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $AssertScriptDir -ErrorAction Stop | Out-Null
+$AssertScriptDir = $AssertScriptDir -replace '\', '/'
+
+function Write-AssertScript {
+    param([string]$Name, [string]$Body)
+    # LF, no BOM: this file is executed by bash inside a Linux container, where
+    # CRLF produces an obscure "\r: command not found" and a BOM breaks the
+    # first line outright.
+    [System.IO.File]::WriteAllText(
+        "$AssertScriptDir/$Name",
+        ($Body -replace "`r`n", "`n"),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+# Set to $true once the first `backup` run has written into the isolated
+# backup root; Invoke-Cleanup reads it to decide whether the permission
+# handback below is needed at all.
+$BackupHasRun = $false
+
 $EnvFile = New-TemporaryFile -ErrorAction Stop
 @"
 POSTGRES_PASSWORD=check-only-not-a-real-secret
@@ -90,6 +135,21 @@ TC_BACKUP_ROOT=$BackupRoot
 "@ | Set-Content -Path $EnvFile -Encoding utf8 -ErrorAction Stop
 
 function Invoke-Cleanup {
+    # Permission handback FIRST (review finding F1). backup.sh leaves this
+    # tree owned by uid 999, mode 0700; on a Linux host the invoking user
+    # genuinely cannot delete inside it, so the directory would be left
+    # behind - and a failing delete inside a finally block can mask the real
+    # exit code too. `chmod -R a+rwX` rather than scripts/check-backup-
+    # restore.sh's `chown -R $(id -u):$(id -g)`: PowerShell has no portable
+    # invoking-uid to chown to, and this is a throwaway directory whose whole
+    # remaining lifetime is the delete on the next line. The `backup` service
+    # is the one that mounts the backup root read-write; `restore-test`
+    # mounts it :ro and so cannot change it.
+    if ($BackupHasRun) {
+        docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
+            run --rm --no-deps -T --user 0:0 --entrypoint /bin/bash backup `
+            -c "chmod -R a+rwX /backups" *> $null
+    }
     & "$PSScriptRoot/compose-teardown.ps1" --env-file $EnvFile -p $RestoreProject `
         -f $RestoreComposeFile down -v --remove-orphans *> $null
     # --profile core --profile backup: `docker compose down` only acts on
@@ -101,6 +161,7 @@ function Invoke-Cleanup {
     & "$PSScriptRoot/compose-teardown.ps1" --env-file $EnvFile -p $BackupProject `
         -f $ComposeFile --profile core --profile backup down -v --remove-orphans *> $null
     Remove-Item -Path $EnvFile -ErrorAction SilentlyContinue
+    if ($AttachmentSeedFile) { Remove-Item -Path $AttachmentSeedFile -ErrorAction SilentlyContinue }
     # Only ever remove a directory THIS run created: guarded on both a
     # non-empty variable and the marker file this run itself wrote above,
     # so a future edit that changes $BackupRoot's value earlier in the
@@ -108,6 +169,9 @@ function Invoke-Cleanup {
     # path.
     if ($BackupRoot -and (Test-Path -LiteralPath $BackupRootMarker)) {
         Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($AssertScriptDir -and (Test-Path -LiteralPath $AssertScriptDir)) {
+        Remove-Item -LiteralPath $AssertScriptDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -160,35 +224,109 @@ try {
     docker run --rm -v "${BackupProject}_attachments:/data" -v "${AttachmentSeedFile}:/seed.txt:ro" alpine:3.20 `
         sh -c "mkdir -p /data/ab && cp /seed.txt /data/ab/synthetic.txt"
     $AttachmentSeedExitCode = $LASTEXITCODE
-    Remove-Item -Path $AttachmentSeedFile -ErrorAction SilentlyContinue
     if ($AttachmentSeedExitCode -ne 0) { throw "failed to seed the synthetic attachment (exit $AttachmentSeedExitCode)" }
+    # Deliberately NOT deleted here any more: the same no-BOM host file is
+    # bind-mounted into the assertion container below as the expected-content
+    # fixture, so the comparison is byte-for-byte against exactly what was
+    # seeded, with no argv encoding anywhere in the path. Removed in
+    # Invoke-Cleanup instead.
 
     Write-Host "--- running backup" -ForegroundColor Cyan
+    $BackupHasRun = $true
     docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
         --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
     if ($LASTEXITCODE -ne 0) { throw "backup failed (exit $LASTEXITCODE)" }
 
+    # -------------------------------------------------------------------
+    # Every assertion about the backup root runs INSIDE a container, never on
+    # the host (review finding F1 - see this file's PLATFORM TRAP header
+    # note). The `restore-test` service is reused because it already
+    # bind-mounts $TC_BACKUP_ROOT read-only, already runs as the uid that owns
+    # those files, and Compose already resolves that path correctly on both
+    # platforms - which the host side does not. `--no-deps` because none of
+    # these need the scratch database; `-T` because there is no TTY in CI.
+    # -------------------------------------------------------------------
+    function Invoke-BackupRootExec {
+        param(
+            [Parameter(Mandatory)][string]$AsUser,
+            [Parameter(Mandatory)][string]$ScriptName,
+            [string[]]$ExtraArgs = @()
+        )
+        docker compose --env-file $EnvFile -p $RestoreProject -f $RestoreComposeFile `
+            run --rm --no-deps -T --user $AsUser `
+            -v "${AssertScriptDir}:/assert:ro" @ExtraArgs `
+            --entrypoint /bin/bash restore-test "/assert/$ScriptName"
+    }
+
+    Write-AssertScript "stat-backup-root.sh" @'
+stat -c '%u %a' /backups
+'@
+
+    Write-AssertScript "probe-unrelated-uid.sh" @'
+if cat /backups/latest.txt >/dev/null 2>&1; then echo READABLE; else echo NOT-READABLE; fi
+'@
+
+    Write-AssertScript "assert-attachment.sh" @'
+set -euo pipefail
+copied="/backups/attachments/ab/synthetic.txt"
+if [[ ! -f "$copied" ]]; then
+  echo "FAIL: backup did not copy the seeded attachment to <backup root>/attachments/ab/synthetic.txt" >&2
+  ls -la /backups /backups/attachments >&2 || true
+  exit 1
+fi
+if ! cmp -s "$copied" /expected.txt; then
+  echo "FAIL: copied attachment content does not match what was seeded" >&2
+  exit 1
+fi
+latest_name="$(tr -d '[:space:]' </backups/latest.txt)"
+manifest_name="$(grep -oE '"attachments_manifest_file": *"[^"]*"' "/backups/$latest_name" | sed -E 's/.*"([^"]+)"$/\1/')"
+if [[ -z "$manifest_name" ]]; then
+  echo "FAIL: could not find attachments_manifest_file in $latest_name" >&2
+  exit 1
+fi
+if ! grep -q "^${EXPECTED_SHA256}  \./ab/synthetic\.txt$" "/backups/$manifest_name"; then
+  echo "FAIL: attachment manifest $manifest_name does not record the seeded file's sha256 ($EXPECTED_SHA256)" >&2
+  cat "/backups/$manifest_name" >&2
+  exit 1
+fi
+echo "OK: seeded attachment present and hash-valid after backup"
+'@
+
+    # -------------------------------------------------------------------
+    # Permission property (review finding F1, step 1). backup.sh's closing
+    # `chmod 700` is a real security property on Linux - the backup contains
+    # the full plaintext database and every attachment - so assert it
+    # deliberately instead of leaving it as the accident that used to break
+    # this pair of scripts. An unrelated, non-root uid must not be able to
+    # read even `latest.txt`.
+    #
+    # Soft-passes where the bind mount does not enforce POSIX bits at all
+    # (Docker Desktop for Windows, i.e. almost every run of THIS script), and
+    # says so rather than passing silently: there the property is untestable,
+    # not satisfied. CI runs check-backup-restore.sh on Linux, where it is
+    # asserted for real.
+    # -------------------------------------------------------------------
+    Write-Host "--- asserting the backup root is unreadable to an unrelated non-root uid" -ForegroundColor Cyan
+    $BackupRootOwnership = (Invoke-BackupRootExec -AsUser "0:0" -ScriptName "stat-backup-root.sh" 2>$null |
+        Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
+    if ($BackupRootOwnership -ne "999 700") {
+        Write-Host "SKIP: this platform does not enforce POSIX ownership/mode across the backup bind mount (saw '$BackupRootOwnership', expected '999 700') - the restrictive-permission property cannot be asserted here; CI on Linux does assert it"
+    }
+    else {
+        $UnrelatedUidVerdict = (Invoke-BackupRootExec -AsUser "4242:4242" -ScriptName "probe-unrelated-uid.sh" 2>$null |
+            Select-Object -Last 1 | ForEach-Object { "$_".Trim() })
+        if ($UnrelatedUidVerdict -ne "NOT-READABLE") {
+            throw "uid 4242 could read the backup root ($UnrelatedUidVerdict) - backup.sh must leave it readable only by its owner"
+        }
+        Write-Host "OK: backup root is 0700/uid-999 and unreadable to an unrelated uid"
+    }
+
     Write-Host "--- asserting the seeded attachment was actually copied and hashed" -ForegroundColor Cyan
-    $CopiedAttachment = Join-Path $BackupRoot "attachments/ab/synthetic.txt"
-    if (-not (Test-Path -LiteralPath $CopiedAttachment)) {
-        throw "backup did not copy the seeded attachment to $CopiedAttachment"
-    }
-    $CopiedContent = Get-Content -Raw -LiteralPath $CopiedAttachment
-    if ($CopiedContent -ne $AttachmentContent) {
-        throw "copied attachment content does not match what was seeded"
-    }
-    $LatestManifestName = (Get-Content -Raw -LiteralPath (Join-Path $BackupRoot "latest.txt")).Trim()
-    $LatestManifest = Get-Content -Raw -LiteralPath (Join-Path $BackupRoot $LatestManifestName)
-    if ($LatestManifest -notmatch '"attachments_manifest_file":\s*"([^"]+)"') {
-        throw "could not find attachments_manifest_file in $LatestManifestName"
-    }
-    $AttachmentsManifestFile = Join-Path $BackupRoot $Matches[1]
-    $ManifestLines = Get-Content -LiteralPath $AttachmentsManifestFile
-    if (-not ($ManifestLines -match "^$AttachmentSha256  \./ab/synthetic\.txt$")) {
-        Write-Host ($ManifestLines -join "`n")
-        throw "attachment manifest $AttachmentsManifestFile does not record the seeded file's sha256 ($AttachmentSha256)"
-    }
-    Write-Host "OK: seeded attachment present and hash-valid after backup"
+    Invoke-BackupRootExec -AsUser "postgres" -ScriptName "assert-attachment.sh" -ExtraArgs @(
+        "-v", "${AttachmentSeedFile}:/expected.txt:ro",
+        "-e", "EXPECTED_SHA256=$AttachmentSha256"
+    ) | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "the container-side backup-root assertions failed (exit $LASTEXITCODE) - see above" }
 
     # A fresh postgres-scratch every round, not reused across rounds - the
     # same bug scripts/restore-test.ps1's own comment/commit explains
