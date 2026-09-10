@@ -54,6 +54,10 @@ it. scripts/check-backup-restore.sh does the same thing, the same way.
 Set-Location (Join-Path $PSScriptRoot "..") -ErrorAction Stop
 
 $BackupProject = "thought-capture-check-backup"
+# A name distinct from every real dev-stack container (CLAUDE.md's Docker
+# section): round 2 runs this as a long-lived writer against the throwaway
+# project's attachments volume and database.
+$BlobWriterContainer = "tc-check-backup-blob-writer"
 $RestoreProject = "thought-capture-check-restore-test"
 $ComposeFile = "deploy/compose/docker-compose.yml"
 $RestoreComposeFile = "deploy/compose/backup.restore-test.docker-compose.yml"
@@ -135,6 +139,7 @@ TC_BACKUP_ROOT=$BackupRoot
 "@ | Set-Content -Path $EnvFile -Encoding utf8 -ErrorAction Stop
 
 function Invoke-Cleanup {
+    docker rm -f $BlobWriterContainer *> $null
     # Permission handback FIRST (review finding F1). backup.sh leaves this
     # tree owned by uid 999, mode 0700; on a Linux host the invoking user
     # genuinely cannot delete inside it, so the directory would be left
@@ -401,6 +406,61 @@ echo "OK: seeded attachment present and hash-valid after backup"
         }
     } -ArgumentList $EnvFile, $BackupProject, $ComposeFile
 
+    # -------------------------------------------------------------------
+    # Blob-ordering regression (review finding F3). The `thoughts` writer
+    # above only ever exercised row counts; it never touched the attachments
+    # volume, so it could not detect that backup.sh used to copy attachments
+    # BEFORE exporting the snapshot pg_dump reads through. A blob written and
+    # committed in that window is in the dump but not in the backup directory.
+    #
+    # This writer does the real thing, in blob-store order (write and sync the
+    # file, THEN commit the `blobs` row - the same order
+    # packages/infrastructure/src/tc_infrastructure/storage/blob_store.py's
+    # `put` guarantees, and the order the fix's correctness argument depends
+    # on), for the backup's whole duration. On the old copy-first ordering this
+    # reliably leaves the restored database referencing a blob the backup never
+    # copied, which restore-test.sh's "every database-referenced blob" step
+    # then fails on, naming its sha256.
+    #
+    # One long-lived container rather than a `docker run` per iteration:
+    # container startup dominates otherwise, and a writer that manages one or
+    # two blobs over the whole backup is not a race test. The loop body is
+    # bind-mounted as a file for the same argv-encoding reason as the assertion
+    # scripts above.
+    # -------------------------------------------------------------------
+    Write-AssertScript "blob-writer.sh" @'
+set -u
+i=0
+while true; do
+  i=$((i + 1))
+  content="synthetic race blob $i $(date -u +%s%N)"
+  sha="$(printf '%s' "$content" | sha256sum | cut -d' ' -f1)"
+  size="$(printf '%s' "$content" | wc -c)"
+  # Matches blob_store.py's own `storage_key_for`: two 2-character fan-out
+  # levels, then the full hash.
+  key="${sha:0:2}/${sha:2:2}/$sha"
+  mkdir -p "/data/attachments/${sha:0:2}/${sha:2:2}"
+  # File first, durably, THEN the row - blob_store.py's `put` order, and the
+  # premise of the fix under test.
+  printf '%s' "$content" >"/data/attachments/$key"
+  sync
+  if psql -v ON_ERROR_STOP=1 --quiet -h postgres -U tc_migrator -d thought_capture -c "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$sha', $size, 'text/plain', '$key')" >/dev/null 2>&1; then
+    echo "COMMITTED $sha"
+  fi
+  sleep 0.05
+done
+'@
+
+    docker rm -f $BlobWriterContainer *> $null
+    docker run -d --name $BlobWriterContainer `
+        --network "${BackupProject}_default" `
+        -v "${BackupProject}_attachments:/data/attachments" `
+        -v "${AssertScriptDir}:/assert:ro" `
+        -e PGPASSWORD=check-only-not-a-real-secret `
+        postgres:18.6-trixie@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280 `
+        bash /assert/blob-writer.sh *> $null
+    if ($LASTEXITCODE -ne 0) { throw "failed to start the concurrent blob writer (exit $LASTEXITCODE)" }
+
     try {
         docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
             --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
@@ -408,7 +468,20 @@ echo "OK: seeded attachment present and hash-valid after backup"
     }
     finally {
         Stop-Job -Job $WriterJob -ErrorAction SilentlyContinue
+        docker stop -t 2 $BlobWriterContainer *> $null
     }
+
+    # Same guard as the `thoughts` writer's, for the same reason: a blob writer
+    # that failed on every iteration - a schema change, a wrong password, an
+    # unreachable host - would make this round pass while testing nothing.
+    $BlobWriterLog = (docker logs $BlobWriterContainer 2>&1 | Out-String)
+    docker rm -f $BlobWriterContainer *> $null
+    $BlobCommitCount = ([regex]::Matches($BlobWriterLog, '(?m)^COMMITTED ')).Count
+    if ($BlobCommitCount -lt 1) {
+        Write-Host $BlobWriterLog
+        throw "the concurrent blob writer never committed a blob during the backup - the copy-ordering regression is not actually exercised"
+    }
+    Write-Host "--- round 2: concurrent blob writer committed $BlobCommitCount blob(s) during the backup"
 
     # Asserts the race was actually exercised, not merely that the backup
     # succeeded - a writer that never committed anything would make this

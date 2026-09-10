@@ -43,6 +43,7 @@ DOCKER_COMPOSE_YML = REPO_ROOT / "deploy" / "compose" / "docker-compose.yml"
 EMBEDDING_CONTRACT_TEST_YML = (
     REPO_ROOT / "deploy" / "compose" / "embedding-sidecar.contract-test.docker-compose.yml"
 )
+BACKUP_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "backup.sh"
 
 # The exact fallback the review found: reading TC_BACKUP_ROOT with a default
 # of the real backup directory silently redirects onto the operator's real
@@ -211,6 +212,103 @@ class TestBackupRootIsReadThroughAContainer:
                 f"scripts/check-backup-restore.{name} must do the handback "
                 f"through the `backup` service - it is the only one that "
                 f"mounts the backup root read-write"
+            )
+
+
+class TestAttachmentCopyHappensAfterTheSnapshot:
+    """Finding F3. backup.sh used to copy attachments in its root phase, before
+    the privilege drop and therefore before the coprocess exported the MVCC
+    snapshot pg_dump reads through - so a blob written and committed in that
+    window was in the dump but not in the backup directory. The full behaviour
+    is covered by scripts/check-backup-restore.sh's round 2, which needs Docker;
+    these are the cheap static guards that stop a refactor from quietly
+    restoring the original ordering.
+
+    Note on what CANNOT be asserted here: the fix forks the privilege drop
+    instead of `exec`-ing it, so root's copy and the child's snapshot export
+    live in the same file and root's copy is lexically EARLIER than the
+    `pg_export_snapshot()` call it now waits for. Line order therefore says
+    nothing about run order; the handshake is what orders them, so the
+    handshake is what these tests pin.
+    """
+
+    def test_the_privilege_drop_is_a_fork_not_a_one_way_exec(self) -> None:
+        text = BACKUP_SH.read_text()
+        code_only = _strip_shell_comments(text)
+        assert "exec gosu" not in code_only, (
+            "backup.sh must not `exec gosu` into the database phase: root has "
+            "to stay alive to perform the attachment copy AFTER the child has "
+            "exported its snapshot"
+        )
+        assert 'gosu postgres /bin/bash "$0" --db-phase "$@" &' in code_only, (
+            "backup.sh's root phase must fork the database phase (and pass "
+            "--db-phase so the child does not re-enter the root branch)"
+        )
+
+    def test_root_waits_for_the_snapshot_signal_before_copying(self) -> None:
+        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        wait_index = code_only.index("read -r -t 5 -u 3 snapshot_signal")
+        copy_index = code_only.index("cp -au --parents -t")
+        assert wait_index < copy_index, (
+            "backup.sh's root phase must block on the 'snapshot exported' "
+            "signal before it starts copying attachments - a copy taken before "
+            "the snapshot instant can miss a blob the dump references"
+        )
+
+    def test_the_child_signals_only_after_exporting_the_snapshot(self) -> None:
+        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        export_index = code_only.index("SELECT pg_export_snapshot();")
+        # The specific write, not the bare redirection: root's own
+        # `exec 3<>"$snapshot_ready_fifo"` also contains that substring and
+        # sits lexically before the export.
+        signal_index = code_only.index("""printf 'snapshot-ready""")
+        assert export_index < signal_index, (
+            "backup.sh's database phase must export its snapshot before "
+            "releasing root's copy - the signal is what makes the copy a "
+            "superset of what the dump references"
+        )
+
+    def test_the_manifest_waits_for_the_copy_to_finish(self) -> None:
+        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        wait_index = code_only.index("read -r -t 600 -u 5 _copy_signal")
+        manifest_index = code_only.index("find . -type f -print0 | sort -z | xargs -0 sha256sum")
+        assert wait_index < manifest_index, (
+            "backup.sh's database phase must block on 'copy complete' before "
+            "hashing the copied tree, or the manifest describes a half-finished "
+            "copy"
+        )
+
+    def test_in_flight_blob_temp_files_are_excluded_from_the_copy(self) -> None:
+        code_only = _strip_shell_comments(BACKUP_SH.read_text())
+        assert "! -name '.incoming-*'" in code_only, (
+            "backup.sh must exclude BlobStore.put's in-flight temp files "
+            "(mkstemp prefix '.incoming-') from the copy: they are never "
+            "referenced by a `blobs` row, and copying one mid-write puts a "
+            "torn file into the manifest"
+        )
+
+    def test_round_2_writes_real_blobs_in_blob_store_order(self) -> None:
+        for name, path in (
+            ("sh", CHECK_BACKUP_RESTORE_SH),
+            ("ps1", CHECK_BACKUP_RESTORE_PS1),
+        ):
+            text = path.read_text()
+            assert "INSERT INTO blobs" in text, (
+                f"scripts/check-backup-restore.{name}'s round 2 must commit "
+                f"real `blobs` rows concurrently with the backup - a writer "
+                f"that only inserts into `thoughts` never exercises the "
+                f"copy-ordering finding at all"
+            )
+            assert "/data/attachments/$key" in text, (
+                f"scripts/check-backup-restore.{name}'s round 2 must write the "
+                f"blob file into the attachments volume, at the fan-out path "
+                f"blob_store.storage_key_for produces, before committing its row"
+            )
+            assert "COMMITTED " in text, (
+                f"scripts/check-backup-restore.{name} must count the blob "
+                f"writer's committed blobs and fail the round if it never "
+                f"committed one - otherwise a writer failing on every iteration "
+                f"makes this round pass while testing nothing"
             )
 
 
