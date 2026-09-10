@@ -5,7 +5,7 @@ afterwards, so they never touch the developer's canonical data. Start the server
 with:
 
     docker compose --env-file .env -f deploy/compose/docker-compose.yml \
-      --profile core up -d
+      --profile core up -d --build
 """
 
 from __future__ import annotations

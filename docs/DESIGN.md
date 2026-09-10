@@ -267,8 +267,17 @@ Database roles deny `UPDATE` and `DELETE` on `thoughts`; an additional trigger r
 CREATE TABLE runs (
   id uuid PRIMARY KEY,
   workspace_id uuid NOT NULL REFERENCES workspaces(id),
+  -- 'embedding_sync' is current schema as of docs/adr/0010's Slice 1
+  -- migration (0008_document_embeddings.py). 'ask' is accepted design
+  -- (docs/adr/0010 §9) but not yet migrated - planned for that ADR's
+  -- "Migration and rollback" step 4, landing alongside `llm_calls.step`
+  -- gaining the same value. Until that slice's migration lands, `kind =
+  -- 'ask'` is rejected by this CHECK constraint; that is expected, not a
+  -- bug, and no Ask code should be implemented against a database that
+  -- does not yet have it.
   kind text NOT NULL CHECK (kind IN
-    ('organize','force_organize','khoj_sync','embedding_sync','export','restore_test','reembed','ask')),
+    ('organize','force_organize','khoj_sync','embedding_sync','export','restore_test','reembed',
+     'replay','regenerate','ask')),
   window_start timestamptz,
   window_end timestamptz,
   status text NOT NULL CHECK (status IN ('queued','running','succeeded','partial','failed')),
@@ -922,8 +931,12 @@ Development target is Windows with WSL2 and Docker Desktop; production-like exec
 
 Suggested Compose profiles:
 
-- `core`: postgres, api, bot, worker;
-- `ai`: the embedding sidecar (`docs/adr/0010`);
+- `core`: postgres, api, bot, worker, and the embedding sidecar
+  (`docs/adr/0010` §5) - first-party and required for semantic search,
+  unlike Khoj below not an optional dependency, so it ships in `core`
+  rather than behind the same flag as the system it is replacing;
+- `ai`: Khoj and its own database, kept buildable during the migration
+  ADR-0010's "Migration and rollback" describes, until it is retired;
 - `observability`: optional local metrics/log tooling;
 - `backup`: one-shot backup and restore-test jobs.
 

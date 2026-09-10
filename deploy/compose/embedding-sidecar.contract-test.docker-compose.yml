@@ -1,0 +1,38 @@
+# Publishes the embedding sidecar's port to loopback, for its own contract
+# tests (tests/contract/embedding_sidecar/) to reach it from the host.
+# Applied only by scripts/check.sh, scripts/check.ps1, and
+# .github/workflows/ci.yml's contract-test steps - NOT part of a normal
+# `--profile core up`, which deliberately does not publish this service to
+# any host port at all (deploy/compose/docker-compose.yml's own header
+# comment on `embedding-sidecar` has the full reasoning: this service has
+# no authentication of its own, so "reachable by any process on the host"
+# is broader exposure than day-to-day operation needs - only other
+# containers on the compose network do).
+#
+#   docker compose -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
+#     --profile core up -d --build embedding-sidecar
+#
+# Deliberately relaxes egress isolation for the duration of the contract
+# tests only (review finding + a trap found while verifying the fix):
+# embedding-sidecar's base definition (deploy/compose/docker-compose.yml)
+# attaches it ONLY to the `embedding` network, which is `internal: true`.
+# Verified directly on Docker 29.2.1: a container attached only to an
+# `internal: true` network SILENTLY LOSES its published host port - the
+# service comes up healthy and answers on its own loopback, but
+# `docker compose ps` shows a bare `8099/tcp` with no host binding and the
+# host gets no connection at all (egress/DNS are correctly blocked; the
+# port publication just evaporates). Adding this second, ordinary bridge
+# network here - for this overlay ONLY, never applied by a normal
+# `--profile core up` - restores the host port for exactly as long as the
+# contract tests need it, without touching the base file's isolation.
+
+services:
+  embedding-sidecar:
+    networks: [embedding, embedding-contract-test]
+    ports:
+      - "127.0.0.1:${TC_EMBEDDING_SIDECAR_PORT:-8081}:8081"
+
+networks:
+  embedding-contract-test:
+    driver: bridge

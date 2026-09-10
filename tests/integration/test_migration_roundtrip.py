@@ -92,3 +92,61 @@ def test_upgrade_downgrade_upgrade_is_clean(roundtrip_url: URL) -> None:
     # (an orphaned trigger function or index would fail this second upgrade).
     command.upgrade(config, "head")
     assert _public_tables(roundtrip_url) >= FIRST_PARTY_TABLES
+
+
+def test_migration_0008_downgrade_aborts_before_any_ddl_when_an_embedding_sync_run_exists(
+    roundtrip_url: URL,
+) -> None:
+    """Migration 0008's downgrade() drops `document_embeddings` and then
+    restores a `runs_kind_check` that no longer allows `kind='embedding_sync'`
+    (review finding). Without a preflight, that leaves two bad outcomes: the
+    ADD CONSTRAINT statement fails outright after the table is already gone,
+    or - if someone "fixes" it by deleting the offending rows first - real
+    run-journal history is silently destroyed just to make a downgrade
+    possible. This proves the preflight added to downgrade() catches the
+    unsafe case and refuses BEFORE dropping anything at all.
+    """
+    config = _alembic_config(roundtrip_url)
+    command.upgrade(config, "head")
+
+    engine = sa.create_engine(roundtrip_url, connect_args=CONNECT_ARGS)
+    try:
+        with engine.begin() as connection:
+            workspace_id = connection.execute(
+                sa.text(
+                    "INSERT INTO workspaces (id, name, mode, timezone, digest_local_time)"
+                    " VALUES (gen_random_uuid(), 'synthetic workspace', 'personal', 'UTC', '20:00')"
+                    " RETURNING id"
+                )
+            ).scalar_one()
+            connection.execute(
+                sa.text(
+                    "INSERT INTO runs (id, workspace_id, kind, status)"
+                    " VALUES (gen_random_uuid(), :workspace_id, 'embedding_sync', 'succeeded')"
+                ),
+                {"workspace_id": workspace_id},
+            )
+
+        assert "document_embeddings" in _public_tables(roundtrip_url)
+
+        with pytest.raises(Exception, match="embedding_sync"):
+            command.downgrade(config, "0007")
+
+        # The preflight must have refused BEFORE the DROP TABLE ran - not
+        # merely failed later on the ADD CONSTRAINT, which would already
+        # have destroyed the table by that point.
+        assert "document_embeddings" in _public_tables(roundtrip_url), (
+            "downgrade dropped document_embeddings despite an unsafe "
+            "embedding_sync run existing - the preflight did not run before "
+            "the destructive DDL"
+        )
+
+        with engine.begin() as connection:
+            remaining = connection.execute(
+                sa.text("SELECT count(*) FROM runs WHERE kind = 'embedding_sync'")
+            ).scalar_one()
+        assert remaining == 1, (
+            "the embedding_sync run itself must be untouched by the refused downgrade"
+        )
+    finally:
+        engine.dispose()

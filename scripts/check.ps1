@@ -108,6 +108,38 @@ try {
     Invoke-Step "unit tests"          { & $Uv run pytest -m "not integration and not contract" }
 
     # -----------------------------------------------------------------------
+    # apps/embedding_sidecar carries its own toolchain (Python 3.12, own
+    # pyproject.toml/uv.lock - docs/adr/0010 §5) and is deliberately excluded
+    # from the root uv workspace, so none of the five steps above ever touch
+    # it. Required, not skippable: this needs only uv + network access to
+    # provision Python 3.12 (the same way the root project's own 3.14 is
+    # provisioned), not Docker - a ruff/mypy/test regression here must fail
+    # the same way a root regression does, not silently pass because nothing
+    # ever ran it (CLAUDE.md: "extend both check scripts" whenever a
+    # formatter/linter/type checker/test suite is added).
+    # -----------------------------------------------------------------------
+    Invoke-Step "embedding sidecar: lockfile is current" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv lock --check } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: format (ruff)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run ruff format --check . } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: lint (ruff)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run ruff check . } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: types (mypy)" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run mypy } finally { Pop-Location }
+    }
+    Invoke-Step "embedding sidecar: unit tests" {
+        Push-Location apps/embedding_sidecar
+        try { & $Uv run pytest } finally { Pop-Location }
+    }
+
+    # -----------------------------------------------------------------------
     # Integration tests: require PostgreSQL from the 'core' compose profile.
     # -----------------------------------------------------------------------
     Write-Host ""
@@ -132,7 +164,7 @@ try {
         Write-Host "OK: integration tests"
     }
     else {
-        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d)"
+        $Script:Skipped += "integration tests (Docker engine unavailable; start Docker Desktop, then: docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core up -d --build)"
         Write-Host "SKIPPED: Docker engine unavailable" -ForegroundColor Yellow
     }
 
@@ -250,6 +282,52 @@ try {
             finally {
                 Remove-Item -LiteralPath $llmEnv -ErrorAction SilentlyContinue
             }
+
+            # ---------------------------------------------------------------
+            # Embedding sidecar network isolation (review finding): a
+            # regression that silently drops embedding-sidecar's `embedding:
+            # internal: true` network attachment, or the contract-test
+            # overlay's second network that restores its published port,
+            # would otherwise only surface as an unreachable-sidecar SKIP
+            # below - indistinguishable from "the operator simply hasn't
+            # started 'core' yet". This is a static config check
+            # (client-side only, same as the sanity checks above), so it
+            # catches the regression even when nothing is running.
+            # `--format json` + ConvertFrom-Json, not text matching:
+            # compose's rendered YAML nests a service's own `networks:` and
+            # the top-level `networks:` definitions differently, and a text
+            # scan risks confusing one for the other.
+            # ---------------------------------------------------------------
+            $baseConfigJson = & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml `
+                --profile core config --format json 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $baseConfigJson) {
+                throw "FAIL: compose config sanity (rendering 'core' base config as JSON failed)"
+            }
+            $overlayConfigJson = & docker compose --env-file $coreOnlyEnv -f deploy/compose/docker-compose.yml `
+                -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml `
+                --profile core config --format json 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $overlayConfigJson) {
+                throw "FAIL: compose config sanity (rendering 'core' + contract-test overlay config as JSON failed)"
+            }
+            $baseConfig = ($baseConfigJson -join "`n") | ConvertFrom-Json
+            $overlayConfig = ($overlayConfigJson -join "`n") | ConvertFrom-Json
+
+            $baseSidecarNetworks = $baseConfig.services.'embedding-sidecar'.networks
+            $baseSidecarNetworkNames = @($baseSidecarNetworks.PSObject.Properties.Name)
+            if ($baseSidecarNetworkNames -notcontains "embedding") {
+                throw "FAIL: compose config sanity (embedding-sidecar is not attached to the 'embedding' network in the base compose file)"
+            }
+            if (@($baseSidecarNetworkNames | Where-Object { $_ -ne "embedding" }).Count -gt 0) {
+                throw "FAIL: compose config sanity (embedding-sidecar is attached to more than just 'embedding' in the base compose file: $($baseSidecarNetworkNames -join ', '))"
+            }
+            $embeddingNetwork = $baseConfig.networks.embedding
+            if (-not $embeddingNetwork -or -not $embeddingNetwork.internal) {
+                throw "FAIL: compose config sanity (the 'embedding' network is not internal: true in the base compose file)"
+            }
+            $overlaySidecarPorts = $overlayConfig.services.'embedding-sidecar'.ports
+            if (-not $overlaySidecarPorts -or @($overlaySidecarPorts).Count -eq 0) {
+                throw "FAIL: compose config sanity (embedding-sidecar has no published port under the contract-test overlay)"
+            }
         }
         finally {
             $ErrorActionPreference = $previousEap
@@ -271,9 +349,22 @@ try {
     # (Docker being up does not imply this profile was ever started) and an
     # unreachable Khoj is a skip, not a hard failure, until Phase 2 makes it
     # required.
+    #
+    # `--ignore=tests/contract/embedding_sidecar`, not a `tests/contract/khoj`
+    # path filter: some Khoj contract tests deliberately live under
+    # `tests/integration` instead (test_khoj_index_sync_contract.py,
+    # test_khoj_semantic_search_contract.py - see either file's own
+    # docstring), because they need the disposable-database fixtures only
+    # `tests/integration/conftest.py` provides, while still carrying
+    # `pytest.mark.contract` so a skip here is required, not silent. A bare
+    # `tests/contract/khoj` path scope was found to never collect them at
+    # all (Codex review of PR #31) - this selects everything marked
+    # `contract` except the embedding sidecar's own suite (which gets its
+    # own gate below), matching what the original unscoped
+    # `pytest -m contract` collected before this stage was split in two.
     # -----------------------------------------------------------------------
     Write-Host ""
-    Write-Host "--- contract tests" -ForegroundColor Cyan
+    Write-Host "--- contract tests (khoj)" -ForegroundColor Cyan
     $KhojUrl = if ($env:TC_KHOJ_BASE_URL) { $env:TC_KHOJ_BASE_URL } else { "http://127.0.0.1:42110" }
     $KhojUp = $false
     try {
@@ -287,17 +378,52 @@ try {
     if ($KhojUp) {
         $env:TC_REQUIRE_CONTRACT = "1"
         try {
-            & $Uv run pytest -m contract
-            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (exit $LASTEXITCODE)" }
+            & $Uv run pytest -m contract --ignore=tests/contract/embedding_sidecar
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (khoj) (exit $LASTEXITCODE)" }
         }
         finally {
             Remove-Item Env:\TC_REQUIRE_CONTRACT -ErrorAction SilentlyContinue
         }
-        Write-Host "OK: contract tests"
+        Write-Host "OK: contract tests (khoj)"
     }
     else {
-        $Script:Skipped += "contract tests (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)"
+        $Script:Skipped += "contract tests (khoj) (Khoj unreachable at $KhojUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/khoj.docker-compose.yml --profile ai up -d)"
         Write-Host "SKIPPED: Khoj unreachable at $KhojUrl" -ForegroundColor Yellow
+    }
+
+    # -------------------------------------------------------------------
+    # Contract tests: require the embedding sidecar from the 'core' compose
+    # profile (docs/adr/0010). First-party and part of 'core', not an
+    # optional add-on the way Khoj/'ai' is - still gated on explicit
+    # reachability, not a hard failure, since 'core' being started at all is
+    # not implied by Docker merely being available.
+    # -------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- contract tests (embedding sidecar)" -ForegroundColor Cyan
+    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_BASE_URL } else { "http://127.0.0.1:8081" }
+    $EmbeddingSidecarUp = $false
+    try {
+        $response = Invoke-WebRequest -Uri "$EmbeddingSidecarUrl/health" -TimeoutSec 3 -UseBasicParsing
+        if ($response.StatusCode -eq 200) { $EmbeddingSidecarUp = $true }
+    }
+    catch {
+        $EmbeddingSidecarUp = $false
+    }
+
+    if ($EmbeddingSidecarUp) {
+        $env:TC_REQUIRE_CONTRACT = "1"
+        try {
+            & $Uv run pytest -m contract tests/contract/embedding_sidecar
+            if ($LASTEXITCODE -ne 0) { throw "FAIL: contract tests (embedding sidecar) (exit $LASTEXITCODE)" }
+        }
+        finally {
+            Remove-Item Env:\TC_REQUIRE_CONTRACT -ErrorAction SilentlyContinue
+        }
+        Write-Host "OK: contract tests (embedding sidecar)"
+    }
+    else {
+        $Script:Skipped += "contract tests (embedding sidecar) (unreachable at $EmbeddingSidecarUrl; docker compose --env-file .env -f deploy/compose/docker-compose.yml -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml --profile core up -d --build embedding-sidecar)"
+        Write-Host "SKIPPED: embedding sidecar unreachable at $EmbeddingSidecarUrl" -ForegroundColor Yellow
     }
 
     # -----------------------------------------------------------------------

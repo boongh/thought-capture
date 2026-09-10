@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.8",
     "openai>=1.100",
     "httpx>=0.28",
+    "pgvector>=0.3",
 ]
 
 [build-system]

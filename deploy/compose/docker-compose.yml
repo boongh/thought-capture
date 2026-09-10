@@ -9,11 +9,35 @@
 # file, not the repository root.
 #
 # Profiles:
-#   core          postgres, one-shot migrate, api, discord-bot, worker
+#   core          postgres, one-shot migrate, api, discord-bot, worker,
+#                 embedding-sidecar (docs/adr/0010) - first-party local
+#                 embedding, unlike Khoj below not an optional dependency
 #   ai            Khoj and its own database (docs/adr/0003) - a SEPARATE file,
 #                 deploy/compose/khoj.docker-compose.yml, passed with a second
 #                 `-f`; see that file's own header for why it is not here.
 #   backup        one-shot backup and restore-test jobs (Phase 3, not yet defined)
+#
+# Networks (docs/DESIGN.md 13: "an internal network"; review finding - this
+# file previously declared no `networks:` at all, so every service landed on
+# Compose's implicit `default` bridge, which has a gateway and full outbound
+# NAT):
+#   default       unchanged behavior - postgres/migrate/api/discord-bot/
+#                 worker, each of which either needs no egress at all or
+#                 already needs it (discord-bot -> Discord, worker ->
+#                 OpenRouter).
+#   embedding     internal: true - no gateway, no egress, no reachability
+#                 from outside this Compose project. embedding-sidecar's
+#                 entire purpose is to see private document text
+#                 (docs/adr/0010 §5) and has no authentication of its own,
+#                 so it gets this network and NOTHING else. api/worker -
+#                 docs/adr/0010 §5's designated callers - are attached to
+#                 BOTH networks: `embedding` to reach the sidecar, `default`
+#                 for everything else they already needed it for.
+#   deploy/compose/embedding-sidecar.contract-test.docker-compose.yml adds a
+#   SECOND, non-internal network to embedding-sidecar ONLY under that overlay
+#   (applied only by scripts/check.*/CI's contract-test steps), because an
+#   internal-only network silently drops a service's published host port -
+#   see that file's own header for the verified detail and why.
 
 name: thought-capture
 
@@ -85,7 +109,16 @@ services:
     # minor. Debian (trixie) rather than Alpine on purpose: musl locale and ICU
     # differences change text collation, which would change full-text and
     # trigram ordering in a system whose correctness depends on retrieval.
-    image: postgres:18.6-trixie
+    #
+    # Built, not pulled directly: deploy/compose/postgres/Dockerfile layers
+    # the `pgvector` extension onto this same pinned base (docs/adr/0010 §2).
+    # Not a second database server the way Khoj's `khoj-db` was - this project
+    # owns and rebuilds this image itself, so there is no external system's
+    # base-image requirement to keep separate from.
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: thought-capture-postgres:local
     profiles: ["core"]
     restart: unless-stopped
     environment:
@@ -163,6 +196,10 @@ services:
       - "127.0.0.1:${TC_API_PORT:-8080}:8080"
     volumes:
       - attachments:/data/attachments
+    # `default` (unchanged) plus `embedding`: api is one of ADR-0010 §5's
+    # designated embedding-sidecar callers (the search-time query embedding
+    # path) - see this file's own header networks comment.
+    networks: [default, embedding]
     healthcheck:
       test:
         ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/live').status==200 else 1)\""]
@@ -189,6 +226,63 @@ services:
     volumes:
       - attachments:/data/attachments
 
+  # Local embedding (docs/adr/0010 §5): a first-party sidecar wrapping
+  # sentence-transformers, its own pinned Python 3.12 image entirely separate
+  # from the workspace image built above (`x-service-image`) - torch/
+  # sentence-transformers ship no cp314 wheel yet (docs/DESIGN.md 5.2's
+  # isolation, previously required of Khoj, now required here too). Holds no
+  # index, no conversation state, no filter logic (docs/DESIGN.md 8.1): a
+  # stateless embed(texts) -> vectors call, reachable from other `core`
+  # services at http://embedding-sidecar:8081 on the internal network.
+  #
+  # Deliberately NOT published to any host port here, unlike postgres/api
+  # above: this service has no authentication of its own (docs/DESIGN.md
+  # 8.1) and has an extensive, still-incomplete-by-design DoS-hardening
+  # story (settings.py's own `limit_concurrency`/`h11_max_incomplete_event_size`
+  # docstrings) - "loopback only" still means "reachable by any process on
+  # the host", which is broader than this service actually needs day to
+  # day (only other containers on this network do). Nothing yet calls this
+  # service (no product-behavior change in this slice); it exists to prove
+  # the sidecar itself boots and answers correctly in isolation.
+  # `embedding-sidecar.contract-test.docker-compose.yml` is a separate
+  # overlay that adds a loopback-published port back, applied only by
+  # scripts/check.*/CI's contract-test steps - see that file's own header.
+  embedding-sidecar:
+    build:
+      context: ../../apps/embedding_sidecar
+      dockerfile: Dockerfile
+    image: thought-capture-embedding-sidecar:local
+    profiles: ["core"]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      # The model is baked into the image at build time (no runtime download),
+      # but loading its weights into memory at process start still takes on
+      # the order of docs/adr/0010 finding 5's ~30s cold start.
+      start_period: 45s
+    # Defense in depth alongside the request-level batch/length/concurrency
+    # bounds this service enforces itself (settings.py): a container-level
+    # ceiling on how much of the host a CPU-bound, unauthenticated-within-
+    # the-network embedding process can consume, matching how this repo
+    # already treats "loopback only" as a boundary, not the only one.
+    mem_limit: ${TC_EMBEDDING_SIDECAR_MEM_LIMIT:-2g}
+    cpus: ${TC_EMBEDDING_SIDECAR_CPU_LIMIT:-2.0}
+    security_opt:
+      - no-new-privileges:true
+    # `embedding` ONLY, deliberately not `default` too (review finding: this
+    # service previously landed on the implicit `default` bridge, which has
+    # a gateway and full outbound NAT - unrestricted egress for a service
+    # whose entire purpose is to see private document text). `embedding` is
+    # `internal: true` below: no gateway, no egress, reachable only by the
+    # other services on this same network (api, worker). See this file's own
+    # header networks comment for the contract-test overlay that adds a
+    # second, non-internal network for THAT overlay only.
+    networks: [embedding]
+
   # Runs the organize/digest scheduler (docs/DESIGN.md 7.2): wakes at the
   # configured local digest time, catches up any missed window on restart,
   # then organizes each subsequent window as it closes. No published ports -
@@ -206,6 +300,21 @@ services:
     environment:
       # organize (docs/DESIGN.md 7.4) runs at digest time, from this service.
       <<: [*service-env, *llm-env]
+    # `default` (unchanged) plus `embedding`: worker is one of ADR-0010 §5's
+    # designated embedding-sidecar callers (the organize-time document
+    # embedding write path) - see this file's own header networks comment.
+    networks: [default, embedding]
+
+networks:
+  # Declared explicitly so it can be named and referenced by services above -
+  # Compose creates this automatically even with no top-level `networks:` key
+  # at all, so declaring it here changes nothing about its own behavior.
+  default: {}
+  # No egress, no gateway, reachable only by services on this project that
+  # explicitly join it (docs/DESIGN.md 13). See this file's own header
+  # networks comment.
+  embedding:
+    internal: true
 
 volumes:
   postgres-data:
