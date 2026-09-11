@@ -32,12 +32,13 @@ from tc_infrastructure.db.tables import (
 pytestmark = pytest.mark.integration
 
 MODEL_ID = "thenlper/gte-small"
+OTHER_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 
-def _vector(seed: float) -> EmbeddingVector:
+def _vector(seed: float, *, model_id: str = MODEL_ID) -> EmbeddingVector:
     return EmbeddingVector(
         values=tuple([seed] * EMBEDDING_DIMENSIONS),
-        model_id=MODEL_ID,
+        model_id=model_id,
         dimensions=EMBEDDING_DIMENSIONS,
     )
 
@@ -358,3 +359,170 @@ async def test_updated_at_only_advances_on_a_real_write(
             )
         )
     assert advanced_updated_at > first_updated_at
+
+
+async def test_same_revision_different_model_replaces_the_stored_row_and_reports_true(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """A forced re-embed sweep (docs/DESIGN.md 8.5) after an embedding-model
+    change writes a new vector for a document whose revision has not moved -
+    the model-gated branch of the write guard (F11)."""
+    workspace_id, _ = fresh_identity
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+
+    async with admin_session_factory() as session, session.begin():
+        document_id, revision_id = await _document_with_revision(
+            session, workspace_id, body="revision one", revision_number=1
+        )
+
+    await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=MODEL_ID),
+    )
+    async with admin_session_factory() as session:
+        first_updated_at = await session.scalar(
+            sa.select(document_embeddings.c.updated_at).where(
+                document_embeddings.c.document_id == document_id
+            )
+        )
+
+    written = await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        revision_number=1,
+        vector=_vector(0.9, model_id=OTHER_MODEL_ID),
+    )
+
+    assert written is True
+    async with admin_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(
+                    document_embeddings.c.revision_id,
+                    document_embeddings.c.embedding,
+                    document_embeddings.c.embedding_model_id,
+                    document_embeddings.c.updated_at,
+                ).where(document_embeddings.c.document_id == document_id)
+            )
+        ).one()
+    assert row.revision_id == revision_id
+    assert row.embedding == list(_vector(0.9, model_id=OTHER_MODEL_ID).values)
+    assert row.embedding_model_id == OTHER_MODEL_ID
+    assert row.updated_at > first_updated_at
+
+
+async def test_same_revision_same_model_does_not_replace_the_stored_row(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """The existing invariant preserved alongside F11: a redundant
+    redelivery of a revision already embedded by the current model is a
+    no-op, not a rewrite of an identical vector."""
+    workspace_id, _ = fresh_identity
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+
+    async with admin_session_factory() as session, session.begin():
+        document_id, revision_id = await _document_with_revision(
+            session, workspace_id, body="revision one", revision_number=1
+        )
+
+    await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=MODEL_ID),
+    )
+    async with admin_session_factory() as session:
+        first_updated_at = await session.scalar(
+            sa.select(document_embeddings.c.updated_at).where(
+                document_embeddings.c.document_id == document_id
+            )
+        )
+
+    written = await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        revision_number=1,
+        vector=_vector(0.9, model_id=MODEL_ID),
+    )
+
+    assert written is False
+    async with admin_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(
+                    document_embeddings.c.embedding,
+                    document_embeddings.c.updated_at,
+                ).where(document_embeddings.c.document_id == document_id)
+            )
+        ).one()
+    assert row.embedding == list(_vector(0.1, model_id=MODEL_ID).values)
+    assert row.updated_at == first_updated_at
+
+
+async def test_older_revision_different_model_does_not_replace_the_stored_row(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """The model gate must not become a back door for stale, out-of-order
+    redeliveries: an older revision is still rejected even when the model
+    also changed."""
+    workspace_id, _ = fresh_identity
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+
+    async with admin_session_factory() as session, session.begin():
+        document_id, first_revision_id = await _document_with_revision(
+            session, workspace_id, body="revision one", revision_number=1
+        )
+        run_id = await session.scalar(
+            sa.select(document_revisions.c.run_id).where(
+                document_revisions.c.id == first_revision_id
+            )
+        )
+        second_revision_id = await _add_revision(
+            session,
+            workspace_id=workspace_id,
+            document_id=document_id,
+            parent_revision_id=first_revision_id,
+            run_id=run_id,
+            revision_number=2,
+            body="revision two",
+        )
+
+    await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=second_revision_id,
+        revision_number=2,
+        vector=_vector(0.9, model_id=MODEL_ID),
+    )
+
+    written = await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=first_revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=OTHER_MODEL_ID),
+    )
+
+    assert written is False
+    async with admin_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(
+                    document_embeddings.c.revision_id,
+                    document_embeddings.c.embedding,
+                    document_embeddings.c.embedding_model_id,
+                ).where(document_embeddings.c.document_id == document_id)
+            )
+        ).one()
+    assert row.revision_id == second_revision_id
+    assert row.embedding == list(_vector(0.9, model_id=MODEL_ID).values)
+    assert row.embedding_model_id == MODEL_ID

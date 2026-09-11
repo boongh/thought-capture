@@ -62,10 +62,13 @@ class DeliverEmbeddingSync:
         #
         # Unlike DeliverKhojSync, not every success path here is a genuine
         # write: ``writer.upsert`` returns False when a strictly-newer
-        # revision is already stored (the out-of-order-redelivery guard,
-        # docs/DESIGN.md 8.4). That is still a correctly handled event - there
-        # was nothing newer to write - so both outcomes are "delivered",
-        # never "failed".
+        # revision is already stored, or when this exact revision is already
+        # embedded by this same model (the out-of-order-redelivery guard,
+        # docs/DESIGN.md 8.4). In the first case there was nothing newer to
+        # write; in the second, a forced re-embed sweep (docs/DESIGN.md 8.5)
+        # that is re-run after partial completion correctly finds nothing
+        # left to do for that revision. Both are correctly handled events, so
+        # both outcomes are "delivered", never "failed".
         try:
             revision = await self._source.get_revision(
                 workspace_id=event.workspace_id, document_id=event.document_id

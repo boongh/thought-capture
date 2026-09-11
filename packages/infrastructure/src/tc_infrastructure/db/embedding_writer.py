@@ -34,15 +34,22 @@ class PostgresEmbeddingWriter:
         vector: EmbeddingVector,
     ) -> bool:
         """Returns ``False`` (no write) when a strictly-newer revision is
-        already stored - the out-of-order-redelivery guard: an at-least-once,
-        out-of-order outbox redelivery must never overwrite a newer embedding
-        with an older one.
+        already stored, or when the stored row is already the *same*
+        revision embedded by the *same* model - the out-of-order-redelivery
+        guard: an at-least-once, out-of-order outbox redelivery must never
+        overwrite a newer embedding with an older one, and a redundant
+        redelivery of a revision already embedded by the current model must
+        be a no-op rather than rewriting an identical vector.
 
         The guard compares the incoming ``revision_number`` against the
         stored row's own revision's number, looked up via a correlated
         subquery against ``document_revisions`` keyed on the stored
         ``revision_id`` - ``document_embeddings`` itself carries no
-        ``revision_number`` column to compare directly.
+        ``revision_number`` column to compare directly. A same-revision
+        write is additionally admitted when ``embedding_model_id`` differs,
+        so a forced re-embed sweep (docs/DESIGN.md 8.5) after an embedding
+        model change can replace a vector without the document's revision
+        having moved.
         """
         # Raw SQL text for just this fragment, deliberately not a SQLAlchemy
         # ORM subquery: `ON CONFLICT DO UPDATE ... WHERE` is not a SELECT, so
@@ -59,10 +66,32 @@ class PostgresEmbeddingWriter:
         # to the pre-existing row - the same way `excluded.column` resolves to
         # the incoming row - so writing it as text is the correct fix, not a
         # workaround.
+        #
+        # The second (OR'd) branch admits a same-revision write when the
+        # stored row's `embedding_model_id` differs from the incoming one -
+        # this is what lets a forced re-embed sweep replace every vector
+        # after an operator swaps the embedding model, even though no
+        # document's revision moved. It is deliberately model-gated rather
+        # than an unconditional `<=`: a stale, out-of-order redelivery of an
+        # *older* revision under the *same* model still fails both branches
+        # (equal-revision check requires equality, and it isn't), so it
+        # stays rejected exactly as before. Only "same revision, different
+        # model" is newly admitted - "same revision, same model" still
+        # returns `False`, so a forced sync that is re-run after partial
+        # completion is cheap: already-migrated rows are skipped, not
+        # rewritten with an identical vector.
         guard = sa.text(
             "(SELECT revision_number FROM document_revisions "
-            "WHERE id = document_embeddings.revision_id) < :incoming_revision_number"
-        ).bindparams(incoming_revision_number=revision_number)
+            "WHERE id = document_embeddings.revision_id) < :incoming_revision_number "
+            "OR ("
+            "(SELECT revision_number FROM document_revisions "
+            "WHERE id = document_embeddings.revision_id) = :incoming_revision_number "
+            "AND document_embeddings.embedding_model_id IS DISTINCT FROM :incoming_model_id"
+            ")"
+        ).bindparams(
+            incoming_revision_number=revision_number,
+            incoming_model_id=vector.model_id,
+        )
 
         insert_statement = pg_insert(document_embeddings).values(
             document_id=document_id,

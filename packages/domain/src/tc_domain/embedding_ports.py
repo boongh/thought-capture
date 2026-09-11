@@ -133,11 +133,16 @@ class EmbeddingWriter(Protocol):
         """Store ``vector`` for ``revision_id``, returning whether the row was
         actually written.
 
-        Returns ``False`` when a strictly-newer revision is already stored -
-        this is the out-of-order-redelivery guard (docs/DESIGN.md 8.4,
-        write-path guard 1): an at-least-once, out-of-order outbox
+        Returns ``False`` when a strictly-newer revision is already stored,
+        or when this exact revision is already embedded by this same
+        model - this is the out-of-order-redelivery guard (docs/DESIGN.md
+        8.4, write-path guard 1): an at-least-once, out-of-order outbox
         redelivery must never overwrite a newer embedding with an older
-        one.
+        one. The second case is what makes a forced re-embed sync
+        (docs/DESIGN.md 8.5) cheap to re-run after partial completion:
+        revisions already migrated to the new model are skipped rather than
+        rewritten with an identical vector, while a same-revision write
+        under a *different* model is still admitted and returns ``True``.
 
         ``workspace_id`` is part of this Protocol's documented contract but
         is not independently re-verified by the write itself -
