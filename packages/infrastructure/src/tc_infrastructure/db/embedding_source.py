@@ -47,9 +47,7 @@ class PostgresEmbeddingSource:
             row = (await session.execute(statement)).first()
 
         if row is None:
-            raise EmbeddingSourceNotFound(
-                f"no document {document_id} in workspace {workspace_id}"
-            )
+            raise EmbeddingSourceNotFound(f"no document {document_id} in workspace {workspace_id}")
 
         return RevisionForEmbedding(
             document_id=row.id,
