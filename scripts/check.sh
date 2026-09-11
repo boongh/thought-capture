@@ -390,7 +390,7 @@ fi
 # merely being available (same reasoning as the integration-test gate above).
 # ---------------------------------------------------------------------------
 printf '\n--- contract tests (embedding sidecar)\n'
-embedding_sidecar_url="${TC_EMBEDDING_SIDECAR_BASE_URL:-http://127.0.0.1:8081}"
+embedding_sidecar_url="${TC_EMBEDDING_SIDECAR_HOST_BASE_URL:-http://127.0.0.1:8081}"
 if curl --silent --fail --max-time 3 "$embedding_sidecar_url/health" >/dev/null 2>&1; then
   if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract tests/contract/embedding_sidecar; then
     printf 'FAIL: contract tests (embedding sidecar)\n' >&2

@@ -310,13 +310,27 @@ services:
       <<: [*service-env, *llm-env]
       # Only worker constructs HttpEmbeddingClient/DeliverEmbeddingSync
       # (apps/worker/src/tc_worker/__main__.py) - api's admin endpoint only
-      # enqueues, it never embeds - so these two operator-tunable settings
-      # (env.example, Settings defaults 30.0s / 20) are forwarded here only,
-      # matching the llm-env pattern above of scoping a variable to the
-      # services with an actual code path that reads it. Without this,
-      # Compose never injects an arbitrary .env key into a container's
-      # runtime environment on its own, so an operator's override in .env
-      # would silently have no effect (review finding).
+      # enqueues, it never embeds - so these operator-tunable settings
+      # (env.example, Settings defaults) are forwarded here only, matching the
+      # llm-env pattern above of scoping a variable to the services with an
+      # actual code path that reads it. Without this, Compose never injects
+      # an arbitrary .env key into a container's runtime environment on its
+      # own, so an operator's override in .env would silently have no effect
+      # (review finding F12).
+      #
+      # TC_EMBEDDING_SIDECAR_BASE_URL means "the URL a container uses" - the
+      # in-container default below matches Settings' own default
+      # (config.py's `embedding_sidecar_base_url`) and env.example documents
+      # it with that same service-name value. This is a DIFFERENT variable
+      # from TC_EMBEDDING_SIDECAR_HOST_BASE_URL (env.example, read only by
+      # tests/contract/embedding_sidecar/conftest.py and both check scripts),
+      # which is "the URL the host uses" once the contract-test overlay
+      # publishes the port to loopback. One name previously carried both
+      # meanings; forwarding it naively here with a loopback default would
+      # have injected an unreachable 127.0.0.1 URL into every operator's
+      # worker container (review finding F12) - see env.example's own
+      # comment on both variables for the full reasoning.
+      TC_EMBEDDING_SIDECAR_BASE_URL: ${TC_EMBEDDING_SIDECAR_BASE_URL:-http://embedding-sidecar:8081}
       TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS: ${TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS:-30.0}
       TC_EMBEDDING_SYNC_BATCH_SIZE: ${TC_EMBEDDING_SYNC_BATCH_SIZE:-20}
     # `default` (unchanged) plus `embedding`: worker is one of ADR-0010 §5's

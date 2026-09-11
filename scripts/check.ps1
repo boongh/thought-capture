@@ -437,7 +437,7 @@ try {
     # -------------------------------------------------------------------
     Write-Host ""
     Write-Host "--- contract tests (embedding sidecar)" -ForegroundColor Cyan
-    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_BASE_URL } else { "http://127.0.0.1:8081" }
+    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_HOST_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_HOST_BASE_URL } else { "http://127.0.0.1:8081" }
     $EmbeddingSidecarUp = $false
     try {
         $response = Invoke-WebRequest -Uri "$EmbeddingSidecarUrl/health" -TimeoutSec 3 -UseBasicParsing
