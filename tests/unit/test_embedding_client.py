@@ -79,6 +79,70 @@ async def test_embed_happy_path() -> None:
     assert vectors[1].values == tuple(_vector(0.2))
 
 
+async def test_embed_reads_truncated_flags_in_order() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+                "model_revision": "abc123",
+                "dimensions": DIMENSIONS,
+                "vectors": [_vector(0.1), _vector(0.2)],
+                "truncated": [True, False],
+            },
+        )
+
+    http, client = _client_with(handler)
+    async with http:
+        vectors = await client.embed(("first", "second"))
+
+    assert vectors[0].truncated is True
+    assert vectors[1].truncated is False
+
+
+async def test_embed_defaults_truncated_to_false_when_key_absent() -> None:
+    """An older sidecar that predates the ``truncated`` field omits the key
+    entirely - this must not raise, and every vector must default to
+    untruncated (the schema addition is genuinely additive)."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+                "model_revision": "abc123",
+                "dimensions": DIMENSIONS,
+                "vectors": [_vector(0.1), _vector(0.2)],
+            },
+        )
+
+    http, client = _client_with(handler)
+    async with http:
+        vectors = await client.embed(("first", "second"))
+
+    assert vectors[0].truncated is False
+    assert vectors[1].truncated is False
+
+
+async def test_embed_raises_when_truncated_length_mismatches_vector_count() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+                "model_revision": "abc123",
+                "dimensions": DIMENSIONS,
+                "vectors": [_vector(0.1), _vector(0.2)],
+                "truncated": [True],
+            },
+        )
+
+    http, client = _client_with(handler)
+    async with http:
+        with pytest.raises(EmbeddingUnavailableError):
+            await client.embed(("first", "second"))
+
+
 @pytest.mark.parametrize("status_code", [500, 503, 429])
 async def test_embed_raises_on_non_2xx_status(status_code: int) -> None:
     """503 (model still loading) and 429 (at capacity) are exactly as

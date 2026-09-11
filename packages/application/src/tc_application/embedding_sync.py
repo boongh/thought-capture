@@ -71,6 +71,17 @@ class DeliverEmbeddingSync:
                 workspace_id=event.workspace_id, document_id=event.document_id
             )
             (vector,) = await self._embed.embed((revision.body_markdown,))
+            if vector.truncated:
+                # Observability only (docs/plans/khoj-retirement-completion.md
+                # Decision D) - never handled differently, never chunked. Ids
+                # only, same as the failure log below.
+                logger.info(
+                    "embedding_sync.truncated",
+                    extra={
+                        "event_id": str(event.event_id),
+                        "document_id": str(event.document_id),
+                    },
+                )
             await self._writer.upsert(
                 workspace_id=event.workspace_id,
                 document_id=event.document_id,

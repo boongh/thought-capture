@@ -4,7 +4,9 @@
 Talks to the sidecar's real contract (`apps/embedding_sidecar/src/
 tc_embedding_sidecar/schemas.py`): ``POST /embed`` with
 ``{"texts": [...]}``, returning ``{"model_id", "model_revision",
-"dimensions", "vectors"}``. Every failure mode - unreachable sidecar,
+"dimensions", "vectors", "truncated"}`` (``truncated`` is optional for
+backward compatibility with older sidecars that predate it). Every failure
+mode - unreachable sidecar,
 timeout, a non-2xx status (including 503 "still loading" and 429 "at
 capacity"), a malformed/missing JSON body, or a response shape that does
 not match what was asked for - is mapped to ``EmbeddingUnavailableError``,
@@ -122,15 +124,39 @@ class HttpEmbeddingClient:
         if len(vectors) != expected_count:
             raise ValueError(f"expected {expected_count} vector(s), got {len(vectors)}")
 
+        # ``truncated`` is optional/backward-compatible: an older sidecar
+        # that predates this field simply omits the key, and every vector
+        # defaults to untruncated - only a *present-but-mismatched-length*
+        # value is treated as a genuine shape violation, same as the
+        # vector-count check above.
+        truncated_flags: object = payload.get("truncated")
+        if truncated_flags is None:
+            truncated_values: list[bool] = [False] * expected_count
+        else:
+            if not isinstance(truncated_flags, list):
+                raise ValueError(
+                    f"expected truncated to be a list, got {type(truncated_flags).__name__}"
+                )
+            if len(truncated_flags) != expected_count:
+                raise ValueError(
+                    f"expected {expected_count} truncated flag(s), got {len(truncated_flags)}"
+                )
+            truncated_values = [bool(flag) for flag in truncated_flags]
+
         combined_model_id = compose_embedding_model_id(model_id, model_revision)
         result = []
-        for vector in vectors:
+        for vector, truncated in zip(vectors, truncated_values, strict=True):
             if not isinstance(vector, (list, tuple)):
                 raise ValueError(f"expected a vector, got {type(vector).__name__}")
             values = tuple(float(v) for v in vector)
             if len(values) != dimensions:
                 raise ValueError(f"expected a {dimensions}-dimensional vector, got {len(values)}")
             result.append(
-                EmbeddingVector(values=values, model_id=combined_model_id, dimensions=dimensions)
+                EmbeddingVector(
+                    values=values,
+                    model_id=combined_model_id,
+                    dimensions=dimensions,
+                    truncated=truncated,
+                )
             )
         return tuple(result)

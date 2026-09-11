@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from tc_application.embedding_sync import DeliverEmbeddingSync, ForceEmbeddingSync
 from tc_domain.embedding_ports import (
     EmbeddingUnavailableError,
@@ -272,6 +274,34 @@ async def test_the_error_recorded_never_contains_document_content() -> None:
 
     assert outbox.failed[0]["error"] == "EmbeddingUnavailableError"
     assert "secret" not in str(outbox.failed[0]["error"])
+
+
+async def test_a_truncated_embedding_is_logged_with_only_ids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """docs/plans/khoj-retirement-completion.md Decision D: truncation must
+    be operator-visible, never handled differently. The log must carry only
+    ids, never the document body or embedding values."""
+    event = a_pending(document_id=DOCUMENT_ID)
+    outbox = FakeEmbeddingSyncOutbox([event])
+    truncated_vector = EmbeddingVector(
+        values=(0.1, 0.2, 0.3), model_id="fake-model", dimensions=3, truncated=True
+    )
+    embed = FakeEmbeddingPort(vector=truncated_vector)
+    deliver = _deliver(outbox, embed=embed)
+
+    with caplog.at_level("INFO"):
+        synced = await deliver()
+
+    assert synced == 1
+    assert outbox.delivered == [event.event_id]
+    truncated_records = [r for r in caplog.records if r.message == "embedding_sync.truncated"]
+    assert len(truncated_records) == 1
+    record = truncated_records[0]
+    assert record.event_id == str(event.event_id)  # type: ignore[attr-defined]
+    assert record.document_id == str(DOCUMENT_ID)  # type: ignore[attr-defined]
+    assert not hasattr(record, "body_markdown")
+    assert REVISION.body_markdown not in caplog.text
 
 
 async def test_force_sync_delegates_to_the_enqueuer_and_returns_its_count() -> None:

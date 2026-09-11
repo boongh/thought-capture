@@ -54,6 +54,7 @@ async def test_embed_returns_the_right_count_and_dimensionality(
     for vector in vectors:
         assert vector.dimensions == EMBEDDING_DIMENSIONS
         assert len(vector.values) == EMBEDDING_DIMENSIONS
+        assert isinstance(vector.truncated, bool)
 
 
 async def test_an_over_limit_batch_surfaces_as_embedding_unavailable(
