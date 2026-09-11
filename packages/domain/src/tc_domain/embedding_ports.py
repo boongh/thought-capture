@@ -31,6 +31,12 @@ class EmbeddingVector:
     values: tuple[float, ...]
     model_id: str
     dimensions: int
+    truncated: bool = False
+    """``True`` when the embedding model's tokenizer truncated this text
+    before encoding, so ``values`` represents only the opening portion of the
+    input, not the whole document (docs/plans/khoj-retirement-completion.md
+    Decision D). Defaults to ``False`` so existing callers/fixtures that
+    construct this type without the field are unaffected."""
 
 
 @runtime_checkable
@@ -108,8 +114,8 @@ class EmbeddingSource(Protocol):
     async def get_revision(
         self, *, workspace_id: uuid.UUID, document_id: uuid.UUID
     ) -> RevisionForEmbedding:
-        """Raise unless the document resolves and belongs to this workspace -
-        never on ``document_id`` alone."""
+        """Raise ``EmbeddingSourceNotFound`` unless the document resolves and
+        belongs to this workspace - never on ``document_id`` alone."""
         ...
 
 
@@ -132,6 +138,15 @@ class EmbeddingWriter(Protocol):
         write-path guard 1): an at-least-once, out-of-order outbox
         redelivery must never overwrite a newer embedding with an older
         one.
+
+        ``workspace_id`` is part of this Protocol's documented contract but
+        is not independently re-verified by the write itself -
+        ``document_embeddings`` has no ``workspace_id`` column by design
+        (ADR-0010 3). Correctness depends entirely on the caller always
+        deriving ``revision_id``/``revision_number`` from the
+        workspace-scoped ``EmbeddingSource.get_revision`` before calling
+        ``upsert``. This is a documented invariant implementations may rely
+        on, not an oversight.
         """
         ...
 
