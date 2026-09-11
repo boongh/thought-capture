@@ -473,10 +473,21 @@ while true; do
   # its bytes on disk.
   printf '%s' "$content" >"/data/attachments/$key"
   sync
-  if psql -v ON_ERROR_STOP=1 --quiet -h postgres -U tc_migrator -d thought_capture \
+  # Diagnostic (review finding, fourth round): the `if ... >/dev/null 2>&1`
+  # form this used to have swallows every failure completely - a writer
+  # failing on every single attempt (wrong host, wrong role, wrong
+  # password, schema drift) produces the exact same empty log as one that
+  # simply has not run yet, making the two indistinguishable from outside
+  # the container. Capturing psql's stderr and printing it (rate-limited to
+  # roughly once a second, not once per 50ms attempt) turns a silent,
+  # permanent failure into a diagnosable one without flooding the log on
+  # the expected happy path where every attempt already prints COMMITTED.
+  if psql_stderr="$(psql -v ON_ERROR_STOP=1 --quiet -h postgres -U tc_migrator -d thought_capture \
     -c "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$sha', $size, 'text/plain', '$key')" \
-    >/dev/null 2>&1; then
+    2>&1 >/dev/null)"; then
     echo "COMMITTED $sha"
+  elif [[ $((i % 20)) -eq 1 ]]; then
+    echo "INSERT_FAILED (attempt $i): $psql_stderr" >&2
   fi
   sleep 0.05
 done
@@ -568,7 +579,7 @@ while [[ "$writer_ready_waited" -lt 30 ]]; do
 done
 if [[ "$writer_ready" -eq 0 ]]; then
   printf 'FAIL: the concurrent blob writer never committed a blob within 6s of starting - it may have failed to start or connect\n' >&2
-  docker logs "$blob_writer_container" 2>&1 >&2 || true
+  docker logs "$blob_writer_container" >&2 2>&1 || true
   exit 1
 fi
 

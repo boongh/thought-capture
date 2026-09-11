@@ -540,8 +540,15 @@ while true; do
   # premise of the fix under test.
   printf '%s' "$content" >"/data/attachments/$key"
   sync
-  if psql -v ON_ERROR_STOP=1 --quiet -h postgres -U tc_migrator -d thought_capture -c "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$sha', $size, 'text/plain', '$key')" >/dev/null 2>&1; then
+  # Diagnostic (review finding, fourth round): capture and periodically
+  # print psql's stderr on failure instead of swallowing it entirely - a
+  # writer failing on every single attempt (wrong host, wrong role, wrong
+  # password, schema drift) used to produce the exact same empty log as one
+  # that simply has not run yet.
+  if psql_stderr="$(psql -v ON_ERROR_STOP=1 --quiet -h postgres -U tc_migrator -d thought_capture -c "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$sha', $size, 'text/plain', '$key')" 2>&1 >/dev/null)"; then
     echo "COMMITTED $sha"
+  elif [[ $((i % 20)) -eq 1 ]]; then
+    echo "INSERT_FAILED (attempt $i): $psql_stderr" >&2
   fi
   sleep 0.05
 done
