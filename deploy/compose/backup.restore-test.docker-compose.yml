@@ -1,0 +1,130 @@
+# Restore validation: proves a backup.sh dump can actually be restored, not
+# only that pg_dump exited 0. Run via scripts/restore-test.sh/.ps1, never
+# `docker compose` directly - the wrapper tears this stack down through
+# scripts/compose-teardown.sh/.ps1 afterward regardless of outcome.
+#
+#   docker compose --env-file .env -f deploy/compose/backup.restore-test.docker-compose.yml \
+#     up -d --build --wait postgres-scratch
+#   docker compose --env-file .env -f deploy/compose/backup.restore-test.docker-compose.yml \
+#     run --rm restore-test
+#
+# A DIFFERENT project name from the main stack's `thought-capture`
+# (deploy/compose/docker-compose.yml) is the entire safety property this
+# file exists for: `postgres-scratch` below has its own Docker volume, and
+# that volume lives entirely inside THIS project. Even a completely
+# unscoped `docker compose down -v` run against this file cannot reach the
+# real dev stack's `postgres-data`/`attachments` volumes, because they are
+# not part of this project - not because anyone remembered a flag
+# (docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md is
+# exactly the failure mode this sidesteps by construction).
+#
+# Networks (review finding F5; the same convention and the same wording as
+# deploy/compose/docker-compose.yml's own `embedding` network): this file
+# declared no `networks:` at all, so both services landed on Compose's
+# implicit `default` bridge, which has a gateway and full outbound NAT. This
+# job restores a dump whose only integrity evidence is a checksum stored in
+# the same mutable directory as the dump, then runs `pg_restore` over it -
+# nothing here has any reason to reach the internet, so `restore-test`
+# below declares an internal: true network and both services join it and
+# nothing else. `postgres-scratch` publishes no host port and `restore-test`
+# needs no egress, so nothing legitimate breaks; image builds are unaffected,
+# because building does not run on this network.
+name: thought-capture-restore-test
+
+services:
+  postgres-scratch:
+    # The SAME image deploy/compose/docker-compose.yml's own `postgres`
+    # service builds - not stock `postgres:18.6-trixie`. A real backup of
+    # the merged system (docs/adr/0010 §2) contains `CREATE EXTENSION
+    # vector` from migration 0008; restoring that into a Postgres without
+    # pgvector installed would fail pg_restore outright, which is exactly
+    # the gap a review of this PR found: this service used to be stock
+    # Postgres, so restore-test could only ever have validated a database
+    # shaped like the pre-pgvector schema, never the one this project
+    # actually runs. Reusing the same `image:` tag (not a separate
+    # Dockerfile copy) means these two services can never drift apart on
+    # which pgvector version is installed.
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    image: thought-capture-postgres:local
+    restart: "no"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
+      POSTGRES_USER: ${POSTGRES_USER:-tc_migrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      # Consumed by initdb/01-roles.sh below - the SAME script the real
+      # stack's own `postgres` service runs, so this scratch cluster
+      # provisions tc_app exactly the way a real recovery host would
+      # (review finding: this service used to omit both the mount and this
+      # variable, so tc_app never existed here at all and a restore whose
+      # dump referenced it - once --no-privileges was dropped from backup.sh
+      # - would fail outright rather than silently proving nothing).
+      TC_APP_DB_PASSWORD: ${TC_APP_DB_PASSWORD:?TC_APP_DB_PASSWORD must be set in .env}
+    # No `ports:` - reachable only from restore-test, over this project's
+    # own internal network. Nothing here needs a host port at all.
+    # No bind-mounted DATA volume, no named volume either: an anonymous
+    # volume scoped to this project, created fresh and discarded with the
+    # rest of this project's resources at the end of every run - there is
+    # nothing here for a teardown to threaten in the first place.
+    volumes:
+      # Runs once, at cluster creation, same as the real stack's own
+      # `postgres` service - provisions the tc_app role before pg_restore
+      # ever runs, so the dump's `GRANT ... TO tc_app` statements have a
+      # role to land on.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      - /var/lib/postgresql:uid=999,gid=999
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tc_migrator} -d ${POSTGRES_DB:-thought_capture}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks: [restore-test]
+
+  restore-test:
+    # Digest-pinned, not the bare mutable tag (review finding): this job
+    # receives the database password and reads the full plaintext backup -
+    # same reasoning and same digest as deploy/compose/docker-compose.yml's
+    # `backup` service.
+    image: postgres:18.6-trixie@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    restart: "no"
+    depends_on:
+      postgres-scratch:
+        condition: service_healthy
+    # Non-root (review finding): unlike `backup` below, this job never
+    # writes to a host path (its one bind mount is read-only) and needs no
+    # root step to fix ownership first, so it can run directly as the
+    # image's own built-in `postgres` user (uid 999) - the same user
+    # backup.sh (deploy/compose/backup/backup.sh) drops to via `gosu` before
+    # it ever writes a file, so every file this job reads under /backups is
+    # already owned by this same uid.
+    user: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tc_migrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
+      # Lets this job connect AS tc_app for its live privilege smoke test
+      # (backup/restore-test.sh), not only compare a catalog snapshot.
+      TC_APP_DB_PASSWORD: ${TC_APP_DB_PASSWORD:?TC_APP_DB_PASSWORD must be set in .env}
+    volumes:
+      # Read-only: this job proves a backup can be restored, it must never
+      # be able to modify the backup it is validating.
+      - ${TC_BACKUP_ROOT:-./backups}:/backups:ro
+      - ./backup/restore-test.sh:/restore-test.sh:ro
+    entrypoint: ["/bin/bash", "/restore-test.sh"]
+    security_opt:
+      - no-new-privileges:true
+    networks: [restore-test]
+
+networks:
+  # No egress, no gateway, reachable only by services on this project that
+  # explicitly join it (docs/DESIGN.md 13). See this file's own header
+  # networks comment.
+  restore-test:
+    internal: true

@@ -1,12 +1,15 @@
-# The Dockerfile only ever COPYs pyproject.toml/uv.lock/.python-version/src/
-# (deploy/compose/docker-compose.yml's `embedding-sidecar` service builds
-# this whole directory as its context) - everything below is real local
-# state `docker build` would otherwise tar up and send to the daemon on
-# every rebuild for nothing, including a multi-GB `.venv` (torch/
-# sentence-transformers) once this project has been synced locally once.
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Allowlist, not a denylist (review finding): the Dockerfile only ever
+# COPYs pyproject.toml/uv.lock/.python-version/src/ (deploy/compose/
+# docker-compose.yml's `embedding-sidecar` service builds this whole
+# directory as its context), so `*` excludes everything by default and only
+# those paths are let back in below. A denylist that names just the known
+# junk (.venv/, caches) instead still hands the build context - and
+# therefore the image's build history - any `.env*` file, private key, or
+# other real local data a developer happens to have sitting under this
+# directory, none of which the image needs.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!src
+!src/**

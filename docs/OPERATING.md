@@ -272,6 +272,67 @@ something this project's code can check in advance - the API only learns
 that when a chat call actually fails, at which point `TC_ASK_ENABLED=true`
 still reports `enabled: true, degraded: true`, not `enabled: false`.
 
-Backup and restore jobs and the future unified custom UI are not runnable
-yet. The `backup` Compose profile described in the design is likewise not
-defined yet.
+Local backup and restore validation ARE runnable (docs/incidents/0001-docker-
+compose-down-deleted-the-real-dev-stack.md's residual-risk finding): `scripts/
+backup.sh`/`.ps1` runs the `backup` Compose profile - `pg_dump` in custom
+format at one consistent database snapshot, written atomically to a HOST
+directory (`TC_BACKUP_ROOT`, never a Docker volume), plus an attachment
+manifest/incremental copy and a `tc_app` grant catalog recorded from that same
+snapshot. Both wrappers pin `-p thought-capture` explicitly and refuse to run
+at all when an ambient `COMPOSE_PROJECT_NAME`, or one set in `.env`, names a
+different project - a backup that silently captured a different, empty stack
+would be worse than one that failed outright. Every artifact is created
+restricted (`umask 077`, with each directory locked to 0700 before anything is
+written into it) rather than tightened after the fact, so a full database dump
+is never briefly world-readable on a host that enforces POSIX permissions.
+Every artifact's filename is namespaced by a run id (a timestamp plus a
+random `mktemp` suffix), not the timestamp alone, so two runs that are
+serialized by the backup lock but happen to start in the same second never
+collide on a filename - a collision would otherwise let a failing second run
+silently overwrite a prior, successful run's dump under its own dump's name
+while `latest.txt` kept pointing at a manifest that no longer matched what
+was actually on disk.
+`scripts/restore-test.sh`/`.ps1` then proves that backup actually
+restores, against a throwaway, isolated Postgres under its own Compose project
+- never `thought-capture` - checking schema/every foreign key (a
+single-transaction `pg_restore`), every table's row count, every attachment's
+blob hash, and that the restored `tc_app` role's grants match the backup-time
+catalog and are actually usable (a live connection as `tc_app` can read
+`thoughts` but is refused writing `users` or updating a thought's body).
+
+**A green restore-test is not provenance.** Every integrity check it runs -
+the dump's sha256, each attachment's blob hash, the row counts, the grant
+catalog - compares the backup against values `backup.sh` recorded into the
+same directory as the backup itself. That catches corruption at rest. It does
+not catch tampering, because anything that could alter the dump could alter
+the recorded checksum beside it. The mitigation today is network egress
+containment, stated precisely rather than as a stronger guarantee it is
+not: the restore-validation stack runs on an `internal: true` network with
+no gateway, so a tampered dump cannot exfiltrate anything or reach further
+hosts from that job. It does NOT sandbox local execution - `pg_restore`
+connects as the scratch cluster's own superuser, and a custom-format dump is
+a stream of SQL a superuser is permitted to run, so a hostile archive can
+still execute commands inside the throwaway `postgres-scratch` container
+(which has no state worth protecting and is discarded with the rest of the
+throwaway project). Signed or authenticated backups (docs/DESIGN.md 12.2
+names `age`, with the private key held off the backup destination) are
+designed but not built, because they need a decided answer to where that key
+lives - still an open owner decision in docs/DESIGN.md 19. **Until that
+decision lands, restoring a backup that has
+been off this host is gated on it, not on a green restore-test.**
+
+**Recovery ordering matters.** The dump now carries `tc_app`'s privileges
+(GRANT statements from migrations 0001-0008) rather than stripping them, so a
+restore target must have the `tc_app` role provisioned - via
+`deploy/compose/initdb/01-roles.sh`, the same script the real stack's own
+`postgres` service runs at cluster creation - **before** `pg_restore` runs.
+Bring Postgres up first (so its init scripts provision the role), then
+restore; restoring into a cluster with no `tc_app` now fails loudly instead
+of quietly producing a database whose application role has a login but zero
+table privileges. That failure mode is intended, not a regression.
+
+What is still NOT built, and remains docs/DESIGN.md 17's separately-gated
+Phase 3 (Operational hardening): scheduling (nightly/quarterly cron), weekly
+off-site replication, retention tiers, and encryption key custody - each has
+its own still-open owner decision (docs/DESIGN.md 19: off-site provider and
+retention tiers). The future unified custom UI is also not runnable yet.

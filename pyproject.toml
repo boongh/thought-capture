@@ -9,6 +9,13 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.0",
     "hypothesis>=6.167",
+    # Used by tests/unit/test_check_backup_restore_isolation.py to PARSE the
+    # compose files rather than grep them - a service that silently loses its
+    # `networks:` key rejoins the egress-capable default network without
+    # changing any string a text scan would notice. Declared explicitly rather
+    # than relied on transitively.
+    "pyyaml>=6.0",
+    "types-PyYAML>=6.0",
 ]
 
 [tool.uv.workspace]

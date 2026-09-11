@@ -138,6 +138,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Backup and restore validation (docs/incidents/0001-docker-compose-down-
+# deleted-the-real-dev-stack.md): proves scripts/backup.sh's dump can
+# actually be restored, not merely that pg_dump exits 0. Runs against its
+# own throwaway, uniquely-named/-ported project - see
+# scripts/check-backup-restore.sh's own header for why it does not reuse
+# scripts/backup.sh/restore-test.sh directly.
+# ---------------------------------------------------------------------------
+printf '\n--- backup and restore validation\n'
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if ! scripts/check-backup-restore.sh; then
+    printf 'FAIL: backup and restore validation\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "OK: backup and restore validation"
+else
+  skipped+=("backup and restore validation (Docker engine unavailable)")
+  printf '%s\n' "SKIPPED: Docker engine unavailable"
+fi
+
+# ---------------------------------------------------------------------------
 # Compose config sanity: the 'ai' profile's required TC_KHOJ_* variables must
 # never block a core-only deployment (review remediation, PR #17 - Compose
 # interpolates every service in every `-f` file before applying `--profile`
@@ -236,17 +256,17 @@ if command -v docker >/dev/null 2>&1; then
   fi
 
   # -------------------------------------------------------------------
-  # Embedding sidecar network isolation (review finding): a regression
-  # that silently drops embedding-sidecar's `embedding: internal: true`
-  # network attachment, or the contract-test overlay's second network
-  # that restores its published port, would otherwise only surface as an
-  # unreachable-sidecar SKIP below - indistinguishable from "the operator
-  # simply hasn't started 'core' yet". This is a static config check
-  # (client-side only, same as the sanity checks above), so it catches
-  # the regression even when nothing is running. `--format json`, not
-  # text grep/awk: compose's rendered YAML nests a service's own
-  # `networks:` and the top-level `networks:` definitions differently,
-  # and a text scan risks confusing one for the other.
+  # Embedding sidecar network isolation (review finding, Finding 4): a
+  # regression that silently drops embedding-sidecar's `embedding:
+  # internal: true` network attachment, or the contract-test overlay's
+  # second network that restores its published port, would otherwise only
+  # surface as an unreachable-sidecar SKIP below - indistinguishable from
+  # "the operator simply hasn't started 'core' yet". This is a static
+  # config check (client-side only, same as the sanity checks above), so
+  # it catches the regression even when nothing is running. `--format
+  # json`, not text grep/awk: compose's rendered YAML nests a service's own
+  # `networks:` and the top-level `networks:` definitions differently, and
+  # a text scan risks confusing one for the other.
   # -------------------------------------------------------------------
   base_config_json="$(docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
     --profile core config --format json 2>/dev/null)"
