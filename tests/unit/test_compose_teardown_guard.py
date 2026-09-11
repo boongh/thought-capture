@@ -46,64 +46,11 @@ REAL_PROJECT_NAME = "thought-capture"
 # unrecognized spellings like "no" or "off".
 RECOGNIZED_FALSE_FORMS = ("0", "f", "F", "false", "False", "FALSE")
 
-DOCKER_STUB_SH = """#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$DOCKER_STUB_LOG"
-exit 0
-"""
-
-DOCKER_STUB_CMD = """@echo off
-rem A space before the redirect operator is required: cmd.exe treats a
-rem digit immediately adjacent to `>>` as a stream-handle number rather
-rem than data - `echo %*>>file` silently ate a trailing "0" argument
-rem (e.g. "-v=0" becoming "-v=") until this was found by testing that
-rem exact case against the real compose-teardown.ps1.
-echo %* >>"%DOCKER_STUB_LOG%"
-exit /b 0
-"""
-
 
 def _bash() -> str:
     found = shutil.which("bash")
     assert found, "bash is required to test scripts/compose-teardown.sh"
     return found
-
-
-@pytest.fixture
-def docker_stub_dir_sh(tmp_path: Path) -> Path:
-    stub_dir = tmp_path / "stub-bin"
-    stub_dir.mkdir()
-    docker_stub = stub_dir / "docker"
-    docker_stub.write_text(DOCKER_STUB_SH, newline="\n")
-    docker_stub.chmod(0o755)
-    return stub_dir
-
-
-@pytest.fixture
-def docker_stub_dir_ps(tmp_path: Path) -> Path:
-    stub_dir = tmp_path / "stub-bin-ps"
-    stub_dir.mkdir()
-    if sys.platform == "win32":
-        # Windows PowerShell/pwsh resolves a bare `docker` invocation through
-        # PATHEXT (which includes .cmd) - this is what scripts/compose-
-        # teardown.ps1 actually goes through when run here.
-        (stub_dir / "docker.cmd").write_text(DOCKER_STUB_CMD, newline="\r\n")
-    else:
-        # On Linux/macOS (this repo's own CI runs pwsh on ubuntu-latest),
-        # PowerShell does NOT do Windows' PATHEXT-based extension
-        # resolution for external commands - it only finds a bare `docker`
-        # if a file literally named `docker` is on PATH and marked
-        # executable. A `docker.cmd`-only stub dir is invisible to it there,
-        # so every `docker` call fell through to whatever REAL `docker`
-        # happened to be on the CI runner's PATH instead of this test's
-        # stub - exactly the review finding this branch fixes (16
-        # PowerShell pass-through tests failing on the Ubuntu runner,
-        # because they were never actually exercising the stub at all).
-        # Same content/log format as the Bash stub, since the Bash-target
-        # stub script and this one need to behave identically here.
-        docker_stub = stub_dir / "docker"
-        docker_stub.write_text(DOCKER_STUB_SH, newline="\n")
-        docker_stub.chmod(0o755)
-    return stub_dir
 
 
 def _run_sh(args: list[str], stub_dir: Path, log_file: Path) -> subprocess.CompletedProcess[str]:
@@ -151,8 +98,9 @@ def _read_calls(log_file: Path) -> list[str]:
     if not log_file.exists():
         return []
     # .rstrip(): the .cmd stub's `echo %* >>file` (a space before the
-    # redirect, itself required - see DOCKER_STUB_CMD's own comment) leaves
-    # one trailing space before each line's newline.
+    # redirect, itself required - see DOCKER_STUB_CMD's own comment in
+    # conftest.py, where this stub now lives) leaves one trailing space
+    # before each line's newline.
     return [stripped for line in log_file.read_text().splitlines() if (stripped := line.rstrip())]
 
 

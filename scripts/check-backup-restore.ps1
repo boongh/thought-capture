@@ -5,7 +5,9 @@ scripts/check.ps1 - not merely that pg_dump exits 0.
 
 .DESCRIPTION
 Deliberately does NOT reuse scripts/backup.ps1/restore-test.ps1 directly:
-those intentionally target the real `thought-capture` project (no -p) so a
+those intentionally target the real `thought-capture` project (pinned
+explicitly with `-p thought-capture`, and refusing to run under a conflicting
+COMPOSE_PROJECT_NAME) so a
 real invocation backs up real data. A routine check.ps1 run must never
 start, reuse, or touch the developer's real dev stack, and must never
 collide with the port check.ps1's own "integration tests" step may already

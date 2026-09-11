@@ -4,7 +4,9 @@
 # scripts/check.sh - not merely that pg_dump exits 0.
 #
 # Deliberately does NOT reuse scripts/backup.sh/restore-test.sh directly:
-# those intentionally target the real `thought-capture` project (no -p) so a
+# those intentionally target the real `thought-capture` project (pinned
+# explicitly with `-p thought-capture`, and refusing to run under a
+# conflicting COMPOSE_PROJECT_NAME) so a
 # real invocation backs up real data. A routine `check.sh` run must never
 # start, reuse, or touch the developer's real dev stack, and must never
 # collide with the port scripts/check.sh's own "integration tests" step may
