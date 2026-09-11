@@ -308,6 +308,17 @@ services:
     environment:
       # organize (docs/DESIGN.md 7.4) runs at digest time, from this service.
       <<: [*service-env, *llm-env]
+      # Only worker constructs HttpEmbeddingClient/DeliverEmbeddingSync
+      # (apps/worker/src/tc_worker/__main__.py) - api's admin endpoint only
+      # enqueues, it never embeds - so these two operator-tunable settings
+      # (env.example, Settings defaults 30.0s / 20) are forwarded here only,
+      # matching the llm-env pattern above of scoping a variable to the
+      # services with an actual code path that reads it. Without this,
+      # Compose never injects an arbitrary .env key into a container's
+      # runtime environment on its own, so an operator's override in .env
+      # would silently have no effect (review finding).
+      TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS: ${TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS:-30.0}
+      TC_EMBEDDING_SYNC_BATCH_SIZE: ${TC_EMBEDDING_SYNC_BATCH_SIZE:-20}
     # `default` (unchanged) plus `embedding`: worker is one of ADR-0010 §5's
     # designated embedding-sidecar callers (the organize-time document
     # embedding write path) - see this file's own header networks comment.
