@@ -242,10 +242,14 @@ mkdir -p "$backup_root"
 
 # The backup lock is held by the ROOT phase above (review finding F3 moved it
 # there so that it also covers the attachment copy); this phase inherits fd 200
-# and so runs inside the same lock. Two concurrent invocations each write their
-# own uniquely-timestamped dump/manifest/row-counts files, so those never
-# collide - but both would write the SAME `latest.txt`, and interleaved writes
-# to one file from two processes can corrupt it.
+# and so runs inside the same lock, which prevents two runs from ever writing
+# at the same time. It does NOT by itself make their filenames unique: two
+# serialized runs that happen to start in the same second would compute the
+# identical $timestamp below and collide on every artifact filename (review
+# finding - see $run_id a few lines down, which is what actually prevents
+# that). Every run also writes the SAME `latest.txt` regardless of its own run
+# id, and interleaved writes to one file from two processes could corrupt it
+# even though the lock already rules out concurrent writers.
 #
 # Refuses to run without the handshake directory rather than falling back to
 # some copy-less mode: this phase is meaningless on its own, and a direct
@@ -270,6 +274,29 @@ snapshot_ready_fifo="$TC_BACKUP_HANDSHAKE_DIR/snapshot-ready"
 copy_complete_fifo="$TC_BACKUP_HANDSHAKE_DIR/copy-complete"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+# Second-resolution alone is not collision-proof (review finding): the flock
+# above only guarantees runs never overlap, not that they start in different
+# seconds, so two serialized runs landing in the same second computed the
+# identical $timestamp and used it in every artifact filename below. If the
+# second run then failed anywhere after overwriting the first run's
+# identically-named dump/row-counts/grants/manifest files but before reaching
+# its own `latest.txt` write (the last thing a run does), `latest.txt` was
+# left pointing at a manifest recording the FIRST run's dump - by sha256 and
+# row counts - while the file actually on disk under that same name was now
+# the second, failed run's. The last known-good backup was silently
+# invalidated by a run that never itself succeeded.
+#
+# `mktemp -u` (the same tool `handshake_dir` above already relies on in this
+# exact container, so it is known to work here) generates a random suffix
+# without creating anything, making every run's artifact filenames disjoint
+# from every other run's regardless of timing. `-p /tmp` pins the directory
+# so the returned name is predictable to strip with `##*/`; `-u` only, no `-d`
+# or bare `mktemp`, because nothing needs to exist on disk under this name -
+# it exists only to be interpolated into the REAL filenames below. The
+# timestamp prefix is kept purely for the human-readability an operator
+# scanning `ls` still wants; it is no longer what guarantees uniqueness.
+run_suffix="$(mktemp -u -p /tmp XXXXXXXXXXXX)"
+run_id="${timestamp}-${run_suffix##*/}"
 
 postgres_dir="$backup_root/postgres"
 attachments_dir="$backup_root/attachments"
@@ -403,8 +430,8 @@ echo "--- pg_dump (custom format, at snapshot $snapshot_id)"
 # replays the GRANT statements migrations 0001-0008 issued. Letting the dump
 # carry whatever ACLs the migrations actually produced keeps one source of
 # truth instead of a second, hand-maintained copy that could drift silently.
-dump_tmp="$postgres_dir/.tmp-$timestamp.dump"
-dump_final="$postgres_dir/thought_capture-$timestamp.dump"
+dump_tmp="$postgres_dir/.tmp-$run_id.dump"
+dump_final="$postgres_dir/thought_capture-$run_id.dump"
 PGPASSWORD="$POSTGRES_PASSWORD" pg_dump \
   --host=postgres --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" \
   --format=custom --no-owner --snapshot="$snapshot_id" --file="$dump_tmp"
@@ -432,7 +459,7 @@ if ! psql_query row_counts_json_text "
   echo "FAIL: could not record row counts from the snapshot session" >&2
   exit 1
 fi
-row_counts_json="$postgres_dir/thought_capture-$timestamp.row-counts.json"
+row_counts_json="$postgres_dir/thought_capture-$run_id.row-counts.json"
 printf '%s\n' "$row_counts_json_text" >"$row_counts_json"
 chmod 600 "$row_counts_json"
 
@@ -464,7 +491,7 @@ if ! psql_query grants_json_text "
   echo "FAIL: could not record tc_app's grant catalog from the snapshot session" >&2
   exit 1
 fi
-grants_json="$postgres_dir/thought_capture-$timestamp.grants.json"
+grants_json="$postgres_dir/thought_capture-$run_id.grants.json"
 printf '%s\n' "$grants_json_text" >"$grants_json"
 chmod 600 "$grants_json"
 
@@ -498,7 +525,7 @@ echo "--- attachments: sha256 manifest"
 # application container's user, and are unreadable to the `postgres` user this
 # section runs as - only root could read them. Only the manifest is written
 # here, over whatever `$attachments_dir` holds as of that root-owned copy.
-manifest_file="$attachments_dir/../attachments-$timestamp.sha256"
+manifest_file="$attachments_dir/../attachments-$run_id.sha256"
 if [[ -n "$(find "$attachments_dir" -type f -print -quit 2>/dev/null)" ]]; then
   (cd "$attachments_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$manifest_file"
 else
@@ -507,11 +534,12 @@ fi
 chmod 600 "$manifest_file"
 
 echo "--- writing backup manifest and restrictive permissions"
-manifest_json="$backup_root/thought_capture-$timestamp.manifest.json"
+manifest_json="$backup_root/thought_capture-$run_id.manifest.json"
 attachment_file_count="$(wc -l <"$manifest_file" | tr -d ' ')"
 cat >"$manifest_json" <<JSON
 {
   "timestamp": "$timestamp",
+  "run_id": "$run_id",
   "postgres_dump_file": "$(basename "$dump_final")",
   "postgres_dump_sha256": "$dump_sha256",
   "postgres_row_counts_file": "$(basename "$row_counts_json")",

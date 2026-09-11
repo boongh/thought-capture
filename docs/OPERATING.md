@@ -285,6 +285,13 @@ would be worse than one that failed outright. Every artifact is created
 restricted (`umask 077`, with each directory locked to 0700 before anything is
 written into it) rather than tightened after the fact, so a full database dump
 is never briefly world-readable on a host that enforces POSIX permissions.
+Every artifact's filename is namespaced by a run id (a timestamp plus a
+random `mktemp` suffix), not the timestamp alone, so two runs that are
+serialized by the backup lock but happen to start in the same second never
+collide on a filename - a collision would otherwise let a failing second run
+silently overwrite a prior, successful run's dump under its own dump's name
+while `latest.txt` kept pointing at a manifest that no longer matched what
+was actually on disk.
 `scripts/restore-test.sh`/`.ps1` then proves that backup actually
 restores, against a throwaway, isolated Postgres under its own Compose project
 - never `thought-capture` - checking schema/every foreign key (a
