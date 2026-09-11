@@ -36,7 +36,7 @@ class PostgresEmbeddingSyncOutbox:
                         attempts=event.attempts,
                     )
                 )
-            except (KeyError, ValueError) as exc:
+            except (KeyError, ValueError, TypeError) as exc:
                 # A payload that will never parse must not be retried forever;
                 # fail it immediately rather than returning it to the caller.
                 await self._outbox.mark_failed(

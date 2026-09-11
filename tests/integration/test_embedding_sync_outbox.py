@@ -125,6 +125,31 @@ async def test_a_malformed_payload_is_failed_immediately_and_not_returned(
     assert "malformed_payload" in row.last_error
 
 
+async def test_a_non_dict_payload_is_failed_immediately_and_not_returned(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    workspace_id, _ = seeded_identity
+    bad_event_id = await _enqueue(
+        app_session_factory,
+        workspace_id,
+        payload=["not", "a", "dict"],  # type: ignore[arg-type]
+    )
+
+    outbox = PostgresEmbeddingSyncOutbox(app_session_factory, lease_owner="test")
+    claimed = await outbox.claim(limit=50)
+
+    assert bad_event_id not in {event.event_id for event in claimed}
+    async with app_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(outbox_events.c.last_error).where(outbox_events.c.id == bad_event_id)
+            )
+        ).one()
+    assert row.last_error is not None
+    assert "malformed_payload" in row.last_error
+
+
 async def test_mark_delivered_then_claim_does_not_return_it_again(
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],
