@@ -27,6 +27,13 @@ class EmbedResponse(BaseModel):
     model_revision: str
     dimensions: int
     vectors: tuple[tuple[float, ...], ...]
+    # Decision D (docs/plans/khoj-retirement-completion.md): the model
+    # silently truncates any text over its token limit with no signal in
+    # the vector itself. One entry per input text, in order - `True` means
+    # that text's embedding represents only its opening tokens, not the
+    # whole text. Additive and defaulted so a caller that predates this
+    # field (T2.2's `HttpEmbeddingClient`) tolerates its absence.
+    truncated: tuple[bool, ...] = Field(default=())
 
 
 class HealthResponse(BaseModel):

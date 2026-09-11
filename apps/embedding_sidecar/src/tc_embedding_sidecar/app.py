@@ -178,11 +178,13 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=429, detail=str(exc), headers={"Retry-After": "1"}
             ) from exc
+        truncated = await model.detect_truncation(request.texts)
         return EmbedResponse(
             model_id=model.model_id,
             model_revision=model.revision,
             dimensions=model.dimensions,
             vectors=tuple(tuple(v) for v in vectors),
+            truncated=truncated,
         )
 
     return app

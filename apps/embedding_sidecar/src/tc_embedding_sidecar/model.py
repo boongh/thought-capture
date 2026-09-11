@@ -62,6 +62,38 @@ class EmbeddingModel:
         # half-initialized model from another task.
         self._model = model
 
+    async def detect_truncation(self, texts: Sequence[str]) -> tuple[bool, ...]:
+        """Report, per text, whether `embed()` would silently truncate it.
+
+        `sentence-transformers`' `encode()` truncates any input longer than
+        `max_seq_length` tokens with no signal in its output (Decision D,
+        docs/plans/khoj-retirement-completion.md) - the only way to observe
+        it is to tokenize first and compare lengths, not to inspect the
+        resulting vector. Tokenizing is cheap relative to a forward pass,
+        but still runs off the event loop for consistency with `embed()`
+        and to avoid blocking on a large batch.
+        """
+        if self._model is None:
+            raise RuntimeError("detect_truncation() called before the model finished loading")
+        if not texts:
+            return ()
+
+        def _check() -> tuple[bool, ...]:
+            model = self._model
+            assert model is not None  # narrowed above; re-asserted for the closure
+            max_seq_length = model.max_seq_length
+            if max_seq_length is None:
+                # No declared limit to compare against - nothing to report
+                # as truncated rather than guessing at one.
+                return tuple(False for _ in texts)
+            tokenizer = model.tokenizer
+            return tuple(
+                len(tokenizer.encode(text, add_special_tokens=True)) > max_seq_length
+                for text in texts
+            )
+
+        return await asyncio.to_thread(_check)
+
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if self._model is None:
             raise RuntimeError("embed() called before the model finished loading")

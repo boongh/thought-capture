@@ -44,6 +44,13 @@ class FakeEmbeddingModel:
         # per-text ordering matter for these transport-level tests.
         return [[float(len(text))] * self.dimensions for text in texts]
 
+    async def detect_truncation(self, texts: Sequence[str]) -> tuple[bool, ...]:
+        # These transport-level tests never exercise real truncation
+        # detection (that's apps/embedding_sidecar/tests/test_model.py's
+        # job) - a fixed all-False result keeps this fake's behavior
+        # predictable for callers that only care about the /embed wiring.
+        return tuple(False for _ in texts)
+
 
 def _lifespan_with(model: FakeEmbeddingModel) -> object:
     @asynccontextmanager

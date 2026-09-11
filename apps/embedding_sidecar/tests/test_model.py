@@ -18,6 +18,69 @@ import pytest
 from tc_embedding_sidecar.model import EmbeddingModel, TooManyRequestsError
 
 
+class _StubTokenizer:
+    """Stands in for the HF tokenizer `SentenceTransformer.tokenizer`
+    exposes. A real tokenizer's `.encode()` returns one int id per token
+    plus special tokens; only the *length* of that list matters here, so
+    this counts whitespace-separated words as a stand-in for token count."""
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        token_count = len(text.split())
+        return list(range(token_count + (2 if add_special_tokens else 0)))
+
+
+class _StubModelWithTokenizer:
+    """Stands in for `SentenceTransformer` for `detect_truncation()` tests -
+    exposes only `max_seq_length` and `tokenizer`, the two attributes that
+    method reads."""
+
+    def __init__(self, max_seq_length: int) -> None:
+        self.max_seq_length = max_seq_length
+        self.tokenizer = _StubTokenizer()
+
+
+def _model_with_tokenizer_stub(max_seq_length: int) -> EmbeddingModel:
+    model = EmbeddingModel("fake/id", revision="fake-revision")
+    model.dimensions = 2
+    model._model = _StubModelWithTokenizer(max_seq_length)
+    return model
+
+
+async def test_detect_truncation_reports_false_for_a_short_text() -> None:
+    model = _model_with_tokenizer_stub(max_seq_length=512)
+
+    result = await model.detect_truncation(["hello world"])
+
+    assert result == (False,)
+
+
+async def test_detect_truncation_reports_true_for_a_text_over_the_token_limit() -> None:
+    model = _model_with_tokenizer_stub(max_seq_length=512)
+    # 600 whitespace-separated words tokenizes (via the stub) to well over
+    # the 512-token limit once the two special tokens are added.
+    long_text = "word " * 600
+
+    result = await model.detect_truncation([long_text])
+
+    assert result == (True,)
+
+
+async def test_detect_truncation_reports_one_flag_per_text_in_order() -> None:
+    model = _model_with_tokenizer_stub(max_seq_length=512)
+
+    result = await model.detect_truncation(["hello world", "word " * 600, "short"])
+
+    assert result == (False, True, False)
+
+
+async def test_detect_truncation_with_an_empty_batch_returns_no_flags() -> None:
+    model = _model_with_tokenizer_stub(max_seq_length=512)
+
+    result = await model.detect_truncation([])
+
+    assert result == ()
+
+
 class _SlowStubModel:
     """Stands in for `SentenceTransformer`. Runs inside a real OS thread via
     `asyncio.to_thread`, so it blocks on a `threading.Event`, not an
