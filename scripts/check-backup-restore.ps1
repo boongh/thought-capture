@@ -557,6 +557,30 @@ done
         bash /assert/blob-writer.sh *> $null
     if ($LASTEXITCODE -ne 0) { throw "failed to start the concurrent blob writer (exit $LASTEXITCODE)" }
 
+    # Wait for the writer's first COMMITTED blob before starting the backup
+    # (review finding, third round). The backup this exercises now finishes
+    # in well under a second (the attachment copy runs concurrently with
+    # pg_dump, not serially after it), which is faster than `docker run -d`
+    # above can boot a fresh container and get its first psql INSERT
+    # committed - so starting the backup immediately could lose the race
+    # outright, passing zero commits without ever having exercised anything.
+    # Blocking here until the writer is demonstrably already committing -
+    # bounded, so a genuinely broken writer still fails fast via the
+    # existing post-backup BlobCommitCount check below - makes the race
+    # actually start under load instead of racing container startup itself.
+    $WriterReady = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        $probeLog = (docker logs $BlobWriterContainer 2>&1 | Out-String)
+        if ($probeLog -match '(?m)^COMMITTED ') { $WriterReady = $true; break }
+        $running = (docker ps -q -f "name=^$BlobWriterContainer`$")
+        if (-not $running) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not $WriterReady) {
+        Write-Host (docker logs $BlobWriterContainer 2>&1 | Out-String)
+        throw "the concurrent blob writer never committed a blob within 6s of starting - it may have failed to start or connect"
+    }
+
     try {
         docker compose --env-file $EnvFile -p $BackupProject -f $ComposeFile `
             --profile core --profile backup up --build --force-recreate --exit-code-from backup backup

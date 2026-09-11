@@ -541,6 +541,37 @@ docker run -d --name "$blob_writer_container" \
   postgres:18.6-trixie@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280 \
   bash -c "$blob_writer_script" >/dev/null
 
+# Wait for the writer's first COMMITTED blob before starting the backup
+# (review finding, third round). The backup this exercises now finishes in
+# well under a second (the attachment copy runs concurrently with pg_dump,
+# not serially after it), which is faster than `docker run -d` above can
+# boot a fresh container and get its first `psql` INSERT committed - so
+# starting the backup immediately lost the race outright on a CI runner,
+# passing zero commits and failing with "the concurrent blob writer never
+# committed a blob during the backup" without ever having exercised
+# anything. Blocking here until the writer is demonstrably already
+# committing - bounded, so a genuinely broken writer still fails fast via
+# the existing post-backup blob_commit_count check below - makes the race
+# actually start under load instead of racing container startup itself.
+writer_ready=0
+writer_ready_waited=0
+while [[ "$writer_ready_waited" -lt 30 ]]; do
+  if docker logs "$blob_writer_container" 2>&1 | grep -q '^COMMITTED '; then
+    writer_ready=1
+    break
+  fi
+  if ! docker ps -q -f "name=^${blob_writer_container}\$" | grep -q .; then
+    break
+  fi
+  sleep 0.2
+  writer_ready_waited=$((writer_ready_waited + 1))
+done
+if [[ "$writer_ready" -eq 0 ]]; then
+  printf 'FAIL: the concurrent blob writer never committed a blob within 6s of starting - it may have failed to start or connect\n' >&2
+  docker logs "$blob_writer_container" 2>&1 >&2 || true
+  exit 1
+fi
+
 docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
   --profile core --profile backup up --build --force-recreate --exit-code-from backup backup
 
