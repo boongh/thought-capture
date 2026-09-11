@@ -236,16 +236,28 @@ The runnable stack captures allowlisted Discord text and attachments, exposes
 authenticated API capture and reads, and preserves canonical data in
 PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`,
 `/v1/entities`, `/v1/search` (exact, semantic, and hybrid modes), `/v1/ask`,
-and `/v1/admin/khoj-sync` routes. A separate read-only `/debug` operator view
-exposes raw thoughts, entities, daily digests, and journaled LLM runs; it is
-not the future unified UI. The Discord bot also takes `/organize`, `/status`,
-`/search`, and `/ask` slash commands, all restricted to the configured owner.
+`/v1/admin/khoj-sync`, and `/v1/admin/embedding-sync` routes. A separate
+read-only `/debug` operator view exposes raw thoughts, entities, daily
+digests, and journaled LLM runs; it is not the future unified UI. The Discord
+bot also takes `/organize`, `/status`, `/search`, and `/ask` slash commands,
+all restricted to the configured owner.
 
 The `worker` processes closed capture windows, catches up missed windows after
-startup, and writes versioned derived documents and entities; it also runs a
-sync loop (`tc_worker.khoj_sync_loop`) that pushes newly-written documents
-into Khoj's index automatically. The Discord bot polls queued daily-digest
-deliveries separately from capture acknowledgements. `upstage/solar-pro4`
+startup, and writes versioned derived documents and entities; it also runs two
+sync loops in parallel (ADR-0010 step 2, "running alongside Khoj sync, not
+replacing it yet"): `tc_worker.khoj_sync_loop`, which pushes newly-written
+documents into Khoj's index, and `tc_worker.embedding_sync_loop`, which
+computes each newly-written document's current-revision embedding via the
+first-party embedding sidecar and stores it in the `document_embeddings`
+pgvector column. Both are outbox-driven and poll every 30s by default; an
+operator can force an immediate backfill for either with
+`POST /v1/admin/khoj-sync` or `POST /v1/admin/embedding-sync` respectively -
+both only enqueue, delivery still happens on the relevant loop's next poll.
+Neither semantic search nor Ask reads from `document_embeddings` yet (Slice 3
+and Slice 4 of `docs/plans/khoj-retirement-completion.md` wire that up); this
+loop only keeps the table current in the meantime. The Discord bot polls
+queued daily-digest deliveries separately from capture acknowledgements.
+`upstage/solar-pro4`
 (select) and `x-ai/grok-4.3` (organize) are reviewed and registered in safe
 mode (`REVIEWED_MODELS`), but `TC_MODEL_ORGANIZE` and `TC_MODEL_SELECT` still
 default to blank in `env.example`: an operator must opt in explicitly, or the
