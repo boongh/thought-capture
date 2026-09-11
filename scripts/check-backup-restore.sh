@@ -110,6 +110,23 @@ TC_DISCORD_OWNER_USER_ID=100000000000000001
 TC_BACKUP_ROOT=$backup_root_compose_value
 ENV
 
+# Ambient shell environment wins over `--env-file` during Compose variable
+# interpolation - the same class of trap this file's own header already
+# documents for TC_BACKUP_ROOT, just for a different variable. .github/
+# workflows/ci.yml exports its own POSTGRES_PASSWORD (for an entirely
+# unrelated Postgres service it runs directly, not through this project's
+# Compose files) as an ambient env var for the whole job, which makes THAT
+# value - not "check-only-not-a-real-secret" above - the real password
+# Compose gives this throwaway project's `postgres` service. Every service
+# defined in $compose_file that reads `${POSTGRES_PASSWORD}` resolves it
+# correctly regardless (Compose interpolation is consistent), but every ad-
+# hoc `docker run`/`docker compose exec` invocation below that needs to
+# authenticate as tc_migrator must resolve the password the same way
+# Compose does, via this variable, rather than assuming the literal above -
+# confirmed directly in CI (run 34572786627): a hardcoded PGPASSWORD there
+# authenticated with the wrong password and failed every single attempt.
+resolved_postgres_password="${POSTGRES_PASSWORD:-check-only-not-a-real-secret}"
+
 # PLATFORM TRAP - argv path translation. Every `--entrypoint` below names
 # `bash`, never `/bin/bash`, and that is load-bearing rather than a style
 # choice. Confirmed directly on this platform: Git Bash rewrites a
@@ -508,7 +525,7 @@ writer_success_log="$(mktemp -u)"
   while [[ ! -f "$writer_stop_file" ]]; do
     i=$((i + 1))
     if docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
-      exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres \
+      exec -T -e "PGPASSWORD=$resolved_postgres_password" postgres \
       psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c \
       "INSERT INTO thoughts (workspace_id, author_user_id, source, source_message_id, body, client_created_at, client_timezone, client_local_date, client_local_time, received_at, content_language)
        SELECT w.id, u.id, 'api', 'race-test-$i-' || extract(epoch from clock_timestamp()), 'synthetic race-regression thought', now(), 'UTC', current_date, current_time, now(), 'en'
@@ -548,7 +565,7 @@ docker rm -f "$blob_writer_container" >/dev/null 2>&1 || true
 docker run -d --name "$blob_writer_container" \
   --network "${backup_project}_default" \
   -v "${backup_project}_attachments:/data/attachments" \
-  -e PGPASSWORD=check-only-not-a-real-secret \
+  -e "PGPASSWORD=$resolved_postgres_password" \
   postgres:18.6-trixie@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280 \
   bash -c "$blob_writer_script" >/dev/null
 
@@ -650,7 +667,7 @@ orphan_size="$(printf '%s' "$orphan_content" | wc -c)"
 # own `storage_key_for`: two 2-character fan-out levels, then the full hash.
 orphan_storage_key="${orphan_sha256:0:2}/${orphan_sha256:2:2}/${orphan_sha256}"
 docker compose --env-file "$env_file" -p "$backup_project" -f "$compose_file" \
-  exec -T -e PGPASSWORD=check-only-not-a-real-secret postgres \
+  exec -T -e "PGPASSWORD=$resolved_postgres_password" postgres \
   psql -v ON_ERROR_STOP=1 --quiet -U tc_migrator -d thought_capture -c \
   "INSERT INTO blobs (sha256, size_bytes, media_type, storage_key) VALUES ('$orphan_sha256', $orphan_size, 'text/plain', '$orphan_storage_key')"
 
