@@ -338,6 +338,18 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-tc_migrator}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: ${POSTGRES_DB:-thought_capture}
+      # Forwarded, not defaulted here (review finding): backup.sh's own
+      # `copy_complete_timeout_seconds="${TC_BACKUP_COPY_TIMEOUT_SECONDS:-600}"`
+      # is the one place that owns "600" as the default, and its own comment
+      # there explains why it must be operator-tunable. Without this line the
+      # container never saw the host's/`.env`'s value at all - the variable
+      # was unset inside the container regardless of what an operator set,
+      # so backup.sh's own "raise TC_BACKUP_COPY_TIMEOUT_SECONDS" advice on
+      # timeout was a dead end. An empty default here (not `:-600`, which
+      # would duplicate that number in two places that could drift)
+      # forwards "unset" as "unset" - bash's `:-` fallback treats empty the
+      # same as unset, so backup.sh's own default still applies unchanged.
+      TC_BACKUP_COPY_TIMEOUT_SECONDS: ${TC_BACKUP_COPY_TIMEOUT_SECONDS:-}
     volumes:
       - ${TC_BACKUP_ROOT:-./backups}:/backups
       - attachments:/data/attachments:ro

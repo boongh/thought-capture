@@ -50,6 +50,7 @@ BACKUP_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "backup.sh"
 RESTORE_TEST_SH = REPO_ROOT / "deploy" / "compose" / "backup" / "restore-test.sh"
 RESTORE_TEST_YML = REPO_ROOT / "deploy" / "compose" / "backup.restore-test.docker-compose.yml"
 OPERATING_MD = REPO_ROOT / "docs" / "OPERATING.md"
+ENV_EXAMPLE = REPO_ROOT / "env.example"
 
 # The exact fallback the review found: reading TC_BACKUP_ROOT with a default
 # of the real backup directory silently redirects onto the operator's real
@@ -606,4 +607,59 @@ class TestBackupArtifactsAreRestrictedFromCreation:
         assert code.index('chmod 700 "$postgres_dir"') < code.index("pg_dump \\"), (
             "the postgres output directory must be chmod 700'd before pg_dump "
             "writes a full database dump into it"
+        )
+
+
+class TestBackupCopyTimeoutIsForwardedToTheContainer:
+    """P2 review finding, PR #32 (ded0d8a's follow-up): backup.sh's own
+    `copy_complete_timeout_seconds="${TC_BACKUP_COPY_TIMEOUT_SECONDS:-600}"`
+    told operators, on timeout, to "raise TC_BACKUP_COPY_TIMEOUT_SECONDS
+    rather than retrying blindly" - but deploy/compose/docker-compose.yml's
+    `backup` service never forwarded that variable into the container's
+    environment at all, so the variable was always unset inside the
+    container regardless of what an operator set on the host, and the
+    script silently used its 600s default every time. The advice in
+    backup.sh's own FAIL message was a dead end.
+
+    These are the same two checks docker-compose.yml's `backup` service
+    already needs to satisfy for POSTGRES_USER/POSTGRES_DB (forwarded, with
+    a default), except this variable's default is owned by backup.sh itself
+    - not duplicated into the compose file - so only forwarding (not a
+    matching `:-600`) is asserted here.
+    """
+
+    def test_docker_compose_yml_forwards_the_variable_to_the_backup_service(self) -> None:
+        data = cast(dict[str, Any], yaml.safe_load(DOCKER_COMPOSE_YML.read_text(encoding="utf-8")))
+        backup_environment = data["services"]["backup"]["environment"]
+        assert "TC_BACKUP_COPY_TIMEOUT_SECONDS" in backup_environment, (
+            "deploy/compose/docker-compose.yml's `backup` service must forward "
+            "TC_BACKUP_COPY_TIMEOUT_SECONDS into the container - without this, "
+            "the variable is always unset inside the container no matter what "
+            "an operator sets on the host, and backup.sh's own 'raise "
+            "TC_BACKUP_COPY_TIMEOUT_SECONDS' advice on timeout is a dead end"
+        )
+        forwarded_value = backup_environment["TC_BACKUP_COPY_TIMEOUT_SECONDS"]
+        assert "${TC_BACKUP_COPY_TIMEOUT_SECONDS" in forwarded_value, (
+            f"TC_BACKUP_COPY_TIMEOUT_SECONDS must be forwarded FROM the host's "
+            f"own variable of the same name, not hardcoded to a fixed value - "
+            f"got: {forwarded_value!r}"
+        )
+        assert ":-600" not in forwarded_value, (
+            "the 600s default must be owned by backup.sh's own "
+            "copy_complete_timeout_seconds assignment, not duplicated here - "
+            "two places defining the same default number can drift"
+        )
+
+    def test_backup_sh_still_owns_the_default(self) -> None:
+        code = _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
+        assert 'copy_complete_timeout_seconds="${TC_BACKUP_COPY_TIMEOUT_SECONDS:-600}"' in code, (
+            "backup.sh must remain the single place that owns the 600s default for this variable"
+        )
+
+    def test_env_example_documents_the_variable(self) -> None:
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        assert re.search(r"^TC_BACKUP_COPY_TIMEOUT_SECONDS=", text, re.MULTILINE), (
+            "env.example must document TC_BACKUP_COPY_TIMEOUT_SECONDS so an "
+            "operator discovers it exists, rather than only finding it by "
+            "reading backup.sh's own FAIL message"
         )
