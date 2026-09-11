@@ -271,5 +271,152 @@ async def test_find_pending_locates_an_undelivered_acknowledgement(
     found = await outbox.find_pending("thought.captured", aggregate)
     assert found == event_id
 
-    await outbox.mark_delivered(event_id)
+    await outbox.settle_unclaimed(event_id)
     assert await outbox.find_pending("thought.captured", aggregate) is None
+
+
+# ---------------------------------------------------------------------------
+# Lease fencing (F10): an expired-lease worker must not affect an event a
+# second worker has since re-claimed.
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_lease_mark_delivered_does_not_steal_a_reclaimed_event(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """Worker A's lease expires mid-delivery; worker B re-claims first."""
+    workspace_id, _ = seeded_identity
+    aggregate = f"agg-{uuid.uuid4()}"
+    event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
+
+    # A negative lease duration means the lease is already expired the
+    # instant it is granted - simulating A returning long after its lease
+    # window closed.
+    worker_a = PostgresOutbox(
+        app_session_factory, lease_owner="worker-a", lease_duration=dt.timedelta(seconds=-1)
+    )
+    worker_b = PostgresOutbox(app_session_factory, lease_owner="worker-b")
+
+    await worker_a.claim(limit=50, event_types=("thought.captured",))
+    claimed_by_b = {e.id for e in await worker_b.claim(limit=50, event_types=("thought.captured",))}
+    assert event_id in claimed_by_b, "B must be able to re-claim A's expired lease"
+
+    async with app_session_factory() as session:
+        before = (
+            await session.execute(
+                sa.select(outbox_events.c.lease_owner, outbox_events.c.leased_until).where(
+                    outbox_events.c.id == event_id
+                )
+            )
+        ).one()
+
+    await worker_a.mark_delivered(event_id)
+
+    async with app_session_factory() as session:
+        after = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.delivered_at,
+                    outbox_events.c.lease_owner,
+                    outbox_events.c.leased_until,
+                ).where(outbox_events.c.id == event_id)
+            )
+        ).one()
+
+    assert after.delivered_at is None, "A's stale mark_delivered must not complete B's event"
+    assert after.lease_owner == before.lease_owner, "B's lease must be untouched"
+    assert after.leased_until == before.leased_until
+
+
+async def test_stale_lease_mark_failed_does_not_clear_a_reclaimed_event(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """A's stale mark_failed must not clear B's lease or overwrite B's state."""
+    workspace_id, _ = seeded_identity
+    aggregate = f"agg-{uuid.uuid4()}"
+    event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
+
+    worker_a = PostgresOutbox(
+        app_session_factory, lease_owner="worker-a", lease_duration=dt.timedelta(seconds=-1)
+    )
+    worker_b = PostgresOutbox(app_session_factory, lease_owner="worker-b")
+
+    await worker_a.claim(limit=50, event_types=("thought.captured",))
+    await worker_b.claim(limit=50, event_types=("thought.captured",))
+
+    async with app_session_factory() as session:
+        before = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.lease_owner,
+                    outbox_events.c.leased_until,
+                    outbox_events.c.available_at,
+                ).where(outbox_events.c.id == event_id)
+            )
+        ).one()
+
+    await worker_a.mark_failed(event_id, attempts=1, error="stale-worker-error")
+
+    async with app_session_factory() as session:
+        after = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.lease_owner,
+                    outbox_events.c.leased_until,
+                    outbox_events.c.available_at,
+                    outbox_events.c.last_error,
+                ).where(outbox_events.c.id == event_id)
+            )
+        ).one()
+
+    assert after.lease_owner == before.lease_owner, "B's lease_owner must survive A's stale failure"
+    assert after.leased_until == before.leased_until, (
+        "B's leased_until must survive A's stale failure"
+    )
+    assert after.available_at == before.available_at, (
+        "A's stale failure must not reschedule B's event"
+    )
+    assert after.last_error is None, "A's stale error must not overwrite the row"
+
+
+async def test_current_owner_mark_delivered_still_delivers(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """The lease fence must not block the worker that actually holds the lease."""
+    workspace_id, _ = seeded_identity
+    aggregate = f"agg-{uuid.uuid4()}"
+    event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
+
+    worker_b = PostgresOutbox(app_session_factory, lease_owner="worker-b")
+    await worker_b.claim(limit=50, event_types=("thought.captured",))
+    await worker_b.mark_delivered(event_id)
+
+    async with app_session_factory() as session:
+        delivered_at = await session.scalar(
+            sa.select(outbox_events.c.delivered_at).where(outbox_events.c.id == event_id)
+        )
+    assert delivered_at is not None
+
+
+async def test_settle_unclaimed_does_not_settle_an_actively_leased_event(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """settle_unclaimed must never steal an event a live consumer is working."""
+    workspace_id, _ = seeded_identity
+    aggregate = f"agg-{uuid.uuid4()}"
+    event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
+
+    outbox = PostgresOutbox(app_session_factory, lease_owner="worker")
+    await outbox.claim(limit=50, event_types=("thought.captured",))
+
+    await outbox.settle_unclaimed(event_id)
+
+    async with app_session_factory() as session:
+        delivered_at = await session.scalar(
+            sa.select(outbox_events.c.delivered_at).where(outbox_events.c.id == event_id)
+        )
+    assert delivered_at is None, "an actively leased event must not be settled as unclaimed"

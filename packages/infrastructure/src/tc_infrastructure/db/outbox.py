@@ -58,8 +58,19 @@ class PostgresOutbox:
         lease_duration: dt.timedelta = DEFAULT_LEASE,
     ) -> None:
         self._session_factory = session_factory
+        # ``lease_owner`` as supplied is a per-service name ("worker",
+        # "discord-bot"), not unique per process. Two replicas of the same
+        # service would otherwise pass each other's lease fence. Append an
+        # instance-unique suffix so the token actually identifies *this*
+        # process for claim/mark_delivered/mark_failed fencing.
         self._lease_owner = lease_owner
+        self._lease_token = f"{lease_owner}:{uuid.uuid4().hex[:12]}"
         self._lease = lease_duration
+
+    @property
+    def lease_token(self) -> str:
+        """The instance-unique lease token used to claim and fence events."""
+        return self._lease_token
 
     async def claim(
         self, limit: int = DEFAULT_BATCH, *, event_types: Sequence[str] | None = None
@@ -99,7 +110,7 @@ class PostgresOutbox:
          RETURNING o.id, o.workspace_id, o.event_type, o.aggregate_id, o.payload, o.attempts
         """)
 
-        params: dict[str, Any] = {"limit": limit, "lease": self._lease, "owner": self._lease_owner}
+        params: dict[str, Any] = {"limit": limit, "lease": self._lease, "owner": self._lease_token}
         if event_types is not None:
             params["event_types"] = list(event_types)
 
@@ -119,21 +130,48 @@ class PostgresOutbox:
         ]
 
     async def mark_delivered(self, event_id: uuid.UUID) -> None:
+        """Complete a claimed event. Fenced on the lease this instance holds.
+
+        A worker whose lease has already expired (e.g. it stalled past
+        ``lease_duration``) may still be finishing delivery after a second
+        worker has re-claimed the same event. Without the ``lease_owner`` /
+        ``leased_until`` fence, the stale worker's ``mark_delivered`` would
+        mark the event done out from under the worker actually processing it
+        now. A lost lease means another worker owns the event, which is
+        correct - it is logged, not raised.
+        """
+        # RETURNING rather than rowcount: the async psycopg dialect does not
+        # reliably report an affected-row count for a plain UPDATE, so
+        # whether a row actually came back is what the fence has to check.
         async with self._session_factory() as session, session.begin():
-            await session.execute(
+            fenced = await session.scalar(
                 sa.text("""
                     UPDATE outbox_events
                        SET delivered_at = now(), leased_until = NULL, lease_owner = NULL
                      WHERE id = :id AND delivered_at IS NULL
+                       AND lease_owner = :owner AND leased_until > now()
+                 RETURNING id
                 """),
-                {"id": event_id},
+                {"id": event_id, "owner": self._lease_token},
             )
+        if fenced is None:
+            logger.warning(
+                "outbox.lease_lost",
+                extra={"event_id": str(event_id), "lease_owner": self._lease_token},
+            )
+            return
         logger.info("outbox.delivered", extra={"event_id": str(event_id)})
 
     async def mark_failed(self, event_id: uuid.UUID, attempts: int, error: str) -> None:
-        """Reschedule with backoff. ``error`` must not contain personal content."""
+        """Reschedule with backoff. ``error`` must not contain personal content.
+
+        Fenced identically to ``mark_delivered``: without the lease check, a
+        stale worker's failure handling would clear ``leased_until`` /
+        ``lease_owner`` for whichever worker currently holds the event,
+        inviting a third concurrent claim.
+        """
         async with self._session_factory() as session, session.begin():
-            await session.execute(
+            fenced = await session.scalar(
                 sa.text("""
                     UPDATE outbox_events
                        SET available_at = now() + :backoff,
@@ -141,13 +179,58 @@ class PostgresOutbox:
                            lease_owner = NULL,
                            last_error = :error
                      WHERE id = :id
+                       AND lease_owner = :owner AND leased_until > now()
+                 RETURNING id
                 """),
-                {"id": event_id, "backoff": backoff_for(attempts), "error": error[:500]},
+                {
+                    "id": event_id,
+                    "backoff": backoff_for(attempts),
+                    "error": error[:500],
+                    "owner": self._lease_token,
+                },
             )
+        if fenced is None:
+            logger.warning(
+                "outbox.lease_lost",
+                extra={"event_id": str(event_id), "lease_owner": self._lease_token},
+            )
+            return
         logger.warning(
             "outbox.failed",
             extra={"event_id": str(event_id), "attempts": attempts, "error_class": error[:80]},
         )
+
+    async def settle_unclaimed(self, event_id: uuid.UUID) -> None:
+        """Settle an event that was never leased through ``claim``.
+
+        Used by the fast-acknowledgement path: it satisfies the event's
+        intent synchronously (e.g. sends the Discord reply itself) and then
+        settles the matching outbox row directly, without ever calling
+        ``claim``. It therefore holds no lease and must not be fenced on one
+        - unlike ``mark_delivered``, which fences to protect a lease held by
+        a concurrent consumer. Do not change this back to ``mark_delivered``:
+        this row's ``lease_owner`` is typically NULL, so a lease fence would
+        make this path a silent no-op and produce a duplicate reply. Instead
+        this only refuses to settle a row a live consumer currently holds.
+        """
+        async with self._session_factory() as session, session.begin():
+            settled = await session.scalar(
+                sa.text("""
+                    UPDATE outbox_events
+                       SET delivered_at = now(), leased_until = NULL, lease_owner = NULL
+                     WHERE id = :id AND delivered_at IS NULL
+                       AND (leased_until IS NULL OR leased_until < now())
+                 RETURNING id
+                """),
+                {"id": event_id},
+            )
+        if settled is None:
+            logger.warning(
+                "outbox.settle_unclaimed_lease_held",
+                extra={"event_id": str(event_id)},
+            )
+            return
+        logger.info("outbox.delivered", extra={"event_id": str(event_id)})
 
     async def find_pending(self, event_type: str, aggregate_id: str) -> uuid.UUID | None:
         """The undelivered event for one aggregate, if there is one.

@@ -241,7 +241,7 @@ class CaptureClient(discord.Client):
         try:
             event_id = await self._outbox.find_pending(THOUGHT_CAPTURED_EVENT, str(thought_id))
             if event_id is not None:
-                await self._outbox.mark_delivered(event_id)
+                await self._outbox.settle_unclaimed(event_id)
         except Exception as exc:
             logger.warning("outbox.settle_failed", extra={"error_class": type(exc).__name__})
 
