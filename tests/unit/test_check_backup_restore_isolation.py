@@ -541,3 +541,69 @@ class TestRestoreTestNetworkIsolation:
             "'internal: true network' could otherwise conclude restoring an "
             "untrusted dump is safe outright"
         )
+
+
+class TestBackupArtifactsAreRestrictedFromCreation:
+    """PR #32 review finding (P1): deploy/compose/backup/backup.sh created its
+    directories and wrote the dump, row counts, grant catalog and manifests
+    under the inherited umask, restricting each only afterwards - under a
+    typical `umask 022`, every local user on a Linux host could read a full
+    database dump for the duration of the backup.
+
+    Whether that window exists is a property of the ORDER of statements in a
+    script that only ever runs as root inside a container, which no host-side
+    test can observe from outside. `scripts/check-backup-restore.sh` already
+    asserts the END state through a container (uid 999, mode 0700); these
+    assert the ordering that makes the end state true from the first byte - the
+    same cheap static-guard style as the findings above.
+    """
+
+    def _code(self) -> str:
+        return _strip_shell_comments(BACKUP_SH.read_text(encoding="utf-8"))
+
+    def test_sets_a_restrictive_umask(self) -> None:
+        assert re.search(r"^umask 077$", self._code(), re.MULTILINE), (
+            "deploy/compose/backup/backup.sh must set `umask 077` so every "
+            "artifact it writes is owner-only from creation, not tightened "
+            "afterwards"
+        )
+
+    def test_the_umask_precedes_every_directory_it_protects(self) -> None:
+        code = self._code()
+        assert code.index("umask 077") < code.index("mkdir"), (
+            "`umask 077` must come before the first directory or file this "
+            "script creates - after it, it protects nothing already written"
+        )
+
+    def test_the_backup_root_is_locked_down_before_anything_is_written_into_it(self) -> None:
+        code = self._code()
+        # `umask` alone cannot cover the directories: /backups normally already
+        # exists (Docker creates a bind mount's target root-owned 0755) and
+        # `mkdir -p` on an existing directory leaves its mode alone.
+        assert code.index('chmod 700 "$backup_root"') < code.index('exec 200>"$lock_file"'), (
+            "the backup root must be chmod 700'd in the root phase, before the "
+            "lock file or any artifact is created inside it"
+        )
+
+    def test_the_attachments_directory_is_locked_down_before_the_copy_begins(self) -> None:
+        code = self._code()
+        assert code.index('chmod 700 "$attachments_dir"') < code.index(
+            "--- attachments: copying"
+        ), (
+            "the root phase's attachments directory must be chmod 700'd before "
+            "the attachment copy writes into it - otherwise the same window "
+            "this change closes for the dump reopens for attachments"
+        )
+
+    def test_the_dump_directory_is_locked_down_before_the_dump_is_written(self) -> None:
+        code = self._code()
+        # Anchored on the actual `pg_dump` invocation's own argv, not the bare
+        # substring "pg_dump" - that also matches an earlier `echo "---
+        # pg_dump ..."` status line, which is not a comment (so
+        # _strip_shell_comments leaves it in) and would let this assertion
+        # pass for the wrong reason if the two were ever reordered relative
+        # to each other.
+        assert code.index('chmod 700 "$postgres_dir"') < code.index("pg_dump \\"), (
+            "the postgres output directory must be chmod 700'd before pg_dump "
+            "writes a full database dump into it"
+        )

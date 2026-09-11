@@ -20,6 +20,22 @@
 # building them without that decision would mean guessing at it.
 set -euo pipefail
 
+# Every artifact this script creates is restricted FROM CREATION, not
+# retroactively (review finding, PR #32). The dump, the row-count and grant
+# catalogs, both manifests and `latest.txt` were each written under the
+# inherited umask - 022 by default, so world-readable - and only chmod 600'd
+# afterwards. That left a window lasting as long as a pg_dump of the entire
+# database, during which any local user on a Linux host could read a full copy
+# of every captured thought. 077 closes it at the source: 0600 files and 0700
+# directories from the first byte.
+#
+# Inherited across the `gosu` fork into the database phase below, so this one
+# line covers both phases. It does NOT affect anything that sets its mode
+# explicitly - the handshake FIFOs (`mkfifo -m 600`) and the handshake
+# directory's `chmod 711`, which the uid-999 child must still be able to
+# traverse, are unchanged by it.
+umask 077
+
 backup_root="/backups"
 attachments_source="/data/attachments"
 # How long the database phase waits for root's attachment copy before failing
@@ -107,10 +123,20 @@ fi
 if [[ "$(id -u)" -eq 0 ]] && [[ "$db_phase" -eq 0 ]]; then
   mkdir -p "$backup_root"
   chown postgres:postgres "$backup_root"
+  # `umask` above cannot cover this one: /backups normally already EXISTS when
+  # this runs (Docker creates a bind mount's target as root-owned 0755 the
+  # first time it is materialised), and `mkdir -p` on an existing directory is
+  # a no-op that leaves its mode alone. Until this line, the only thing that
+  # tightened it was the closing sweep at the bottom of this file - i.e. only
+  # after every artifact had already been written into it. Best-effort for the
+  # same reason that sweep is (see its comment about Windows bind mounts):
+  # never fail a backup over a mode the underlying filesystem ignored.
+  chmod 700 "$backup_root" 2>/dev/null || true
 
   attachments_dir="$backup_root/attachments"
   mkdir -p "$attachments_dir"
   chown postgres:postgres "$attachments_dir"
+  chmod 700 "$attachments_dir" 2>/dev/null || true
 
   # The lock now lives in the ROOT phase (review finding F3): it has to cover
   # the attachment copy as well as the DB phase, and the copy happens here.
@@ -248,6 +274,12 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 postgres_dir="$backup_root/postgres"
 attachments_dir="$backup_root/attachments"
 mkdir -p "$postgres_dir" "$attachments_dir"
+# Same reason as the root phase's chmod above: these may already exist from an
+# earlier run under the old, looser behaviour, in which case `mkdir -p` leaves
+# their mode alone. Tightened HERE, before the snapshot session opens and
+# before any artifact is written into them, rather than only in the closing
+# sweep at the bottom of this file.
+chmod 700 "$postgres_dir" "$attachments_dir" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # One long-lived session, held open across pg_dump and the row-count/grant
@@ -504,6 +536,12 @@ printf '%s\n' "$(basename "$manifest_json")" >"$latest_tmp"
 chmod 600 "$latest_tmp"
 mv "$latest_tmp" "$backup_root/latest.txt"
 
+# A BACKSTOP, no longer the primary control (review finding, PR #32): `umask
+# 077` at the top of this file and the per-directory `chmod 700`s in both
+# phases above mean everything THIS run created was already restricted at
+# creation. What is left for this sweep is anything inherited from an earlier
+# run that predates that change, still sitting in the backup root.
+#
 # Best-effort: a Windows bind mount (Docker Desktop/WSL2) does not enforce
 # POSIX permission bits the way a native Linux host filesystem does, so this
 # is defense-in-depth for Linux deployment (docs/DESIGN.md 12.2's "encrypt

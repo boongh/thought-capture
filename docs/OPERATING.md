@@ -278,7 +278,14 @@ backup.sh`/`.ps1` runs the `backup` Compose profile - `pg_dump` in custom
 format at one consistent database snapshot, written atomically to a HOST
 directory (`TC_BACKUP_ROOT`, never a Docker volume), plus an attachment
 manifest/incremental copy and a `tc_app` grant catalog recorded from that same
-snapshot. `scripts/restore-test.sh`/`.ps1` then proves that backup actually
+snapshot. Both wrappers pin `-p thought-capture` explicitly and refuse to run
+at all when an ambient `COMPOSE_PROJECT_NAME`, or one set in `.env`, names a
+different project - a backup that silently captured a different, empty stack
+would be worse than one that failed outright. Every artifact is created
+restricted (`umask 077`, with each directory locked to 0700 before anything is
+written into it) rather than tightened after the fact, so a full database dump
+is never briefly world-readable on a host that enforces POSIX permissions.
+`scripts/restore-test.sh`/`.ps1` then proves that backup actually
 restores, against a throwaway, isolated Postgres under its own Compose project
 - never `thought-capture` - checking schema/every foreign key (a
 single-transaction `pg_restore`), every table's row count, every attachment's
