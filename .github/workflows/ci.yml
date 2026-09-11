@@ -185,6 +185,27 @@ jobs:
         # intentionally target the real `thought-capture` project) directly.
         run: scripts/check-backup-restore.sh
 
+      - name: Reclaim disk space before the embedding sidecar's torch build
+        # scripts/check-backup-restore.sh's own teardown already removes
+        # every container/volume it created, but leaves the IMAGES it built
+        # behind (thought-capture-postgres:local rebuilt repeatedly across
+        # its 3 rounds, the postgres:18.6-trixie/alpine:3.20 base layers,
+        # BuildKit's own layer cache) - none of which anything later in this
+        # job needs again. ubuntu-latest's ~14GB free disk is tight enough
+        # that those layers plus the embedding sidecar's own image (torch +
+        # sentence-transformers, over 1GB unpacked) can exhaust it outright -
+        # confirmed directly in CI (run 34573558753): "Start the embedding
+        # sidecar" failed with "No space left on device" partway through
+        # `chown -R` on its own just-installed torch package, only after
+        # scripts/check-backup-restore.sh started completing all 3 rounds
+        # for the first time (earlier CI failures never got far enough to
+        # accumulate this much layer/cache disk usage in the first place).
+        run: |
+          df -h /
+          docker buildx prune -af
+          docker system prune -af
+          df -h /
+
       # -----------------------------------------------------------------
       # Khoj contract tests (docs/DESIGN.md 16 step 6, docs/adr/0003).
       #
