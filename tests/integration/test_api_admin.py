@@ -125,3 +125,39 @@ async def test_force_khoj_sync_enqueues_every_current_document(
     # independent event for the same document (both are valid, retried
     # independently - force-sync is a trigger, not a dedup mechanism).
     assert len(events) == 2
+
+
+async def test_force_embedding_sync_requires_auth(api_fresh: httpx.AsyncClient) -> None:
+    response = await api_fresh.post("/v1/admin/embedding-sync")
+    assert response.status_code == 401
+
+
+async def test_force_embedding_sync_enqueues_every_current_document(
+    api_fresh: httpx.AsyncClient,
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+    unique_message_id: str,
+) -> None:
+    workspace_id, user_id = fresh_identity
+    document_id = await _seed_document(
+        app_session_factory, workspace_id, user_id, unique=unique_message_id
+    )
+
+    response = await api_fresh.post("/v1/admin/embedding-sync", headers=AUTH)
+
+    assert response.status_code == 200
+    # fresh_identity is a private workspace, so exactly this one document.
+    assert response.json()["enqueued"] == 1
+    async with app_session_factory() as session:
+        events = (
+            await session.execute(
+                sa.select(outbox_events).where(
+                    outbox_events.c.event_type == "embedding.sync_requested",
+                    outbox_events.c.aggregate_id == str(document_id),
+                )
+            )
+        ).all()
+    # The organize write already enqueued one; force-sync adds a second,
+    # independent event for the same document (both are valid, retried
+    # independently - force-sync is a trigger, not a dedup mechanism).
+    assert len(events) == 2

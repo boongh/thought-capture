@@ -22,11 +22,13 @@ from tc_api.problems import ProblemError, problem_response
 from tc_api.routers import admin, ask, debug, documents, entities, health, search, thoughts
 from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
+from tc_application.embedding_sync import ForceEmbeddingSync
 from tc_application.khoj_sync import ForceKhojSync
 from tc_application.search import Search
 from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
+from tc_infrastructure.db.embedding_force_sync import PostgresEmbeddingForceSync
 from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.entity_reader import PostgresEntityReader
 from tc_infrastructure.db.identity import resolve_identity
@@ -82,6 +84,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         llm_calls=PostgresLlmCallReader(sessions),
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(sessions)),
+        force_embedding_sync=ForceEmbeddingSync(PostgresEmbeddingForceSync(sessions)),
         session_factory=sessions,
         workspace_id=identity.workspace_id,
         user_id=identity.user_id,

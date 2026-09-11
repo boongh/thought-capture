@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from tc_api.dependencies import Authenticated, Context
-from tc_api.schemas import KhojSyncResponse
+from tc_api.schemas import EmbeddingSyncResponse, KhojSyncResponse
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"], dependencies=[Authenticated])
 
@@ -18,3 +18,13 @@ router = APIRouter(prefix="/v1/admin", tags=["admin"], dependencies=[Authenticat
 async def force_khoj_sync(context: Context) -> KhojSyncResponse:
     enqueued = await context.force_khoj_sync(context.workspace_id)
     return KhojSyncResponse(enqueued=enqueued)
+
+
+@router.post(
+    "/embedding-sync",
+    response_model=EmbeddingSyncResponse,
+    summary="Force current-document embedding sync",
+)
+async def force_embedding_sync(context: Context) -> EmbeddingSyncResponse:
+    enqueued = await context.force_embedding_sync(context.workspace_id)
+    return EmbeddingSyncResponse(enqueued=enqueued)
