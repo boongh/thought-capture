@@ -19,6 +19,7 @@ import uuid
 
 import httpx
 
+from tc_application.embedding_sync import DeliverEmbeddingSync
 from tc_application.khoj_sync import DeliverKhojSync
 from tc_application.organize import JournalFactory, OrganizeWindow
 from tc_application.structured import JournalWriter
@@ -28,6 +29,9 @@ from tc_domain.llm import LLMRequest, LLMResponse
 from tc_infrastructure.config import Settings, get_settings
 from tc_infrastructure.db.context_index import PostgresContextIndex
 from tc_infrastructure.db.document_reader import PostgresDocumentReader
+from tc_infrastructure.db.embedding_source import PostgresEmbeddingSource
+from tc_infrastructure.db.embedding_sync_outbox import PostgresEmbeddingSyncOutbox
+from tc_infrastructure.db.embedding_writer import PostgresEmbeddingWriter
 from tc_infrastructure.db.engine import create_engine, create_session_factory
 from tc_infrastructure.db.entity_repository import PostgresEntityRepository
 from tc_infrastructure.db.identity import resolve_identity
@@ -38,9 +42,11 @@ from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.windows import PostgresCaptureWindows
+from tc_infrastructure.embedding.client import HttpEmbeddingClient
 from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.llm.factory import build_organize_provider, build_select_provider
 from tc_infrastructure.runtime import run
+from tc_worker.embedding_sync_loop import EmbeddingSyncLoop
 from tc_worker.khoj_sync_loop import KhojSyncLoop
 from tc_worker.scheduler import OrganizeScheduler
 
@@ -120,16 +126,36 @@ async def serve(settings: Settings) -> None:
             )
         )
 
+        # docs/DESIGN.md 8.4, ADR-0010: the worker also owns embedding sync -
+        # same "unreachable dependency just means retry with backoff" shape
+        # as Khoj sync above, now against the self-hosted embedding sidecar
+        # instead of Khoj.
+        embedding_sync_loop = EmbeddingSyncLoop(
+            DeliverEmbeddingSync(
+                outbox=PostgresEmbeddingSyncOutbox(sessions, lease_owner="worker"),
+                source=PostgresEmbeddingSource(sessions),
+                embed=HttpEmbeddingClient(
+                    http,
+                    settings.embedding_sidecar_base_url,
+                    timeout=settings.embedding_sidecar_timeout_seconds,
+                ),
+                writer=PostgresEmbeddingWriter(sessions),
+                batch_size=settings.embedding_sync_batch_size,
+            )
+        )
+
         await scheduler.catch_up()
         scheduler.start()
         scheduler.schedule_next()
         khoj_sync_loop.start()
+        embedding_sync_loop.start()
 
         logger.info("worker.ready", extra={"workspace_id": str(identity.workspace_id)})
         try:
             await asyncio.Event().wait()
         finally:
             khoj_sync_loop.stop()
+            embedding_sync_loop.stop()
             scheduler.shutdown()
     finally:
         await http.aclose()
