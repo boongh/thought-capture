@@ -33,6 +33,9 @@ class StubEmbeddingPort:
             EmbeddingVector(values=(0.0, 0.0), model_id="stub@v1", dimensions=2) for _ in texts
         )
 
+    async def current_model_id(self) -> str:
+        return "stub@v1"
+
 
 class StubEmbeddingSyncOutbox:
     async def claim(self, limit: int) -> tuple[PendingEmbeddingSync, ...]:

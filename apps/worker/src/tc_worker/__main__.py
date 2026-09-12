@@ -22,6 +22,7 @@ import httpx
 from tc_application.embedding_sync import DeliverEmbeddingSync
 from tc_application.khoj_sync import DeliverKhojSync
 from tc_application.organize import JournalFactory, OrganizeWindow
+from tc_application.reembed import ReconcileReembedRuns
 from tc_application.structured import JournalWriter
 from tc_domain.capture import WorkspaceId
 from tc_domain.context import ContextAssemblyConfig
@@ -39,6 +40,7 @@ from tc_infrastructure.db.khoj_index_recorder import PostgresKhojIndexRecorder
 from tc_infrastructure.db.khoj_sync_outbox import PostgresKhojSyncOutbox
 from tc_infrastructure.db.llm_journal import PostgresLLMJournal
 from tc_infrastructure.db.organize_writer import PostgresOrganizeWriter
+from tc_infrastructure.db.reembed_run import PostgresReembedRunStore
 from tc_infrastructure.db.run_ledger import PostgresRunLedger
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.windows import PostgresCaptureWindows
@@ -141,7 +143,10 @@ async def serve(settings: Settings) -> None:
                 ),
                 writer=PostgresEmbeddingWriter(sessions),
                 batch_size=settings.embedding_sync_batch_size,
-            )
+            ),
+            # F15-A: advances any workspace's tracked `runs(kind='reembed')`
+            # to succeeded/failed after each poll's delivery.
+            reconcile=ReconcileReembedRuns(PostgresReembedRunStore(sessions)),
         )
 
         await scheduler.catch_up()

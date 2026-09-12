@@ -38,9 +38,17 @@ class RaisingDeliver:
         raise RuntimeError("boom: token=abc123")
 
 
+class RecordingReconcile:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self) -> None:
+        self.calls += 1
+
+
 async def test_start_is_idempotent_and_polls_at_least_once() -> None:
     deliver = RecordingDeliver()
-    loop = EmbeddingSyncLoop(deliver, interval=0.01)
+    loop = EmbeddingSyncLoop(deliver, reconcile=RecordingReconcile(), interval=0.01)
 
     loop.start()
     task = loop._task
@@ -52,8 +60,26 @@ async def test_start_is_idempotent_and_polls_at_least_once() -> None:
     loop.stop()
 
 
+async def test_reconcile_runs_after_each_poll_cycles_delivery() -> None:
+    deliver = RecordingDeliver()
+    reconcile = RecordingReconcile()
+    loop = EmbeddingSyncLoop(deliver, reconcile=reconcile, interval=0.01)
+
+    loop.start()
+    await asyncio.wait_for(deliver.event.wait(), timeout=1.0)
+    # Poll for reconcile to observe its call too - deliver's event fires
+    # first, a moment before reconcile runs in the same cycle.
+    for _ in range(100):
+        if reconcile.calls:
+            break
+        await asyncio.sleep(0.01)
+
+    assert reconcile.calls >= 1
+    loop.stop()
+
+
 async def test_stop_without_start_does_not_error() -> None:
-    loop = EmbeddingSyncLoop(RecordingDeliver(), interval=0.01)
+    loop = EmbeddingSyncLoop(RecordingDeliver(), reconcile=RecordingReconcile(), interval=0.01)
 
     loop.stop()  # must not raise
 
@@ -62,7 +88,7 @@ async def test_stop_without_start_does_not_error() -> None:
 
 async def test_stop_is_idempotent() -> None:
     deliver = RecordingDeliver()
-    loop = EmbeddingSyncLoop(deliver, interval=0.01)
+    loop = EmbeddingSyncLoop(deliver, reconcile=RecordingReconcile(), interval=0.01)
     loop.start()
     await asyncio.wait_for(deliver.event.wait(), timeout=1.0)
 
@@ -74,7 +100,7 @@ async def test_stop_is_idempotent() -> None:
 
 async def test_a_raising_deliver_does_not_kill_the_loop() -> None:
     deliver = RaisingDeliver()
-    loop = EmbeddingSyncLoop(deliver, interval=0.01)
+    loop = EmbeddingSyncLoop(deliver, reconcile=RecordingReconcile(), interval=0.01)
 
     loop.start()
     await asyncio.wait_for(deliver.event.wait(), timeout=1.0)
@@ -90,7 +116,7 @@ async def test_a_raising_deliver_does_not_kill_the_loop() -> None:
 
 async def test_stop_cancels_the_underlying_task_cleanly() -> None:
     deliver = RecordingDeliver()
-    loop = EmbeddingSyncLoop(deliver, interval=10.0)
+    loop = EmbeddingSyncLoop(deliver, reconcile=RecordingReconcile(), interval=10.0)
     loop.start()
     await asyncio.wait_for(deliver.event.wait(), timeout=1.0)
     task = loop._task

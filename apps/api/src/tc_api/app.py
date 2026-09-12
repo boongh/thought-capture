@@ -24,6 +24,7 @@ from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.embedding_sync import ForceEmbeddingSync
 from tc_application.khoj_sync import ForceKhojSync
+from tc_application.reembed import StartReembedRun
 from tc_application.search import Search
 from tc_domain.policy import AttachmentPolicy
 from tc_infrastructure.config import Settings, get_settings
@@ -35,10 +36,12 @@ from tc_infrastructure.db.identity import resolve_identity
 from tc_infrastructure.db.khoj_force_sync import PostgresKhojForceSync
 from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.reembed_run import PostgresReembedRunStore
 from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.semantic_hydrator import PostgresSemanticHydrator
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.embedding.client import HttpEmbeddingClient
 from tc_infrastructure.khoj.client import HttpKhojClient
 from tc_infrastructure.storage.attachment_archive import HttpAttachmentArchive
 from tc_infrastructure.storage.blob_store import FilesystemBlobStore
@@ -72,6 +75,11 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
     khoj = HttpKhojClient(http, settings.khoj_base_url)
     hydrator = PostgresSemanticHydrator(sessions)
     exact_search = PostgresExactSearch(sessions)
+    embed = HttpEmbeddingClient(
+        http,
+        settings.embedding_sidecar_base_url,
+        timeout=settings.embedding_sidecar_timeout_seconds,
+    )
 
     return ApiContext(
         settings=settings,
@@ -85,6 +93,7 @@ async def build_context(settings: Settings, http: httpx.AsyncClient) -> ApiConte
         outbox=PostgresOutbox(sessions, lease_owner="api"),
         force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(sessions)),
         force_embedding_sync=ForceEmbeddingSync(PostgresEmbeddingForceSync(sessions)),
+        start_reembed=StartReembedRun(embed=embed, runs=PostgresReembedRunStore(sessions)),
         session_factory=sessions,
         workspace_id=identity.workspace_id,
         user_id=identity.user_id,

@@ -107,6 +107,51 @@ class HttpEmbeddingClient:
                 f"embedding sidecar returned an unexpected shape: {exc}"
             ) from exc
 
+    async def current_model_id(self) -> str:
+        """``GET /health`` and compose ``model_id``/``model_revision`` the
+        same way ``embed`` does (``compose_embedding_model_id``, the one
+        place that join is allowed to happen) - F15-A's target model source
+        for ``StartReembedRun``. An unreachable/unready sidecar (including
+        its own 503 "still loading") or an unexpected response shape both
+        raise ``EmbeddingUnavailableError``, never a guessed model id."""
+        try:
+            response = await self._http.get(
+                f"{self._base_url}/health",
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "embedding_client.health_request_failed",
+                extra={"error_class": type(exc).__name__},
+            )
+            raise EmbeddingUnavailableError("embedding sidecar health check failed") from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            logger.warning(
+                "embedding_client.health_malformed_response",
+                extra={"error_class": type(exc).__name__},
+            )
+            raise EmbeddingUnavailableError(
+                "embedding sidecar health check returned a non-JSON response"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise EmbeddingUnavailableError(
+                f"embedding sidecar health check returned an unexpected shape: "
+                f"expected a JSON object, got {type(payload).__name__}"
+            )
+        model_id = payload.get("model_id")
+        model_revision = payload.get("model_revision")
+        if not isinstance(model_id, str) or not isinstance(model_revision, str):
+            raise EmbeddingUnavailableError(
+                "embedding sidecar health check returned an unexpected shape: "
+                "model_id/model_revision were not strings"
+            )
+        return compose_embedding_model_id(model_id, model_revision)
+
     def _parse_response(
         self, payload: object, *, expected_count: int
     ) -> tuple[EmbeddingVector, ...]:

@@ -127,6 +127,44 @@ async def test_force_khoj_sync_enqueues_every_current_document(
     assert len(events) == 2
 
 
+async def test_reembed_requires_auth(api_fresh: httpx.AsyncClient) -> None:
+    response = await api_fresh.post("/v1/admin/reembed")
+    assert response.status_code == 401
+
+
+async def test_reembed_returns_503_when_the_embedding_sidecar_is_unreachable(
+    api_fresh: httpx.AsyncClient,
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """F15-A (docs/plans/embedding-sync-review-round-4.md): the target model
+    id must come from the sidecar's own ``/health``, never a guess - an
+    unreachable sidecar (this test environment's default
+    ``TC_EMBEDDING_SIDECAR_BASE_URL``, which resolves only inside the
+    Compose network) must fail loudly rather than ever recording a
+    ``runs(kind='reembed')`` row against a fabricated model id.
+    """
+    response = await api_fresh.post("/v1/admin/reembed", headers=AUTH)
+
+    assert response.status_code == 503
+
+
+async def test_reembed_accepts_no_workspace_controlling_input(api_fresh: httpx.AsyncClient) -> None:
+    """docs/DESIGN.md 10: workspace comes from auth, never a client-supplied
+    parameter. Asserted at the OpenAPI-schema level, not just by observing
+    a response, since the endpoint takes no body either way - the
+    regression this guards is someone later adding a ``workspace_id`` query
+    parameter or request-body field and reading it instead of
+    ``context.workspace_id``."""
+    schema = api_fresh.get("/openapi.json")
+    response = await schema
+    operation = response.json()["paths"]["/v1/admin/reembed"]["post"]
+
+    assert "requestBody" not in operation
+    assert "parameters" not in operation or all(
+        param.get("in") != "query" for param in operation.get("parameters", [])
+    )
+
+
 async def test_force_embedding_sync_requires_auth(api_fresh: httpx.AsyncClient) -> None:
     response = await api_fresh.post("/v1/admin/embedding-sync")
     assert response.status_code == 401

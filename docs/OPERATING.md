@@ -255,10 +255,10 @@ not a bug: embeddings are *derived* artifacts, so stopping only changes
 *when* they get recomputed — nothing canonical is touched, and the raw
 thoughts and attachments that produced them remain exactly as captured.
 
-**Interim recovery** (manual, operator-run; **superseded** once the tracked
-`runs.kind = 'reembed'` lifecycle lands as its own slice — see
-`docs/plans/embedding-sync-review-round-3.md` "F13-B" for what that slice
-will look like):
+**Recovery** (audited, via the tracked `reembed` lifecycle —
+`docs/adr/0010`'s addendum, round-4 finding F15; supersedes the earlier
+hand-run `DELETE FROM document_embeddings` procedure this section used to
+document):
 
 1. Back up first — prevention is not recovery:
 
@@ -266,46 +266,37 @@ will look like):
    ./scripts/backup.sh    # or scripts/backup.ps1 on PowerShell
    ```
 
-2. Stop the worker so nothing else drains the outbox mid-recovery:
+2. Start (or resume) a tracked reembed sweep for the affected workspace:
 
    ```bash
-   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core stop worker
-   ```
-
-3. Delete the affected workspace's `document_embeddings` rows. This is safe
-   today specifically because nothing reads this table yet (semantic search
-   and Ask are not wired to it — see "Current scope and known gaps" below),
-   and `docs/DESIGN.md:922` already documents this table as one that "may be
-   deleted and rebuilt":
-
-   ```sql
-   DELETE FROM document_embeddings
-   USING documents
-   WHERE documents.id = document_embeddings.document_id
-     AND documents.workspace_id = '<workspace-id>';
-   ```
-
-4. Rebuild into an empty, and therefore uniform, index:
-
-   ```bash
-   curl -X POST http://127.0.0.1:8080/v1/admin/embedding-sync \
+   curl -X POST http://127.0.0.1:8080/v1/admin/reembed \
      -H "Authorization: Bearer $TC_API_BEARER_TOKEN"
    ```
 
-   This only enqueues one `embedding.sync_requested` event per current
-   document; delivery happens once the worker is running again, on its next
-   poll of `tc_worker.embedding_sync_loop`.
+   In one transaction, this records a `runs(kind='reembed', status='running')`
+   row targeting whatever model the sidecar's `/health` currently reports,
+   deletes every one of the workspace's `document_embeddings` rows, and
+   re-enqueues one `embedding.sync_requested` event per current document —
+   the same audited replacement for the old manual `DELETE` this endpoint
+   exists to retire. A 503 response means the sidecar is unreachable (fix
+   that first, per the F16 rebuild steps above, before retrying); a repeat
+   call while a sweep is already `running` for the workspace is safe and
+   just returns that same run.
 
-5. Restart the worker:
+3. The worker's `EmbeddingSyncLoop` delivers the re-enqueued events and
+   reconciles the run's status (`succeeded`/`failed`) on its own poll cycle
+   — no manual worker stop/restart is needed. Check progress with:
 
-   ```bash
-   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core start worker
+   ```sql
+   SELECT status, embedding_model_id, started_at, finished_at, error_code
+   FROM runs
+   WHERE kind = 'reembed' AND workspace_id = '<workspace-id>'
+   ORDER BY started_at DESC LIMIT 1;
    ```
 
-   Watch for `embedding_sync.model_conflict` recurring in the logs — if it
-   does, step 3's delete did not cover every row in the workspace (or another
-   workspace shares the same sidecar and hit the same model change; repeat
-   steps 3–5 for it too).
+   `status='failed'` with `error_code='embedding_sync_dead_lettered'` means
+   at least one of this sweep's own sync events exhausted its retries —
+   investigate the worker logs for that document before retrying the sweep.
 
 ## Running the checks
 
@@ -323,7 +314,8 @@ The runnable stack captures allowlisted Discord text and attachments, exposes
 authenticated API capture and reads, and preserves canonical data in
 PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`,
 `/v1/entities`, `/v1/search` (exact, semantic, and hybrid modes), `/v1/ask`,
-`/v1/admin/khoj-sync`, and `/v1/admin/embedding-sync` routes. A separate
+`/v1/admin/khoj-sync`, `/v1/admin/embedding-sync`, and `/v1/admin/reembed`
+routes. A separate
 read-only `/debug` operator view exposes raw thoughts, entities, daily
 digests, and journaled LLM runs; it is not the future unified UI. The Discord
 bot also takes `/organize`, `/status`, `/search`, and `/ask` slash commands,

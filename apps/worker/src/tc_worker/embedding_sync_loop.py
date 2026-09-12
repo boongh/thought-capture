@@ -13,6 +13,7 @@ import asyncio
 import logging
 
 from tc_application.embedding_sync import DeliverEmbeddingSync
+from tc_application.reembed import ReconcileReembedRuns
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,24 @@ POLL_INTERVAL_SECONDS = 30.0
 
 
 class EmbeddingSyncLoop:
-    """Polls ``DeliverEmbeddingSync`` on an interval until stopped."""
+    """Polls ``DeliverEmbeddingSync`` on an interval until stopped.
+
+    ``reconcile`` runs after each poll cycle's delivery, not before or on
+    its own timer: a reembed run's completion depends on the very outbox
+    delivery this loop just drove, so checking right after gives
+    ``runs(kind='reembed')`` the freshest possible read without a second
+    scheduled task (F15-A, docs/plans/embedding-sync-review-round-4.md).
+    """
 
     def __init__(
-        self, deliver: DeliverEmbeddingSync, *, interval: float = POLL_INTERVAL_SECONDS
+        self,
+        deliver: DeliverEmbeddingSync,
+        *,
+        reconcile: ReconcileReembedRuns,
+        interval: float = POLL_INTERVAL_SECONDS,
     ) -> None:
         self._deliver = deliver
+        self._reconcile = reconcile
         self._interval = interval
         self._task: asyncio.Task[None] | None = None
 
@@ -44,6 +57,7 @@ class EmbeddingSyncLoop:
                 synced = await self._deliver()
                 if synced:
                     logger.info("embedding_sync.synced_batch", extra={"count": synced})
+                await self._reconcile()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

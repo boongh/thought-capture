@@ -840,6 +840,7 @@ All first-party endpoints are under `/v1`, return RFC 9457-style problem details
 | `GET` | `/v1/entities` | entities, aliases, document links |
 | `POST` | `/v1/entities/{id}/aliases` | owner-approved alias |
 | `POST` | `/v1/admin/embedding-sync` | force a re-embed of current documents: enqueues one `embedding.sync_requested` outbox event per document with a current revision (7.2 step 11, `docs/adr/0010`), the same event the organize writer enqueues on each revision write, so a forced sync and an organize-triggered sync share one code path; returns the count enqueued, not a synchronous embed |
+| `POST` | `/v1/admin/reembed` | begin the tracked `reembed` lifecycle (8.5, `docs/adr/0010` addendum): in one transaction, records a `runs(kind='reembed')` row targeting whatever model the embedding sidecar's `/health` currently reports, deletes the workspace's existing `document_embeddings`, and re-enqueues every current document via the same `embedding_sync_requested` enqueue path as the row above; distinct from it because this one also wipes and re-tracks, replacing the former hand-run `DELETE` runbook step. Idempotent while a run is already `running` for the workspace: returns that run instead of starting a second one. 503 if the sidecar is unreachable, never a run recorded against a guessed model |
 | `POST` | `/v1/admin/export` | create portable plaintext export |
 | `GET` | `/health/live` | process liveness only |
 | `GET` | `/health/ready` | database and required dependency readiness |

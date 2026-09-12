@@ -271,6 +271,27 @@ class EmbeddingSyncResponse(BaseModel):
     )
 
 
+class ReembedResponse(BaseModel):
+    """``POST /v1/admin/reembed`` (F15-A, docs/plans/
+    embedding-sync-review-round-4.md). Unlike ``EmbeddingSyncResponse``, this
+    always represents a tracked ``runs(kind='reembed')`` row - including
+    when the call was idempotent and returned an already-``running`` sweep
+    rather than starting a new one, in which case ``enqueued`` is 0 (this
+    call enqueued nothing new)."""
+
+    run_id: uuid.UUID
+    enqueued: int = Field(
+        description=(
+            "Documents just enqueued for re-embedding by this call. 0 when a sweep "
+            "was already running for this workspace and this call returned it "
+            "unchanged instead of starting a second one."
+        )
+    )
+    embedding_model_id: str = Field(
+        description="The target model this run is migrating the workspace onto."
+    )
+
+
 class AskRequest(BaseModel):
     """docs/DESIGN.md 10's ``POST /v1/ask`` body. Filter fields mirror
     ``GET /v1/search``'s (docs/adr/0003's "Ask proxy" amendment, "Strict

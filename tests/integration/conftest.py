@@ -32,6 +32,7 @@ from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.embedding_sync import ForceEmbeddingSync
 from tc_application.khoj_sync import ForceKhojSync
+from tc_application.reembed import StartReembedRun
 from tc_application.search import Search
 from tc_domain.capture import UserId, WorkspaceId
 from tc_domain.policy import AttachmentPolicy
@@ -42,10 +43,12 @@ from tc_infrastructure.db.entity_reader import PostgresEntityReader
 from tc_infrastructure.db.khoj_force_sync import PostgresKhojForceSync
 from tc_infrastructure.db.llm_call_reader import PostgresLlmCallReader
 from tc_infrastructure.db.outbox import PostgresOutbox
+from tc_infrastructure.db.reembed_run import PostgresReembedRunStore
 from tc_infrastructure.db.search_reader import PostgresExactSearch
 from tc_infrastructure.db.semantic_hydrator import PostgresSemanticHydrator
 from tc_infrastructure.db.thought_reader import PostgresThoughtReader
 from tc_infrastructure.db.thought_repository import PostgresThoughtRepository
+from tc_infrastructure.embedding.client import HttpEmbeddingClient
 from tc_infrastructure.khoj.client import HttpKhojClient
 from tests.integration.support import CONNECT_ARGS
 from tests.unit.fakes import FakeAttachmentArchive
@@ -61,6 +64,13 @@ API_TOKEN = "test-bearer-token-value"
 # may not have a real Khoj behind it depending on the developer's own local
 # setup. See _api_client's docstring for why this matters.
 UNREACHABLE_KHOJ_URL = "http://127.0.0.1:1"
+
+# Same reasoning as UNREACHABLE_KHOJ_URL above, for the embedding sidecar's
+# 503-when-unreachable test: a developer with TC_EMBEDDING_SIDECAR_BASE_URL
+# exported locally (e.g. pointing at a real sidecar started via
+# `docker compose ... --profile core up`) must not make that test
+# non-deterministic by accidentally reaching a live one.
+UNREACHABLE_EMBEDDING_SIDECAR_URL = "http://127.0.0.1:1"
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -346,6 +356,14 @@ async def _api_client(
             force_khoj_sync=ForceKhojSync(PostgresKhojForceSync(app_session_factory)),
             force_embedding_sync=ForceEmbeddingSync(
                 PostgresEmbeddingForceSync(app_session_factory)
+            ),
+            start_reembed=StartReembedRun(
+                embed=HttpEmbeddingClient(
+                    khoj_http,
+                    UNREACHABLE_EMBEDDING_SIDECAR_URL,
+                    timeout=settings.embedding_sidecar_timeout_seconds,
+                ),
+                runs=PostgresReembedRunStore(app_session_factory),
             ),
             session_factory=app_session_factory,
             workspace_id=WorkspaceId(workspace_id),

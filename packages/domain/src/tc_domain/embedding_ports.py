@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 
@@ -46,6 +47,27 @@ class EmbeddingPort(Protocol):
 
         Returns ``()`` for an empty input tuple without erroring - there is
         nothing to embed, not a failure.
+        """
+        ...
+
+    async def current_model_id(self) -> str:
+        """The sidecar's currently-loaded model, composed the same way a
+        computed ``EmbeddingVector.model_id`` is (F15-A, docs/plans/
+        embedding-sync-review-round-4.md).
+
+        This is the one place a ``reembed`` run's target model is allowed to
+        come from: the API process holds no ``TC_EMBEDDING_MODEL_ID``/
+        ``_REVISION`` of its own, and guessing rather than asking the
+        sidecar would risk recording a run against a model the sidecar isn't
+        actually serving.
+
+        Raises:
+            EmbeddingUnavailableError: the sidecar could not be reached, or
+                its ``/health`` response did not match the expected shape -
+                mirrors ``embed``'s degrade-explicit contract. Callers must
+                never fall back to a guessed model id on this error; the
+                caller (the ``/v1/admin/reembed`` handler) turns this into a
+                loud 503 instead.
         """
         ...
 
@@ -207,4 +229,107 @@ class EmbeddingForceSyncPort(Protocol):
         Return the count enqueued; delivery happens on the periodic sync
         loop's next poll, not inline - this is a trigger, not a blocking
         full reindex."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ReembedRun:
+    """One tracked ``runs(kind='reembed')`` row (F15-A, docs/plans/
+    embedding-sync-review-round-4.md).
+
+    Carries what an operator or ``POST /v1/admin/reembed`` caller needs to
+    know about a model-migration sweep, without exposing the raw ``runs``
+    row shape outward.
+    """
+
+    run_id: uuid.UUID
+    workspace_id: uuid.UUID
+    embedding_model_id: str
+    status: str
+    """One of ``'running'``, ``'succeeded'``, ``'failed'`` (``runs.status``)."""
+    enqueued: int
+    """Documents enqueued for re-embedding when this run started."""
+    started_at: datetime
+    """When this sweep began - the boundary ``has_dead_lettered_sync_events``
+    uses so a dead letter from before this run started (an unrelated,
+    already-stale failure) can never be mistaken for this sweep's own."""
+
+
+@runtime_checkable
+class ReembedRunStore(Protocol):
+    async def start(self, workspace_id: uuid.UUID, *, embedding_model_id: str) -> ReembedRun:
+        """Begin (or return the already-running) reembed sweep for
+        ``workspace_id`` under ``embedding_model_id``.
+
+        In one transaction: insert ``runs(kind='reembed', status='running',
+        embedding_model_id=..., started_at=now())``, delete every
+        ``document_embeddings`` row belonging to this workspace, and enqueue
+        one ``embedding.sync_requested`` event per current document -
+        reusing the same enqueue path ``ForceEmbeddingSync``/the organize
+        writer already use, so all three trigger sources share one code
+        path. The caller (the HTTP handler) must only acknowledge the
+        request after this call returns, since it returns only after that
+        transaction commits (CLAUDE.md's durability invariant).
+
+        Idempotent while a run is already ``running`` for this workspace:
+        returns that existing run's details unchanged rather than starting a
+        second one or erroring (owner decision, round-4 F15).
+        """
+        ...
+
+    async def find_running(self, workspace_id: uuid.UUID) -> ReembedRun | None:
+        """The workspace's currently-``running`` reembed run, if any."""
+        ...
+
+    # The remaining methods are the narrow primitives
+    # ``tc_application.reembed.ReconcileReembedRuns`` composes into the
+    # succeeded/failed/still-running decision (docs/DESIGN.md 8.5, 9.2).
+    # Deliberately not a single opaque ``reconcile()`` verb: that state
+    # transition is exactly the kind of branching business logic this
+    # codebase otherwise always keeps in the application layer, testable
+    # against fakes without a real database (e.g. ``DeliverEmbeddingSync``
+    # above composes ``EmbeddingSource``/``EmbeddingPort``/``EmbeddingWriter``
+    # the same way, rather than a store deciding for it).
+
+    async def list_running(self) -> tuple[ReembedRun, ...]:
+        """Every workspace's currently-``running`` reembed run."""
+        ...
+
+    async def count_current_documents(self, workspace_id: uuid.UUID) -> int:
+        """How many of this workspace's documents currently have a revision
+        (the same population ``EmbeddingForceSyncPort.enqueue_all`` and
+        ``start`` above enqueue against)."""
+        ...
+
+    async def count_embedded_under_model(
+        self, workspace_id: uuid.UUID, embedding_model_id: str
+    ) -> int:
+        """How many of this workspace's ``document_embeddings`` rows already
+        carry ``embedding_model_id`` - joined through ``documents`` for
+        workspace scope, since ``document_embeddings`` has none of its own."""
+        ...
+
+    async def has_dead_lettered_sync_events(
+        self, workspace_id: uuid.UUID, *, since: datetime
+    ) -> bool:
+        """True if any of this workspace's ``embedding.sync_requested``
+        events created at or after ``since`` has exhausted ``max_attempts``
+        without being delivered.
+
+        ``since`` must be the reconciled run's own ``started_at`` - never
+        unbounded. A dead letter from before this sweep began is a stale,
+        unrelated failure (e.g. an ordinary sync event that dead-lettered
+        weeks earlier for its own reasons); nothing in this codebase ever
+        clears or ages out a dead-lettered row, so an unbounded check would
+        let one old, unrelated failure permanently fail every future reembed
+        attempt for that workspace."""
+        ...
+
+    async def mark_succeeded(self, run_id: uuid.UUID) -> None:
+        """Sets ``status='succeeded'`` and ``finished_at=now()``."""
+        ...
+
+    async def mark_failed(self, run_id: uuid.UUID, *, error_code: str) -> None:
+        """Sets ``status='failed'``, ``finished_at=now()``, and
+        ``error_code`` - never personal content (docs/DESIGN.md 14.2)."""
         ...

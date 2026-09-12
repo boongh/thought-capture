@@ -632,3 +632,101 @@ service, new flag) and can be reverted independently without touching the
 still-live Khoj path. After step 5's cutover, rollback means re-enabling
 the Khoj compose profile and flag — kept buildable, not deleted, until this
 ADR's "Full Khoj removal" verification gate above is met.
+
+## Addendum: tracked reembed lifecycle (2026-09-12, round-4 review finding F15)
+
+**What this addendum records.** Round-3's own review (`docs/plans/embedding-sync-review-round-3.md`)
+found no tracked `runs.kind='reembed'` lifecycle behind §8.5/9.2's
+requirement that a model change "requires a `reembed` run … that recomputes
+every `document_embeddings` row before the new model is read from," and the
+owner deferred building it. Round 4's independent review raised the same
+gap and additionally found that the deferral, recorded only in an untracked
+`docs/plans/` file, was not an accepted decision the review could weigh
+against. The owner then chose to build the trackable half now (this
+addendum) rather than defer further, closing the round-3 deferral this ADR
+never itself recorded.
+
+**F15-A, landed:** `POST /v1/admin/reembed` (`docs/DESIGN.md`'s endpoint
+table). In one Postgres transaction: inserts `runs(kind='reembed',
+status='running', embedding_model_id=<target>, started_at=now())`, deletes
+the requesting workspace's existing `document_embeddings` rows, and
+re-enqueues one `embedding.sync_requested` event per current document
+through the same `enqueue_embedding_sync` path §7.2 step 11 and the
+`embedding-sync` endpoint already share. The target model comes from a new
+`EmbeddingPort.current_model_id()`, which reads the sidecar's own `/health`
+response and composes it through the existing `compose_embedding_model_id`
+— never a config value the API process might hold stale relative to what
+the sidecar container actually has baked in (the exact mismatch class F16,
+same review round, closed on the sidecar's build/deploy side). An
+unreachable sidecar fails the request with 503 rather than recording a run
+against a guessed model. A worker-side `ReconcileReembedRuns`, run after
+each embedding-sync poll cycle, advances a `running` run to `succeeded`
+once every current document is embedded under the target model, or
+`failed` if one of *that run's own* enqueued events dead-letters — scoped
+by the run's `started_at` specifically so a stale, unrelated dead letter
+from before the run began (such as the exact `EmbeddingModelConflictError`
+halt this feature exists to help recover from) can never be mistaken for
+this run's own failure. A second call while a run is already `running` for
+a workspace is idempotent: it returns that run rather than erroring or
+starting a duplicate sweep.
+
+**Migration 0009** grants `tc_app` `DELETE` on `document_embeddings`,
+narrowing rather than reversing migration 0008's original invariant
+("superseded in place, never removed while the document itself still
+exists"): DELETE is needed specifically to unblock round-3's already-
+accepted `EmbeddingModelConflictError` model-uniformity guard, which would
+otherwise reject every new-model write this feature enqueues against the
+workspace's surviving old-model rows. The sync-writer's own upsert path
+still never deletes; DELETE reaches this table through exactly one call
+site (`PostgresReembedRunStore.start`), a code-review-time invariant, not
+one Postgres itself enforces at the grant level.
+
+**Known, accepted residual risks (not fixed in this pass, tracked here
+rather than silently accepted):**
+
+- **Concurrent-start race.** `start()`'s idempotency check
+  (`find_running` then insert) is not locked against two truly concurrent
+  `POST /v1/admin/reembed` calls landing in the same commit window; under
+  READ COMMITTED both could pass the check and each start an independent
+  `running` row. This mirrors an already-accepted gap in
+  `PostgresEmbeddingWriter.upsert`'s own workspace-uniformity precondition,
+  but is a weaker analogy than it first appears: two duplicated reembed
+  sweeps cost more (two full re-enqueues, two tracked rows an operator must
+  reconcile by hand) than a transient conflict exception. Acceptable today
+  because this is a single-operator admin surface; a partial unique index
+  on `runs (workspace_id) WHERE kind = 'reembed' AND status = 'running'`
+  would close it if concurrent operators ever become real.
+- **A document deleted mid-sweep can spuriously fail an otherwise-healthy
+  run.** If a document is deleted after its sync event is enqueued but
+  before delivery, `EmbeddingSource.get_revision` fails, the event
+  eventually dead-letters for a document that no longer exists (and is
+  correctly excluded from `count_current_documents`), and — because the
+  dead-letter check does not distinguish "this document still matters" from
+  "this document existed when enqueued" — the run is marked `failed` even
+  though every document that still exists would have completed
+  successfully. Matches this ADR's literal "failed when an event
+  dead-letters" wording; worth a future fix (e.g. excluding events for
+  since-deleted documents from the dead-letter check) but not built here to
+  keep this addendum's slice bounded.
+
+**F15-B, explicitly deferred — blocking acceptance criteria on the slice
+that first reads `document_embeddings`:** nothing reads the table yet
+(`search_reader.py` has no pgvector path), so read-time gating cannot be
+built or tested today. The slice that adds semantic reads MUST implement,
+before it ships:
+
+1. **The read-time model filter** already named a blocking criterion in
+   round 3: every semantic-search query filters on
+   `document_embeddings.embedding_model_id = <the workspace's current
+   target model>`, never trusting the sync loop to always be caught up
+   (mirrors §8.4's existing `revision_id = documents.current_revision_id`
+   currentness guarantee).
+2. **The read gate itself:** `degraded=true` (or an outright refusal) on
+   semantic reads while a `runs(kind='reembed', status='running')` row
+   exists for the workspace, so a query never silently mixes a partially-
+   completed sweep's coverage with stale pre-sweep rows.
+
+**Dimensionality changes remain out of scope.** This lifecycle recomputes
+vectors; it does not resize the `vector(384)` column. A model whose output
+is not 384-dimensional still needs its own migration — this addendum makes
+model swaps trackable, not free.

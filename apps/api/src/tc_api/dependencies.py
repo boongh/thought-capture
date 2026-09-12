@@ -20,6 +20,7 @@ from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
 from tc_application.embedding_sync import ForceEmbeddingSync
 from tc_application.khoj_sync import ForceKhojSync
+from tc_application.reembed import StartReembedRun
 from tc_application.search import Search
 from tc_domain.capture import UserId, WorkspaceId
 from tc_infrastructure.config import Settings
@@ -45,6 +46,7 @@ class ApiContext:
     outbox: PostgresOutbox
     force_khoj_sync: ForceKhojSync
     force_embedding_sync: ForceEmbeddingSync
+    start_reembed: StartReembedRun
     session_factory: async_sessionmaker[AsyncSession]
     workspace_id: WorkspaceId
     user_id: UserId
@@ -141,6 +143,15 @@ def _basic_auth_credential(authorization: str | None) -> str | None:
     return password or None
 
 
+def get_start_reembed(context: Context) -> StartReembedRun:
+    """``POST /v1/admin/reembed``'s use case, assembled once at startup in
+    ``tc_api.app.build_context`` like every other ``ApiContext`` collaborator
+    and simply read off the context here (F15-A, docs/plans/
+    embedding-sync-review-round-4.md)."""
+    return context.start_reembed
+
+
 Context = Annotated[ApiContext, Depends(get_context)]
+ReembedUseCase = Annotated[StartReembedRun, Depends(get_start_reembed)]
 Authenticated = Depends(require_bearer_token)
 DebugAuthenticated = Depends(require_debug_access)
