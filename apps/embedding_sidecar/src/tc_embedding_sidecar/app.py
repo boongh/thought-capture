@@ -173,18 +173,17 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
                 ),
             )
         try:
-            vectors = await model.embed(request.texts)
+            result = await model.embed(request.texts)
         except TooManyRequestsError as exc:
             raise HTTPException(
                 status_code=429, detail=str(exc), headers={"Retry-After": "1"}
             ) from exc
-        truncated = await model.detect_truncation(request.texts)
         return EmbedResponse(
             model_id=model.model_id,
             model_revision=model.revision,
             dimensions=model.dimensions,
-            vectors=tuple(tuple(v) for v in vectors),
-            truncated=truncated,
+            vectors=tuple(tuple(v) for v in result.vectors),
+            truncated=result.truncated,
         )
 
     return app

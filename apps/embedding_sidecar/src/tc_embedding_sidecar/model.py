@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from sentence_transformers import SentenceTransformer
 
@@ -17,6 +19,37 @@ from sentence_transformers import SentenceTransformer
 class TooManyRequestsError(Exception):
     """Raised when admission is already at `max_concurrent_encodes +
     max_queued_encodes` - the caller should surface this as HTTP 429."""
+
+
+@dataclass(frozen=True)
+class EncodeResult:
+    """The outcome of one admitted `EmbeddingModel.embed()` call: one vector
+    and one truncation flag per input text, in input order."""
+
+    vectors: list[list[float]]
+    truncated: tuple[bool, ...]
+
+
+def _detect_truncation(model: Any, texts: Sequence[str]) -> tuple[bool, ...]:
+    """Report, per text, whether encoding it would silently truncate it.
+
+    `sentence-transformers`' `encode()` truncates any input longer than
+    `max_seq_length` tokens with no signal in its output (Decision D,
+    docs/plans/khoj-retirement-completion.md) - the only way to observe it
+    is to tokenize first and compare lengths, not to inspect the resulting
+    vector. Runs synchronously inside the same worker thread as the encode
+    call that follows it (see `EmbeddingModel._encode_and_flag`) - never
+    awaited or admitted on its own.
+    """
+    max_seq_length = model.max_seq_length
+    if max_seq_length is None:
+        # No declared limit to compare against - nothing to report as
+        # truncated rather than guessing at one.
+        return tuple(False for _ in texts)
+    tokenizer = model.tokenizer
+    return tuple(
+        len(tokenizer.encode(text, add_special_tokens=True)) > max_seq_length for text in texts
+    )
 
 
 class EmbeddingModel:
@@ -62,43 +95,33 @@ class EmbeddingModel:
         # half-initialized model from another task.
         self._model = model
 
-    async def detect_truncation(self, texts: Sequence[str]) -> tuple[bool, ...]:
-        """Report, per text, whether `embed()` would silently truncate it.
+    def _encode_and_flag(self, texts: list[str]) -> EncodeResult:
+        """Run both CPU-bound phases for one request inside a single worker
+        thread: tokenize-for-truncation first, then encode.
 
-        `sentence-transformers`' `encode()` truncates any input longer than
-        `max_seq_length` tokens with no signal in its output (Decision D,
-        docs/plans/khoj-retirement-completion.md) - the only way to observe
-        it is to tokenize first and compare lengths, not to inspect the
-        resulting vector. Tokenizing is cheap relative to a forward pass,
-        but still runs off the event loop for consistency with `embed()`
-        and to avoid blocking on a large batch.
+        Tokenizing first means a tokenizer failure never costs a wasted
+        forward pass. Note the cost this preserves rather than introduces:
+        each text is tokenized twice per request - once here for the
+        truncation flag, once again inside `SentenceTransformer.encode`'s
+        own internal tokenization. That duplication already existed before
+        this method did; what changes here is that both phases now run
+        under the same admitted, semaphore-held call instead of the second
+        phase running unbounded after the first released its slot.
+        `max_text_length` remains the per-request ceiling on it.
         """
-        if self._model is None:
-            raise RuntimeError("detect_truncation() called before the model finished loading")
-        if not texts:
-            return ()
+        model = self._model
+        assert model is not None  # narrowed by the caller before to_thread
+        truncated = _detect_truncation(model, texts)
+        vectors = model.encode(texts, convert_to_numpy=True)
+        return EncodeResult(vectors=[vector.tolist() for vector in vectors], truncated=truncated)
 
-        def _check() -> tuple[bool, ...]:
-            model = self._model
-            assert model is not None  # narrowed above; re-asserted for the closure
-            max_seq_length = model.max_seq_length
-            if max_seq_length is None:
-                # No declared limit to compare against - nothing to report
-                # as truncated rather than guessing at one.
-                return tuple(False for _ in texts)
-            tokenizer = model.tokenizer
-            return tuple(
-                len(tokenizer.encode(text, add_special_tokens=True)) > max_seq_length
-                for text in texts
-            )
-
-        return await asyncio.to_thread(_check)
-
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(self, texts: Sequence[str]) -> EncodeResult:
+        """Tokenize-for-truncation and encode `texts`, both under one
+        admitted, semaphore-held call - see `_encode_and_flag`."""
         if self._model is None:
             raise RuntimeError("embed() called before the model finished loading")
         if not texts:
-            return []
+            return EncodeResult(vectors=[], truncated=())
         if self._admitted >= self._max_admitted:
             raise TooManyRequestsError(
                 f"already at capacity ({self._max_admitted} concurrent/queued encode requests)"
@@ -106,9 +129,6 @@ class EmbeddingModel:
         self._admitted += 1
         try:
             async with self._encode_semaphore:
-                vectors = await asyncio.to_thread(
-                    self._model.encode, list(texts), convert_to_numpy=True
-                )
+                return await asyncio.to_thread(self._encode_and_flag, list(texts))
         finally:
             self._admitted -= 1
-        return [vector.tolist() for vector in vectors]

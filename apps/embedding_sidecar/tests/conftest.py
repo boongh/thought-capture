@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from tc_embedding_sidecar.app import create_app
-from tc_embedding_sidecar.model import TooManyRequestsError
+from tc_embedding_sidecar.model import EncodeResult, TooManyRequestsError
 
 FAKE_MODEL_ID = "fake/stub-embedder"
 FAKE_MODEL_REVISION = "fake0000revision0000sha"
@@ -37,19 +37,19 @@ class FakeEmbeddingModel:
     def is_ready(self) -> bool:
         return self._ready
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed(self, texts: Sequence[str]) -> EncodeResult:
         if self._busy:
             raise TooManyRequestsError("synthetic: already at capacity")
         # A deterministic, cheap stand-in vector - only its length and
-        # per-text ordering matter for these transport-level tests.
-        return [[float(len(text))] * self.dimensions for text in texts]
-
-    async def detect_truncation(self, texts: Sequence[str]) -> tuple[bool, ...]:
-        # These transport-level tests never exercise real truncation
-        # detection (that's apps/embedding_sidecar/tests/test_model.py's
-        # job) - a fixed all-False result keeps this fake's behavior
-        # predictable for callers that only care about the /embed wiring.
-        return tuple(False for _ in texts)
+        # per-text ordering matter for these transport-level tests. These
+        # transport-level tests never exercise real truncation detection
+        # (that's apps/embedding_sidecar/tests/test_model.py's job) - a
+        # fixed all-False result keeps this fake's behavior predictable for
+        # callers that only care about the /embed wiring.
+        return EncodeResult(
+            vectors=[[float(len(text))] * self.dimensions for text in texts],
+            truncated=tuple(False for _ in texts),
+        )
 
 
 def _lifespan_with(model: FakeEmbeddingModel) -> object:
