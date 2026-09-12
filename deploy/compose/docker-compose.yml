@@ -200,6 +200,17 @@ services:
       # entrypoint refuses to start without a token instead, which fails the
       # service that actually needs it rather than the whole stack.
       TC_API_BEARER_TOKEN: ${TC_API_BEARER_TOKEN:-}
+      # Since review round 4 (`6ac8c6b`), apps/api/src/tc_api/app.py also
+      # constructs a real HttpEmbeddingClient and injects it into
+      # StartReembedRun for POST /v1/admin/reembed - api embeds now, not just
+      # enqueues (review finding F20). These two defaults must stay
+      # byte-identical to the worker service's own copies below, including
+      # the in-container service-name default (never a loopback address -
+      # review finding F12); see the worker service's own anchor comment for
+      # the full reasoning. TC_EMBEDDING_SYNC_BATCH_SIZE is deliberately NOT
+      # forwarded here - api has no sync loop to read it.
+      TC_EMBEDDING_SIDECAR_BASE_URL: ${TC_EMBEDDING_SIDECAR_BASE_URL:-http://embedding-sidecar:8081}
+      TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS: ${TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS:-30.0}
     ports:
       - "127.0.0.1:${TC_API_PORT:-8080}:8080"
     volumes:
@@ -331,12 +342,15 @@ services:
     environment:
       # organize (docs/DESIGN.md 7.4) runs at digest time, from this service.
       <<: [*service-env, *llm-env]
-      # Only worker constructs HttpEmbeddingClient/DeliverEmbeddingSync
-      # (apps/worker/src/tc_worker/__main__.py) - api's admin endpoint only
-      # enqueues, it never embeds - so these operator-tunable settings
-      # (env.example, Settings defaults) are forwarded here only, matching the
-      # llm-env pattern above of scoping a variable to the services with an
-      # actual code path that reads it. Without this, Compose never injects
+      # worker constructs HttpEmbeddingClient/DeliverEmbeddingSync
+      # (apps/worker/src/tc_worker/__main__.py) for its own sync loop, AND
+      # (since review round 4, `6ac8c6b`) apps/api/src/tc_api/app.py also
+      # constructs one for POST /v1/admin/reembed - so the api service above
+      # forwards the same two base-url/timeout settings with byte-identical
+      # defaults (review finding F20). TC_EMBEDDING_SYNC_BATCH_SIZE below is
+      # forwarded to worker ONLY: api has no sync loop to read it, matching
+      # the llm-env pattern above of scoping a variable to the services with
+      # an actual code path that reads it. Without this, Compose never injects
       # an arbitrary .env key into a container's runtime environment on its
       # own, so an operator's override in .env would silently have no effect
       # (review finding F12).

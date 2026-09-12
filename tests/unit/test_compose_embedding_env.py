@@ -173,13 +173,68 @@ def test_worker_base_url_default_is_the_in_container_service_name() -> None:
     assert "127.0.0.1" not in forwarded_value
 
 
-def test_api_service_does_not_forward_the_sidecar_base_url() -> None:
+def _api_environment() -> dict[str, Any]:
     data = cast(dict[str, Any], yaml.safe_load(DOCKER_COMPOSE_YML.read_text(encoding="utf-8")))
-    api_environment = cast(dict[str, Any], data["services"]["api"]["environment"])
-    assert "TC_EMBEDDING_SIDECAR_BASE_URL" not in api_environment, (
-        "apps/api/src/tc_api/app.py only enqueues via PostgresEmbeddingForceSync "
-        "and never constructs HttpEmbeddingClient - forwarding this into `api` "
-        "would be dead configuration"
+    return cast(dict[str, Any], data["services"]["api"]["environment"])
+
+
+# Since review round 4 (`6ac8c6b`), apps/api/src/tc_api/app.py constructs a
+# real `HttpEmbeddingClient` and injects it into `StartReembedRun` for
+# `POST /v1/admin/reembed` - api embeds now, not just enqueues. Only these two
+# variables (matching WORKER_EMBEDDING_ENV_VARS minus the batch size, which
+# has no sync loop to read it in `api`) need forwarding.
+API_EMBEDDING_ENV_VARS = (
+    "TC_EMBEDDING_SIDECAR_BASE_URL",
+    "TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS",
+)
+
+
+def test_api_service_forwards_every_embedding_setting_it_reads() -> None:
+    environment = _api_environment()
+    for var in API_EMBEDDING_ENV_VARS:
+        assert var in environment, (
+            f"deploy/compose/docker-compose.yml's `api` service must forward "
+            f"{var} into the container - since review round 4 (6ac8c6b), "
+            f"apps/api/src/tc_api/app.py builds a real HttpEmbeddingClient for "
+            f"POST /v1/admin/reembed, so an operator's .env override being "
+            f"silently ignored here means reembed either 503s or silently "
+            f"talks to a different sidecar than sync does (review finding F20)"
+        )
+
+
+def test_api_base_url_default_matches_worker_default() -> None:
+    api_environment = _api_environment()
+    worker_environment = _worker_environment()
+    assert (
+        api_environment["TC_EMBEDDING_SIDECAR_BASE_URL"]
+        == worker_environment["TC_EMBEDDING_SIDECAR_BASE_URL"]
+    ), (
+        "api and worker must forward TC_EMBEDDING_SIDECAR_BASE_URL with the "
+        "byte-identical default (the in-container service name, never a "
+        "loopback address - review finding F12) - otherwise reembed and sync "
+        "could silently talk to two different sidecars"
+    )
+    assert "127.0.0.1" not in str(api_environment["TC_EMBEDDING_SIDECAR_BASE_URL"])
+
+
+def test_api_timeout_default_matches_worker_default() -> None:
+    api_environment = _api_environment()
+    worker_environment = _worker_environment()
+    assert (
+        api_environment["TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS"]
+        == worker_environment["TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS"]
+    ), (
+        "api and worker must forward TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS with "
+        "the byte-identical default (review finding F20)"
+    )
+
+
+def test_api_service_does_not_forward_the_sync_batch_size() -> None:
+    api_environment = _api_environment()
+    assert "TC_EMBEDDING_SYNC_BATCH_SIZE" not in api_environment, (
+        "apps/api has no sync loop (only apps/worker's EmbeddingSyncLoop reads "
+        "TC_EMBEDDING_SYNC_BATCH_SIZE) - forwarding it into `api` would be "
+        "dead configuration (review finding F20, point 2)"
     )
 
 

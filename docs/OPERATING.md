@@ -339,12 +339,14 @@ queued daily-digest deliveries separately from capture acknowledgements.
 
 The embedding sidecar's URL is two deliberately separate variables
 (`env.example`): `TC_EMBEDDING_SIDECAR_BASE_URL` is the URL a *container*
-uses (defaults to the in-container service name, and is forwarded into the
-`worker` service by `deploy/compose/docker-compose.yml`, since only worker
-constructs `HttpEmbeddingClient`); `TC_EMBEDDING_SIDECAR_HOST_BASE_URL` is the
-URL the *host* uses once the contract-test overlay publishes the sidecar's
-port to loopback, read only by `tests/contract/embedding_sidecar/conftest.py`
-and both check scripts. Setting the wrong one has no effect on the other.
+uses (defaults to the in-container service name, and is forwarded into both
+the `api` and `worker` services by `deploy/compose/docker-compose.yml`, since
+`worker`'s sync loop and `api`'s `POST /v1/admin/reembed` handler both
+construct their own `HttpEmbeddingClient`); `TC_EMBEDDING_SIDECAR_HOST_BASE_URL`
+is the URL the *host* uses once the contract-test overlay publishes the
+sidecar's port to loopback, read only by
+`tests/contract/embedding_sidecar/conftest.py` and both check scripts.
+Setting the wrong one has no effect on the other.
 `upstage/solar-pro4`
 (select) and `x-ai/grok-4.3` (organize) are reviewed and registered in safe
 mode (`REVIEWED_MODELS`), but `TC_MODEL_ORGANIZE` and `TC_MODEL_SELECT` still
