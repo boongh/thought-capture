@@ -70,3 +70,16 @@ class KhojExportNotFound(DomainError):
     the sync consumer must still fail this event explicitly rather than crash
     if it ever does.
     """
+
+
+class EmbeddingSourceNotFound(DomainError):
+    """An ``embedding.sync_requested`` event points at a document that does not
+    resolve, or does not belong to the event's workspace.
+
+    Should not happen - documents are never deleted (docs/DESIGN.md 6.3) and
+    every event carries its own workspace - but the sync consumer must still
+    fail this event explicitly rather than crash if it ever does. Deliberately
+    not ``KhojExportNotFound``: Slice 5 of docs/plans/khoj-retirement-completion.md
+    deletes every Khoj-named domain error once Khoj is removed, and the
+    embedding sync path must not depend on code scheduled for deletion.
+    """

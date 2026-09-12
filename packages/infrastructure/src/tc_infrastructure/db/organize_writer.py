@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tc_domain.capture import WorkspaceId
 from tc_domain.organize import OrganizeWriteRequest, OrganizeWriteResult, RunOutcome
+from tc_infrastructure.db.embedding_sync_enqueue import enqueue_embedding_sync
 from tc_infrastructure.db.entity_repository import PostgresEntityRepository
 from tc_infrastructure.db.khoj_sync_enqueue import enqueue_khoj_sync
 from tc_infrastructure.db.tables import (
@@ -110,6 +111,9 @@ class PostgresOrganizeWriter:
                 # documents (invariant 5) get no event; Khoj's own index for
                 # them is already current from a prior run.
                 await enqueue_khoj_sync(session, workspace_id=workspace_id, document_id=document_id)
+                await enqueue_embedding_sync(
+                    session, workspace_id=workspace_id, document_id=document_id
+                )
 
             await self._write_context_selections(
                 session, workspace_id=workspace_id, run_id=run_id, request=request

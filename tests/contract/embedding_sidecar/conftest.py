@@ -4,7 +4,17 @@ Start the server with the contract-test overlay applied - a normal
 `--profile core up` no longer publishes this service to any host port at all
 (deploy/compose/docker-compose.yml's own header comment on `embedding-sidecar`
 has the full reasoning), so the base file alone leaves nothing on
-TC_EMBEDDING_SIDECAR_BASE_URL's default for these tests to reach:
+TC_EMBEDDING_SIDECAR_HOST_BASE_URL's default for these tests to reach.
+
+This is deliberately a DIFFERENT variable from TC_EMBEDDING_SIDECAR_BASE_URL
+(env.example, forwarded into the `worker` service by
+deploy/compose/docker-compose.yml) - that one is the URL a *container* uses
+to reach the sidecar over the `embedding` Compose network, and defaults to
+the in-container service name. This one is the URL the *host* uses once the
+contract-test overlay below publishes the sidecar's port to loopback.
+Collapsing them into one name previously meant the loopback default silently
+broke the worker container, since nothing inside a container listens on its
+own 127.0.0.1 (review finding F12):
 
     docker compose --env-file .env -f deploy/compose/docker-compose.yml \
       -f deploy/compose/embedding-sidecar.contract-test.docker-compose.yml \
@@ -30,7 +40,7 @@ import httpx
 import pytest
 
 EMBEDDING_SIDECAR_BASE_URL = os.environ.get(
-    "TC_EMBEDDING_SIDECAR_BASE_URL", "http://127.0.0.1:8081"
+    "TC_EMBEDDING_SIDECAR_HOST_BASE_URL", "http://127.0.0.1:8081"
 )
 
 

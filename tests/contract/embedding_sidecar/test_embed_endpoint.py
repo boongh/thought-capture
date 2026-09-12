@@ -82,6 +82,44 @@ async def test_embed_is_deterministic_for_the_same_text(sidecar: httpx.AsyncClie
     assert first.json()["vectors"] == second.json()["vectors"]
 
 
+async def test_embed_reports_truncated_true_for_a_text_over_the_token_limit(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """Decision D (docs/plans/khoj-retirement-completion.md): the model
+    silently truncates past its 512-token limit with no signal in the
+    vector itself, so this can only be proven via the `truncated` flag,
+    not by inspecting the returned vector. "word " repeated 600 times is
+    well over 512 tokens for a subword tokenizer, comfortably inside the
+    `MAX_TEXT_LENGTH` character limit."""
+    long_text = "word " * 600
+
+    response = await sidecar.post("/embed", json={"texts": [long_text]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["truncated"] == [True]
+
+
+async def test_embed_reports_truncated_false_for_a_short_text(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    response = await sidecar.post("/embed", json={"texts": ["hello world"]})
+
+    assert response.status_code == 200
+    assert response.json()["truncated"] == [False]
+
+
+async def test_embed_reports_one_truncation_flag_per_input_text_in_order(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    texts = ["hello world", "word " * 600]
+
+    response = await sidecar.post("/embed", json={"texts": texts})
+
+    assert response.status_code == 200
+    assert response.json()["truncated"] == [False, True]
+
+
 async def test_embed_with_an_empty_batch_returns_no_vectors(sidecar: httpx.AsyncClient) -> None:
     response = await sidecar.post("/embed", json={"texts": []})
 

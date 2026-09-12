@@ -220,6 +220,78 @@ LEFT JOIN external_identities e ON e.user_id = u.id;
 `external_user_id` is the Discord account allowed to capture. If it is missing
 or wrong, messages are ignored without being stored (docs/DESIGN.md 4.1).
 
+## Recovering from an embedding model conflict
+
+**Symptom:** `embedding_sync.model_conflict` at **ERROR** in the `worker`
+logs, one entry per affected document, carrying `event_id`, `document_id`,
+`stored_model_id`, and `incoming_model_id`. The corresponding
+`embedding.sync_requested` events keep failing and retrying with backoff,
+eventually dead-lettering once they exhaust `outbox_events.max_attempts`
+(`outbox.py`) — semantic sync for that workspace is effectively halted, not
+silently degraded.
+
+**Cause:** the embedding sidecar's model or pinned revision changed
+(`TC_EMBEDDING_MODEL_ID` or `TC_EMBEDDING_MODEL_REVISION` in `.env`) without
+running a full re-embed of the workspace first. `document_embeddings` must
+never hold vectors from two different models within one workspace
+(docs/DESIGN.md 8.5, 9.2); the write path now refuses every write that would
+violate that, rather than mixing models silently. This is a deliberate halt,
+not a bug: embeddings are *derived* artifacts, so stopping only changes
+*when* they get recomputed — nothing canonical is touched, and the raw
+thoughts and attachments that produced them remain exactly as captured.
+
+**Interim recovery** (manual, operator-run; **superseded** once the tracked
+`runs.kind = 'reembed'` lifecycle lands as its own slice — see
+`docs/plans/embedding-sync-review-round-3.md` "F13-B" for what that slice
+will look like):
+
+1. Back up first — prevention is not recovery:
+
+   ```bash
+   ./scripts/backup.sh    # or scripts/backup.ps1 on PowerShell
+   ```
+
+2. Stop the worker so nothing else drains the outbox mid-recovery:
+
+   ```bash
+   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core stop worker
+   ```
+
+3. Delete the affected workspace's `document_embeddings` rows. This is safe
+   today specifically because nothing reads this table yet (semantic search
+   and Ask are not wired to it — see "Current scope and known gaps" below),
+   and `docs/DESIGN.md:922` already documents this table as one that "may be
+   deleted and rebuilt":
+
+   ```sql
+   DELETE FROM document_embeddings
+   USING documents
+   WHERE documents.id = document_embeddings.document_id
+     AND documents.workspace_id = '<workspace-id>';
+   ```
+
+4. Rebuild into an empty, and therefore uniform, index:
+
+   ```bash
+   curl -X POST http://127.0.0.1:8080/v1/admin/embedding-sync \
+     -H "Authorization: Bearer $TC_API_BEARER_TOKEN"
+   ```
+
+   This only enqueues one `embedding.sync_requested` event per current
+   document; delivery happens once the worker is running again, on its next
+   poll of `tc_worker.embedding_sync_loop`.
+
+5. Restart the worker:
+
+   ```bash
+   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core start worker
+   ```
+
+   Watch for `embedding_sync.model_conflict` recurring in the logs — if it
+   does, step 3's delete did not cover every row in the workspace (or another
+   workspace shares the same sidecar and hit the same model change; repeat
+   steps 3–5 for it too).
+
 ## Running the checks
 
 ```bash
@@ -236,16 +308,37 @@ The runnable stack captures allowlisted Discord text and attachments, exposes
 authenticated API capture and reads, and preserves canonical data in
 PostgreSQL. The API provides health, `/v1/thoughts`, `/v1/documents`,
 `/v1/entities`, `/v1/search` (exact, semantic, and hybrid modes), `/v1/ask`,
-and `/v1/admin/khoj-sync` routes. A separate read-only `/debug` operator view
-exposes raw thoughts, entities, daily digests, and journaled LLM runs; it is
-not the future unified UI. The Discord bot also takes `/organize`, `/status`,
-`/search`, and `/ask` slash commands, all restricted to the configured owner.
+`/v1/admin/khoj-sync`, and `/v1/admin/embedding-sync` routes. A separate
+read-only `/debug` operator view exposes raw thoughts, entities, daily
+digests, and journaled LLM runs; it is not the future unified UI. The Discord
+bot also takes `/organize`, `/status`, `/search`, and `/ask` slash commands,
+all restricted to the configured owner.
 
 The `worker` processes closed capture windows, catches up missed windows after
-startup, and writes versioned derived documents and entities; it also runs a
-sync loop (`tc_worker.khoj_sync_loop`) that pushes newly-written documents
-into Khoj's index automatically. The Discord bot polls queued daily-digest
-deliveries separately from capture acknowledgements. `upstage/solar-pro4`
+startup, and writes versioned derived documents and entities; it also runs two
+sync loops in parallel (ADR-0010 step 2, "running alongside Khoj sync, not
+replacing it yet"): `tc_worker.khoj_sync_loop`, which pushes newly-written
+documents into Khoj's index, and `tc_worker.embedding_sync_loop`, which
+computes each newly-written document's current-revision embedding via the
+first-party embedding sidecar and stores it in the `document_embeddings`
+pgvector column. Both are outbox-driven and poll every 30s by default; an
+operator can force an immediate backfill for either with
+`POST /v1/admin/khoj-sync` or `POST /v1/admin/embedding-sync` respectively -
+both only enqueue, delivery still happens on the relevant loop's next poll.
+Neither semantic search nor Ask reads from `document_embeddings` yet (Slice 3
+and Slice 4 of `docs/plans/khoj-retirement-completion.md` wire that up); this
+loop only keeps the table current in the meantime. The Discord bot polls
+queued daily-digest deliveries separately from capture acknowledgements.
+
+The embedding sidecar's URL is two deliberately separate variables
+(`env.example`): `TC_EMBEDDING_SIDECAR_BASE_URL` is the URL a *container*
+uses (defaults to the in-container service name, and is forwarded into the
+`worker` service by `deploy/compose/docker-compose.yml`, since only worker
+constructs `HttpEmbeddingClient`); `TC_EMBEDDING_SIDECAR_HOST_BASE_URL` is the
+URL the *host* uses once the contract-test overlay publishes the sidecar's
+port to loopback, read only by `tests/contract/embedding_sidecar/conftest.py`
+and both check scripts. Setting the wrong one has no effect on the other.
+`upstage/solar-pro4`
 (select) and `x-ai/grok-4.3` (organize) are reviewed and registered in safe
 mode (`REVIEWED_MODELS`), but `TC_MODEL_ORGANIZE` and `TC_MODEL_SELECT` still
 default to blank in `env.example`: an operator must opt in explicitly, or the

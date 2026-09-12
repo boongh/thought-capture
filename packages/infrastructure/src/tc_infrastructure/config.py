@@ -128,6 +128,18 @@ class Settings(BaseSettings):
     # happened.
     ask_provider_retention_acknowledged: bool = False
 
+    # -- Embedding sidecar (docs/adr/0010 §4-5) ------------------------------
+    # The in-container Compose service name/port, resolvable only from other
+    # containers on the same Compose network - env.example's own default is a
+    # loopback value instead, used only by the contract-test overlay that
+    # publishes this service to the host.
+    embedding_sidecar_base_url: str = "http://embedding-sidecar:8081"
+    embedding_sidecar_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Batch size for the periodic embedding-sync poll (docs/DESIGN.md 8.4) -
+    # bounded well under the sidecar's own max_batch_size so a single sync
+    # batch never risks tripping that limit.
+    embedding_sync_batch_size: int = Field(default=20, ge=1)
+
     @field_validator(
         "discord_owner_user_id",
         "discord_guild_id",

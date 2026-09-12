@@ -254,7 +254,7 @@ try {
             # select, worker's organize), not every container in the shared
             # network.
             $llmEnv = Join-Path ([System.IO.Path]::GetTempPath()) "tc-compose-sanity-llm.env"
-            "POSTGRES_PASSWORD=sanity-check-only`nTC_APP_DB_PASSWORD=sanity-check-only`nTC_OPENROUTER_API_KEY=sanity-check-api-key`nTC_MODEL_ORGANIZE=sanity-check-organize-model`nTC_MODEL_SELECT=sanity-check-select-model`n" |
+            "POSTGRES_PASSWORD=sanity-check-only`nTC_APP_DB_PASSWORD=sanity-check-only`nTC_OPENROUTER_API_KEY=sanity-check-api-key`nTC_MODEL_ORGANIZE=sanity-check-organize-model`nTC_MODEL_SELECT=sanity-check-select-model`nTC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS=99.5`nTC_EMBEDDING_SYNC_BATCH_SIZE=77`n" |
                 Set-Content -LiteralPath $llmEnv -Encoding utf8 -NoNewline
             try {
                 $llmConfig = & docker compose --env-file $llmEnv -f deploy/compose/docker-compose.yml --profile core config 2>$null
@@ -296,6 +296,23 @@ try {
                     if ($serviceBlock -match "TC_MODEL_(ORGANIZE|SELECT|QUERY_PLAN)") {
                         throw "FAIL: compose config sanity ($service must not receive model pins, but does)"
                     }
+                }
+
+                # Embedding sync settings forwarding (review finding, Slice 2
+                # first-line review): only `worker` constructs
+                # HttpEmbeddingClient/DeliverEmbeddingSync
+                # (apps/worker/src/tc_worker/__main__.py) - Compose never
+                # auto-injects an arbitrary .env key into a container's
+                # runtime environment unless it is also listed under that
+                # service's `environment:`, so an operator override of either
+                # variable would silently have no effect without this being
+                # forwarded.
+                $workerBlock = Get-ServiceBlock $lines "worker"
+                if ($workerBlock -notmatch 'TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS: "99\.5"') {
+                    throw "FAIL: compose config sanity (worker did not receive TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS)"
+                }
+                if ($workerBlock -notmatch 'TC_EMBEDDING_SYNC_BATCH_SIZE: "77"') {
+                    throw "FAIL: compose config sanity (worker did not receive TC_EMBEDDING_SYNC_BATCH_SIZE)"
                 }
             }
             finally {
@@ -420,7 +437,7 @@ try {
     # -------------------------------------------------------------------
     Write-Host ""
     Write-Host "--- contract tests (embedding sidecar)" -ForegroundColor Cyan
-    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_BASE_URL } else { "http://127.0.0.1:8081" }
+    $EmbeddingSidecarUrl = if ($env:TC_EMBEDDING_SIDECAR_HOST_BASE_URL) { $env:TC_EMBEDDING_SIDECAR_HOST_BASE_URL } else { "http://127.0.0.1:8081" }
     $EmbeddingSidecarUp = $false
     try {
         $response = Invoke-WebRequest -Uri "$EmbeddingSidecarUrl/health" -TimeoutSec 3 -UseBasicParsing

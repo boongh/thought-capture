@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tc_api.problems import ProblemError, unauthorized
 from tc_application.ask import AskQuestion
 from tc_application.capture import CaptureThought
+from tc_application.embedding_sync import ForceEmbeddingSync
 from tc_application.khoj_sync import ForceKhojSync
 from tc_application.search import Search
 from tc_domain.capture import UserId, WorkspaceId
@@ -43,6 +44,7 @@ class ApiContext:
     llm_calls: PostgresLlmCallReader
     outbox: PostgresOutbox
     force_khoj_sync: ForceKhojSync
+    force_embedding_sync: ForceEmbeddingSync
     session_factory: async_sessionmaker[AsyncSession]
     workspace_id: WorkspaceId
     user_id: UserId

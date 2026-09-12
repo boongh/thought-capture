@@ -195,7 +195,7 @@ if command -v docker >/dev/null 2>&1; then
   # (discord-bot's select, worker's organize), not every container in the
   # shared network.
   llm_env="$(mktemp)"
-  printf 'POSTGRES_PASSWORD=sanity-check-only\nTC_APP_DB_PASSWORD=sanity-check-only\nTC_OPENROUTER_API_KEY=sanity-check-api-key\nTC_MODEL_ORGANIZE=sanity-check-organize-model\nTC_MODEL_SELECT=sanity-check-select-model\n' >"$llm_env"
+  printf 'POSTGRES_PASSWORD=sanity-check-only\nTC_APP_DB_PASSWORD=sanity-check-only\nTC_OPENROUTER_API_KEY=sanity-check-api-key\nTC_MODEL_ORGANIZE=sanity-check-organize-model\nTC_MODEL_SELECT=sanity-check-select-model\nTC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS=99.5\nTC_EMBEDDING_SYNC_BATCH_SIZE=77\n' >"$llm_env"
   llm_config="$(docker compose --env-file "$llm_env" -f deploy/compose/docker-compose.yml --profile core config 2>/dev/null)"
   llm_config_status=$?
   if [[ $llm_config_status -ne 0 ]]; then
@@ -241,6 +241,24 @@ if command -v docker >/dev/null 2>&1; then
       exit 1
     fi
   done
+
+  # Embedding sync settings forwarding (review finding, Slice 2 first-line
+  # review): only `worker` constructs HttpEmbeddingClient/DeliverEmbeddingSync
+  # (apps/worker/src/tc_worker/__main__.py) - a Compose `.env` key is never
+  # auto-injected into a container's runtime environment unless it is also
+  # listed under that service's `environment:`, so an operator override of
+  # either variable would silently have no effect without this being forwarded.
+  worker_env="$(service_block worker)"
+  if ! grep -q "TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS: \"99.5\"" <<<"$worker_env"; then
+    printf "FAIL: compose config sanity (worker did not receive TC_EMBEDDING_SIDECAR_TIMEOUT_SECONDS)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+    exit 1
+  fi
+  if ! grep -q 'TC_EMBEDDING_SYNC_BATCH_SIZE: "77"' <<<"$worker_env"; then
+    printf "FAIL: compose config sanity (worker did not receive TC_EMBEDDING_SYNC_BATCH_SIZE)\n" >&2
+    rm -f "$core_only_env" "$ai_error_file" "$llm_env"
+    exit 1
+  fi
   rm -f "$llm_env"
   if docker compose --env-file "$core_only_env" -f deploy/compose/docker-compose.yml \
     -f deploy/compose/khoj.docker-compose.yml --profile ai config --quiet 2>"$ai_error_file"; then
@@ -372,7 +390,7 @@ fi
 # merely being available (same reasoning as the integration-test gate above).
 # ---------------------------------------------------------------------------
 printf '\n--- contract tests (embedding sidecar)\n'
-embedding_sidecar_url="${TC_EMBEDDING_SIDECAR_BASE_URL:-http://127.0.0.1:8081}"
+embedding_sidecar_url="${TC_EMBEDDING_SIDECAR_HOST_BASE_URL:-http://127.0.0.1:8081}"
 if curl --silent --fail --max-time 3 "$embedding_sidecar_url/health" >/dev/null 2>&1; then
   if ! TC_REQUIRE_CONTRACT=1 "$uv_bin" run pytest -m contract tests/contract/embedding_sidecar; then
     printf 'FAIL: contract tests (embedding sidecar)\n' >&2

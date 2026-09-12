@@ -261,6 +261,16 @@ class KhojSyncResponse(BaseModel):
     )
 
 
+class EmbeddingSyncResponse(BaseModel):
+    enqueued: int = Field(
+        description=(
+            "Documents just enqueued for embedding sync. Delivery happens on the "
+            "worker's next embedding sync-loop poll, not inline - this is a trigger, "
+            "not a blocking full reindex."
+        )
+    )
+
+
 class AskRequest(BaseModel):
     """docs/DESIGN.md 10's ``POST /v1/ask`` body. Filter fields mirror
     ``GET /v1/search``'s (docs/adr/0003's "Ask proxy" amendment, "Strict
