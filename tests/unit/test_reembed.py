@@ -30,11 +30,13 @@ class FakeEmbeddingPort:
     def __init__(self, *, model_id: str = MODEL_ID, raises: Exception | None = None) -> None:
         self.model_id = model_id
         self.raises = raises
+        self.current_model_id_calls = 0
 
     async def embed(self, texts: tuple[str, ...]) -> tuple[object, ...]:
         raise NotImplementedError("not exercised by these tests")
 
     async def current_model_id(self) -> str:
+        self.current_model_id_calls += 1
         if self.raises is not None:
             raise self.raises
         return self.model_id
@@ -149,6 +151,36 @@ async def test_start_is_idempotent_while_a_run_is_already_running() -> None:
 
     assert result is already_running
     assert result.enqueued == 5
+
+
+async def test_start_returns_an_already_running_run_without_asking_the_sidecar() -> None:
+    """F21 (docs/plans/embedding-sync-review-round-5.md): an operator retrying
+    the endpoint during exactly the outage that motivates the retry must not
+    get a 503 for a sweep that is already running - the store's own record of
+    a running run must be consulted before the sidecar, not after."""
+    already_running = _run(status="running", enqueued=5)
+    embed = FakeEmbeddingPort(raises=EmbeddingUnavailableError("sidecar down"))
+    runs = FakeReembedRunStore(running=already_running)
+    start = StartReembedRun(embed=embed, runs=runs)
+
+    result = await start(WORKSPACE_ID)
+
+    assert result is already_running
+    assert embed.current_model_id_calls == 0
+    assert runs.start_calls == []
+
+
+async def test_start_still_propagates_a_real_outage_when_no_run_is_running() -> None:
+    """The fix must not swallow a genuine outage: absent a running run, an
+    unreachable sidecar still surfaces as EmbeddingUnavailableError."""
+    embed = FakeEmbeddingPort(raises=EmbeddingUnavailableError("sidecar down"))
+    runs = FakeReembedRunStore(started=_run())
+    start = StartReembedRun(embed=embed, runs=runs)
+
+    with pytest.raises(EmbeddingUnavailableError):
+        await start(WORKSPACE_ID)
+
+    assert runs.start_calls == []
 
 
 async def test_reconcile_marks_succeeded_once_every_current_document_is_embedded() -> None:

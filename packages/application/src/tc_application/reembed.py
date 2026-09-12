@@ -30,7 +30,17 @@ class StartReembedRun:
         self._runs = runs
 
     async def __call__(self, workspace_id: WorkspaceId) -> ReembedRun:
-        # Asked before touching the store at all: an unreachable sidecar
+        # Consult the store before the sidecar: an operator retrying this
+        # endpoint during exactly the outage that motivates the retry must
+        # get back the already-running sweep, not a 503, since idempotency
+        # matters most when the sidecar is down (F21,
+        # docs/plans/embedding-sync-review-round-5.md). `start`'s own
+        # running check still covers the concurrent two-callers-at-once race
+        # that this lookup can't.
+        existing = await self._runs.find_running(workspace_id)
+        if existing is not None:
+            return existing
+        # No run running: an unreachable sidecar here is a real outage and
         # must fail loudly (the caller maps EmbeddingUnavailableError to a
         # 503) rather than ever recording a run against a guessed model.
         embedding_model_id = await self._embed.current_model_id()
