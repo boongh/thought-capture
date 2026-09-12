@@ -19,7 +19,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tc_domain.embedding_ports import EmbeddingVector
+from tc_domain.embedding_ports import EmbeddingModelConflictError, EmbeddingVector
 from tc_infrastructure.db.embedding_writer import PostgresEmbeddingWriter
 from tc_infrastructure.db.tables import (
     EMBEDDING_DIMENSIONS,
@@ -361,13 +361,17 @@ async def test_updated_at_only_advances_on_a_real_write(
     assert advanced_updated_at > first_updated_at
 
 
-async def test_same_revision_different_model_replaces_the_stored_row_and_reports_true(
+async def test_same_revision_different_model_raises_model_conflict_and_leaves_the_row_untouched(
     admin_session_factory: async_sessionmaker[AsyncSession],
     fresh_identity: tuple[uuid.UUID, uuid.UUID],
 ) -> None:
-    """A forced re-embed sweep (docs/DESIGN.md 8.5) after an embedding-model
-    change writes a new vector for a document whose revision has not moved -
-    the model-gated branch of the write guard (F11)."""
+    """A same-revision write under a *different* model must never be admitted
+    (F13 - this replaces F11's
+    ``test_same_revision_different_model_replaces_the_stored_row_and_reports_true``,
+    which asserted the unsafe admission as intended behavior). Refusing it,
+    not merely returning ``False``, is what lets the sync loop tell "nothing
+    to do" apart from "an operator changed the model without a reembed
+    sweep" (docs/DESIGN.md 8.5, 9.2)."""
     workspace_id, _ = fresh_identity
     writer = PostgresEmbeddingWriter(admin_session_factory)
 
@@ -390,15 +394,15 @@ async def test_same_revision_different_model_replaces_the_stored_row_and_reports
             )
         )
 
-    written = await writer.upsert(
-        workspace_id=workspace_id,
-        document_id=document_id,
-        revision_id=revision_id,
-        revision_number=1,
-        vector=_vector(0.9, model_id=OTHER_MODEL_ID),
-    )
+    with pytest.raises(EmbeddingModelConflictError):
+        await writer.upsert(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            vector=_vector(0.9, model_id=OTHER_MODEL_ID),
+        )
 
-    assert written is True
     async with admin_session_factory() as session:
         row = (
             await session.execute(
@@ -411,16 +415,191 @@ async def test_same_revision_different_model_replaces_the_stored_row_and_reports
             )
         ).one()
     assert row.revision_id == revision_id
-    assert row.embedding == list(_vector(0.9, model_id=OTHER_MODEL_ID).values)
-    assert row.embedding_model_id == OTHER_MODEL_ID
-    assert row.updated_at > first_updated_at
+    assert row.embedding == list(_vector(0.1, model_id=MODEL_ID).values)
+    assert row.embedding_model_id == MODEL_ID
+    assert row.updated_at == first_updated_at
+
+
+async def test_newer_revision_different_model_raises_model_conflict(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """Path B: the ordinary newer-revision path must not silently mix models
+    either - a plain revert of F11 (dropping only the OR'd branch) would
+    still admit this, because the strictly-newer guard alone says nothing
+    about the model. This is the case that makes the workspace-uniformity
+    precondition necessary, not merely the F11 revert."""
+    workspace_id, _ = fresh_identity
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+
+    async with admin_session_factory() as session, session.begin():
+        document_id, first_revision_id = await _document_with_revision(
+            session, workspace_id, body="revision one", revision_number=1
+        )
+        run_id = await session.scalar(
+            sa.select(document_revisions.c.run_id).where(
+                document_revisions.c.id == first_revision_id
+            )
+        )
+        second_revision_id = await _add_revision(
+            session,
+            workspace_id=workspace_id,
+            document_id=document_id,
+            parent_revision_id=first_revision_id,
+            run_id=run_id,
+            revision_number=2,
+            body="revision two",
+        )
+
+    await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=first_revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=MODEL_ID),
+    )
+
+    with pytest.raises(EmbeddingModelConflictError):
+        await writer.upsert(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            revision_id=second_revision_id,
+            revision_number=2,
+            vector=_vector(0.9, model_id=OTHER_MODEL_ID),
+        )
+
+    async with admin_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(
+                    document_embeddings.c.revision_id,
+                    document_embeddings.c.embedding_model_id,
+                ).where(document_embeddings.c.document_id == document_id)
+            )
+        ).one()
+    assert row.revision_id == first_revision_id
+    assert row.embedding_model_id == MODEL_ID
+
+
+async def test_fresh_document_raises_model_conflict_when_a_sibling_document_holds_a_different_model(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """Path B's insert variant: a document embedded for the *first* time (no
+    row of its own to guard on the revision-number check) still must not be
+    allowed to introduce a second model into a workspace that already has
+    one, via a sibling document's stored row."""
+    workspace_id, _ = fresh_identity
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+
+    async with admin_session_factory() as session, session.begin():
+        existing_document_id, existing_revision_id = await _document_with_revision(
+            session, workspace_id, body="existing doc"
+        )
+
+    await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=existing_document_id,
+        revision_id=existing_revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=MODEL_ID),
+    )
+
+    async with admin_session_factory() as session, session.begin():
+        new_document_id, new_revision_id = await _document_with_revision(
+            session, workspace_id, body="brand new doc"
+        )
+
+    with pytest.raises(EmbeddingModelConflictError):
+        await writer.upsert(
+            workspace_id=workspace_id,
+            document_id=new_document_id,
+            revision_id=new_revision_id,
+            revision_number=1,
+            vector=_vector(0.5, model_id=OTHER_MODEL_ID),
+        )
+
+    async with admin_session_factory() as session:
+        stored_document_ids = (
+            await session.execute(
+                sa.select(document_embeddings.c.document_id).where(
+                    document_embeddings.c.document_id == new_document_id
+                )
+            )
+        ).all()
+    assert stored_document_ids == [], "the conflicted write must not have inserted anything"
+
+
+async def test_a_different_workspaces_conflicting_model_does_not_raise(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """The uniformity precondition is workspace-scoped, not global: another
+    workspace holding a different model entirely must never block this
+    workspace's write (workspace scoping is real, not incidental)."""
+    other_workspace_id = uuid.uuid4()
+    other_user_id = uuid.uuid4()
+    async with admin_session_factory() as session, session.begin():
+        await session.execute(
+            sa.text("INSERT INTO users (id, display_name) VALUES (:id, :name)"),
+            {"id": other_user_id, "name": "synthetic owner (other workspace)"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspaces (id, name, mode, timezone)"
+                " VALUES (:id, :name, 'personal', 'Asia/Bangkok')"
+            ),
+            {"id": other_workspace_id, "name": "synthetic other workspace"},
+        )
+        await session.execute(
+            sa.text(
+                "INSERT INTO workspace_memberships (workspace_id, user_id, role)"
+                " VALUES (:workspace_id, :user_id, 'owner')"
+            ),
+            {"workspace_id": other_workspace_id, "user_id": other_user_id},
+        )
+        other_document_id, other_revision_id = await _document_with_revision(
+            session, other_workspace_id, body="other workspace's doc"
+        )
+
+    writer = PostgresEmbeddingWriter(admin_session_factory)
+    await writer.upsert(
+        workspace_id=other_workspace_id,
+        document_id=other_document_id,
+        revision_id=other_revision_id,
+        revision_number=1,
+        vector=_vector(0.1, model_id=OTHER_MODEL_ID),
+    )
+
+    workspace_id, _ = fresh_identity
+    async with admin_session_factory() as session, session.begin():
+        document_id, revision_id = await _document_with_revision(
+            session, workspace_id, body="this workspace's doc"
+        )
+
+    written = await writer.upsert(
+        workspace_id=workspace_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        revision_number=1,
+        vector=_vector(0.5, model_id=MODEL_ID),
+    )
+
+    assert written is True
+    async with admin_session_factory() as session:
+        stored_model_id = await session.scalar(
+            sa.select(document_embeddings.c.embedding_model_id).where(
+                document_embeddings.c.document_id == document_id
+            )
+        )
+    assert stored_model_id == MODEL_ID
 
 
 async def test_same_revision_same_model_does_not_replace_the_stored_row(
     admin_session_factory: async_sessionmaker[AsyncSession],
     fresh_identity: tuple[uuid.UUID, uuid.UUID],
 ) -> None:
-    """The existing invariant preserved alongside F11: a redundant
+    """The existing invariant preserved by F13's restored guard: a redundant
     redelivery of a revision already embedded by the current model is a
     no-op, not a rewrite of an identical vector."""
     workspace_id, _ = fresh_identity
@@ -467,13 +646,14 @@ async def test_same_revision_same_model_does_not_replace_the_stored_row(
     assert row.updated_at == first_updated_at
 
 
-async def test_older_revision_different_model_does_not_replace_the_stored_row(
+async def test_older_revision_different_model_raises_model_conflict_before_the_revision_guard(
     admin_session_factory: async_sessionmaker[AsyncSession],
     fresh_identity: tuple[uuid.UUID, uuid.UUID],
 ) -> None:
-    """The model gate must not become a back door for stale, out-of-order
-    redeliveries: an older revision is still rejected even when the model
-    also changed."""
+    """A stale, out-of-order redelivery under a *different* model must never
+    become a back door either: the workspace-uniformity precondition raises
+    unconditionally, regardless of whether the revision guard would also
+    have rejected this write on its own."""
     workspace_id, _ = fresh_identity
     writer = PostgresEmbeddingWriter(admin_session_factory)
 
@@ -504,15 +684,15 @@ async def test_older_revision_different_model_does_not_replace_the_stored_row(
         vector=_vector(0.9, model_id=MODEL_ID),
     )
 
-    written = await writer.upsert(
-        workspace_id=workspace_id,
-        document_id=document_id,
-        revision_id=first_revision_id,
-        revision_number=1,
-        vector=_vector(0.1, model_id=OTHER_MODEL_ID),
-    )
+    with pytest.raises(EmbeddingModelConflictError):
+        await writer.upsert(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            revision_id=first_revision_id,
+            revision_number=1,
+            vector=_vector(0.1, model_id=OTHER_MODEL_ID),
+        )
 
-    assert written is False
     async with admin_session_factory() as session:
         row = (
             await session.execute(

@@ -15,6 +15,7 @@ import pytest
 
 from tc_application.embedding_sync import DeliverEmbeddingSync, ForceEmbeddingSync
 from tc_domain.embedding_ports import (
+    EmbeddingModelConflictError,
     EmbeddingUnavailableError,
     EmbeddingVector,
     PendingEmbeddingSync,
@@ -302,6 +303,79 @@ async def test_a_truncated_embedding_is_logged_with_only_ids(
     assert record.document_id == str(DOCUMENT_ID)  # type: ignore[attr-defined]
     assert not hasattr(record, "body_markdown")
     assert REVISION.body_markdown not in caplog.text
+
+
+async def test_a_model_conflict_is_logged_at_error_with_only_ids_and_marks_the_event_failed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``EmbeddingModelConflictError`` means the write genuinely did not
+    happen (F13, docs/DESIGN.md 8.5, 9.2) - it must be treated as a FAILED
+    outcome, not folded into the "delivered" reasoning that covers a
+    strictly-newer-revision no-op. The log must carry ids and model ids
+    only, never document body text."""
+    event = a_pending(document_id=DOCUMENT_ID)
+    outbox = FakeEmbeddingSyncOutbox([event])
+    conflict = EmbeddingModelConflictError(
+        document_id=DOCUMENT_ID,
+        stored_model_id="old-model",
+        incoming_model_id="fake-model",
+    )
+    writer = FakeEmbeddingWriter(raises=conflict)
+    deliver = _deliver(outbox, writer=writer)
+
+    with caplog.at_level("ERROR"):
+        synced = await deliver()
+
+    assert synced == 0
+    assert outbox.delivered == []
+    assert outbox.failed == [
+        {
+            "event_id": event.event_id,
+            "attempts": event.attempts,
+            "error": "EmbeddingModelConflictError",
+        }
+    ]
+    conflict_records = [r for r in caplog.records if r.message == "embedding_sync.model_conflict"]
+    assert len(conflict_records) == 1
+    record = conflict_records[0]
+    assert record.levelname == "ERROR"
+    assert record.event_id == str(event.event_id)  # type: ignore[attr-defined]
+    assert record.document_id == str(DOCUMENT_ID)  # type: ignore[attr-defined]
+    assert record.stored_model_id == "old-model"  # type: ignore[attr-defined]
+    assert record.incoming_model_id == "fake-model"  # type: ignore[attr-defined]
+    assert not hasattr(record, "body_markdown")
+    assert REVISION.body_markdown not in caplog.text
+
+
+async def test_a_model_conflict_does_not_strand_the_rest_of_the_batch() -> None:
+    """One conflicted document must not block sibling events in the same
+    poll cycle from being delivered."""
+    conflicted = a_pending(document_id=DOCUMENT_ID)
+    good = a_pending()
+    outbox = FakeEmbeddingSyncOutbox([conflicted, good])
+    conflict = EmbeddingModelConflictError(
+        document_id=DOCUMENT_ID, stored_model_id="old-model", incoming_model_id="fake-model"
+    )
+
+    calls: list[uuid.UUID] = []
+
+    class SwitchingWriter(FakeEmbeddingWriter):
+        async def upsert(self, *, document_id: uuid.UUID, **kwargs: object) -> bool:
+            calls.append(document_id)
+            if document_id == DOCUMENT_ID:
+                raise conflict
+            return True
+
+    deliver = _deliver(outbox, writer=SwitchingWriter())
+
+    synced = await deliver()
+
+    assert synced == 1
+    assert outbox.delivered == [good.event_id]
+    assert len(outbox.failed) == 1
+    assert outbox.failed[0]["event_id"] == conflicted.event_id
+    assert outbox.failed[0]["error"] == "EmbeddingModelConflictError"
+    assert calls == [DOCUMENT_ID, good.document_id]
 
 
 async def test_force_sync_delegates_to_the_enqueuer_and_returns_its_count() -> None:

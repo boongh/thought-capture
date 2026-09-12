@@ -220,6 +220,78 @@ LEFT JOIN external_identities e ON e.user_id = u.id;
 `external_user_id` is the Discord account allowed to capture. If it is missing
 or wrong, messages are ignored without being stored (docs/DESIGN.md 4.1).
 
+## Recovering from an embedding model conflict
+
+**Symptom:** `embedding_sync.model_conflict` at **ERROR** in the `worker`
+logs, one entry per affected document, carrying `event_id`, `document_id`,
+`stored_model_id`, and `incoming_model_id`. The corresponding
+`embedding.sync_requested` events keep failing and retrying with backoff,
+eventually dead-lettering once they exhaust `outbox_events.max_attempts`
+(`outbox.py`) — semantic sync for that workspace is effectively halted, not
+silently degraded.
+
+**Cause:** the embedding sidecar's model or pinned revision changed
+(`TC_EMBEDDING_MODEL_ID` or `TC_EMBEDDING_MODEL_REVISION` in `.env`) without
+running a full re-embed of the workspace first. `document_embeddings` must
+never hold vectors from two different models within one workspace
+(docs/DESIGN.md 8.5, 9.2); the write path now refuses every write that would
+violate that, rather than mixing models silently. This is a deliberate halt,
+not a bug: embeddings are *derived* artifacts, so stopping only changes
+*when* they get recomputed — nothing canonical is touched, and the raw
+thoughts and attachments that produced them remain exactly as captured.
+
+**Interim recovery** (manual, operator-run; **superseded** once the tracked
+`runs.kind = 'reembed'` lifecycle lands as its own slice — see
+`docs/plans/embedding-sync-review-round-3.md` "F13-B" for what that slice
+will look like):
+
+1. Back up first — prevention is not recovery:
+
+   ```bash
+   ./scripts/backup.sh    # or scripts/backup.ps1 on PowerShell
+   ```
+
+2. Stop the worker so nothing else drains the outbox mid-recovery:
+
+   ```bash
+   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core stop worker
+   ```
+
+3. Delete the affected workspace's `document_embeddings` rows. This is safe
+   today specifically because nothing reads this table yet (semantic search
+   and Ask are not wired to it — see "Current scope and known gaps" below),
+   and `docs/DESIGN.md:922` already documents this table as one that "may be
+   deleted and rebuilt":
+
+   ```sql
+   DELETE FROM document_embeddings
+   USING documents
+   WHERE documents.id = document_embeddings.document_id
+     AND documents.workspace_id = '<workspace-id>';
+   ```
+
+4. Rebuild into an empty, and therefore uniform, index:
+
+   ```bash
+   curl -X POST http://127.0.0.1:8080/v1/admin/embedding-sync \
+     -H "Authorization: Bearer $TC_API_BEARER_TOKEN"
+   ```
+
+   This only enqueues one `embedding.sync_requested` event per current
+   document; delivery happens once the worker is running again, on its next
+   poll of `tc_worker.embedding_sync_loop`.
+
+5. Restart the worker:
+
+   ```bash
+   docker compose --env-file .env -f deploy/compose/docker-compose.yml --profile core start worker
+   ```
+
+   Watch for `embedding_sync.model_conflict` recurring in the logs — if it
+   does, step 3's delete did not cover every row in the workspace (or another
+   workspace shares the same sidecar and hit the same model change; repeat
+   steps 3–5 for it too).
+
 ## Running the checks
 
 ```bash

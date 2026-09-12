@@ -8,6 +8,7 @@ import logging
 from tc_domain.capture import WorkspaceId
 from tc_domain.embedding_ports import (
     EmbeddingForceSyncPort,
+    EmbeddingModelConflictError,
     EmbeddingPort,
     EmbeddingSource,
     EmbeddingSyncOutbox,
@@ -65,10 +66,16 @@ class DeliverEmbeddingSync:
         # revision is already stored, or when this exact revision is already
         # embedded by this same model (the out-of-order-redelivery guard,
         # docs/DESIGN.md 8.4). In the first case there was nothing newer to
-        # write; in the second, a forced re-embed sweep (docs/DESIGN.md 8.5)
-        # that is re-run after partial completion correctly finds nothing
-        # left to do for that revision. Both are correctly handled events, so
-        # both outcomes are "delivered", never "failed".
+        # write; in the second, a redundant redelivery of an already-embedded
+        # revision correctly finds nothing left to do. Both are correctly
+        # handled events, so both outcomes are "delivered", never "failed".
+        #
+        # A model conflict is different: `EmbeddingModelConflictError` means
+        # the workspace's document_embeddings already holds a different
+        # model, so upsert wrote nothing at all - the work genuinely did not
+        # happen (docs/DESIGN.md 8.5, 9.2). That is a FAILED outcome, handled
+        # in its own branch below, before the generic `except Exception` -
+        # not folded into the "delivered" reasoning above.
         try:
             revision = await self._source.get_revision(
                 workspace_id=event.workspace_id, document_id=event.document_id
@@ -93,6 +100,24 @@ class DeliverEmbeddingSync:
                 vector=vector,
             )
             await self._outbox.mark_delivered(event.event_id)
+        except EmbeddingModelConflictError as exc:
+            # ERROR, not warning: this is an operator-actionable condition
+            # (a model/revision change without a reembed sweep), not routine
+            # transient failure. Ids and model ids only, never document body
+            # text (docs/DESIGN.md 14.2).
+            logger.error(
+                "embedding_sync.model_conflict",
+                extra={
+                    "event_id": str(event.event_id),
+                    "document_id": str(event.document_id),
+                    "stored_model_id": exc.stored_model_id,
+                    "incoming_model_id": exc.incoming_model_id,
+                },
+            )
+            await self._outbox.mark_failed(
+                event.event_id, attempts=event.attempts, error=type(exc).__name__
+            )
+            return False
         except Exception as exc:
             # Sanitized: the exception class only, never the message (docs/DESIGN.md
             # 14.2) - an embedding-sidecar HTTP error can carry response

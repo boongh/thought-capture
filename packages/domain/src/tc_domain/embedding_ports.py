@@ -61,6 +61,37 @@ class EmbeddingUnavailableError(Exception):
     """
 
 
+class EmbeddingModelConflictError(Exception):
+    """Refusing a write that would leave ``document_embeddings`` holding
+    vectors from two different embedding models within one workspace.
+
+    The invariant this enforces (docs/DESIGN.md 8.5, 9.2): ``document_embeddings``
+    never holds more than one distinct ``embedding_model_id`` within a
+    workspace. A model change (a new ``TC_EMBEDDING_MODEL_ID`` or a bumped
+    ``TC_EMBEDDING_MODEL_REVISION``) therefore halts ordinary sync for that
+    workspace - loudly, via this exception - until an operator rebuilds the
+    index under the new model; see ``docs/OPERATING.md``'s recovery runbook.
+    ``document_id``, ``stored_model_id``, and ``incoming_model_id`` are all
+    non-personal identifiers, safe to log (docs/DESIGN.md 14.2).
+    """
+
+    def __init__(
+        self,
+        *,
+        document_id: uuid.UUID,
+        stored_model_id: str,
+        incoming_model_id: str,
+    ) -> None:
+        super().__init__(
+            f"document_embeddings already holds model {stored_model_id!r} for this "
+            f"workspace; refusing to write model {incoming_model_id!r} for document "
+            f"{document_id}"
+        )
+        self.document_id = document_id
+        self.stored_model_id = stored_model_id
+        self.incoming_model_id = incoming_model_id
+
+
 @dataclass(frozen=True, slots=True)
 class PendingEmbeddingSync:
     """One claimed ``embedding.sync_requested`` event.
@@ -141,17 +172,29 @@ class EmbeddingWriter(Protocol):
         one. The second case is what makes a forced re-embed sync
         (docs/DESIGN.md 8.5) cheap to re-run after partial completion:
         revisions already migrated to the new model are skipped rather than
-        rewritten with an identical vector, while a same-revision write
-        under a *different* model is still admitted and returns ``True``.
+        rewritten with an identical vector.
 
-        ``workspace_id`` is part of this Protocol's documented contract but
-        is not independently re-verified by the write itself -
-        ``document_embeddings`` has no ``workspace_id`` column by design
-        (ADR-0010 3). Correctness depends entirely on the caller always
-        deriving ``revision_id``/``revision_number`` from the
+        Raises:
+            EmbeddingModelConflictError: this workspace's ``document_embeddings``
+                already holds at least one row under a different
+                ``embedding_model_id`` than ``vector.model_id``. Nothing is
+                written in this case - a same-revision write under a
+                *different* model is refused, not admitted, because
+                ``document_embeddings`` must never hold more than one
+                distinct model within a workspace at once (docs/DESIGN.md
+                8.5, 9.2).
+
+        ``workspace_id`` is part of this Protocol's documented contract and,
+        as of this precondition, *is* independently re-verified by the write
+        itself - it is joined against ``documents`` to recover the workspace
+        scope ``document_embeddings`` itself has no ``workspace_id`` column
+        for (ADR-0010 3), solely to enforce the single-model-per-workspace
+        invariant above. This does not re-verify the *caller's* side of the
+        contract: correctness of `revision_id`/`revision_number` still
+        depends entirely on the caller always deriving them from the
         workspace-scoped ``EmbeddingSource.get_revision`` before calling
-        ``upsert``. This is a documented invariant implementations may rely
-        on, not an oversight.
+        ``upsert``. That part remains a documented invariant implementations
+        may rely on, not something this write independently checks.
         """
         ...
 
