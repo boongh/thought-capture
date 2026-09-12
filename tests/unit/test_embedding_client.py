@@ -124,6 +124,57 @@ async def test_embed_defaults_truncated_to_false_when_key_absent() -> None:
     assert vectors[1].truncated is False
 
 
+async def test_embed_raises_when_truncated_is_explicitly_null() -> None:
+    """A present-but-``null`` ``truncated`` is not part of the sidecar's
+    contract (absence, not null, is the backward-compat signal) - it must
+    be treated as a shape violation, not silently defaulted to all-false."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+                "model_revision": "abc123",
+                "dimensions": DIMENSIONS,
+                "vectors": [_vector(0.1), _vector(0.2)],
+                "truncated": None,
+            },
+        )
+
+    http, client = _client_with(handler)
+    async with http:
+        with pytest.raises(EmbeddingUnavailableError):
+            await client.embed(("first", "second"))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["false", 1, 0, "", {}, None],
+    ids=["string_false", "int_1", "int_0", "empty_string", "empty_dict", "none_element"],
+)
+async def test_embed_raises_when_truncated_flag_is_not_a_bool(flag: object) -> None:
+    """Every element must be an exact ``bool`` - ``bool(flag)`` coercion
+    would silently turn ``"false"`` into ``True`` and various falsy
+    non-bools into ``False``, both of which are worse than raising."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+                "model_revision": "abc123",
+                "dimensions": DIMENSIONS,
+                "vectors": [_vector(0.1), _vector(0.2)],
+                "truncated": [flag, False],
+            },
+        )
+
+    http, client = _client_with(handler)
+    async with http:
+        with pytest.raises(EmbeddingUnavailableError):
+            await client.embed(("first", "second"))
+
+
 async def test_embed_raises_when_truncated_length_mismatches_vector_count() -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(

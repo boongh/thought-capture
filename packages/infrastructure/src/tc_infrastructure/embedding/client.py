@@ -4,8 +4,10 @@
 Talks to the sidecar's real contract (`apps/embedding_sidecar/src/
 tc_embedding_sidecar/schemas.py`): ``POST /embed`` with
 ``{"texts": [...]}``, returning ``{"model_id", "model_revision",
-"dimensions", "vectors", "truncated"}`` (``truncated`` is optional for
-backward compatibility with older sidecars that predate it). Every failure
+"dimensions", "vectors", "truncated"}`` (``truncated`` is optional -
+omitted entirely - for backward compatibility with older sidecars that
+predate it; a present-but-``null`` value is not part of that contract and
+is treated as a shape violation). Every failure
 mode - unreachable sidecar,
 timeout, a non-2xx status (including 503 "still loading" and 429 "at
 capacity"), a malformed/missing JSON body, or a response shape that does
@@ -25,6 +27,11 @@ from tc_domain.embedding_ports import EmbeddingUnavailableError, EmbeddingVector
 from tc_infrastructure.db.tables import EMBEDDING_DIMENSIONS
 
 logger = logging.getLogger(__name__)
+
+# Unique sentinel so ``payload.get("truncated", _ABSENT)`` can distinguish
+# "key genuinely missing" (backward-compat default) from "key present with
+# value null" (a shape the sidecar's contract never produces).
+_ABSENT = object()
 
 
 def compose_embedding_model_id(model_id: str, model_revision: str) -> str:
@@ -126,11 +133,12 @@ class HttpEmbeddingClient:
 
         # ``truncated`` is optional/backward-compatible: an older sidecar
         # that predates this field simply omits the key, and every vector
-        # defaults to untruncated - only a *present-but-mismatched-length*
-        # value is treated as a genuine shape violation, same as the
-        # vector-count check above.
-        truncated_flags: object = payload.get("truncated")
-        if truncated_flags is None:
+        # defaults to untruncated - only that genuine absence takes the
+        # default path. A present value of any other shape (null, wrong
+        # length, non-bool elements) is a genuine shape violation, same as
+        # the vector-count check above.
+        truncated_flags: object = payload.get("truncated", _ABSENT)
+        if truncated_flags is _ABSENT:
             truncated_values: list[bool] = [False] * expected_count
         else:
             if not isinstance(truncated_flags, list):
@@ -141,7 +149,12 @@ class HttpEmbeddingClient:
                 raise ValueError(
                     f"expected {expected_count} truncated flag(s), got {len(truncated_flags)}"
                 )
-            truncated_values = [bool(flag) for flag in truncated_flags]
+            for flag in truncated_flags:
+                if not isinstance(flag, bool):
+                    raise ValueError(
+                        f"expected truncated flags to be booleans, got {type(flag).__name__}"
+                    )
+            truncated_values = list(truncated_flags)
 
         combined_model_id = compose_embedding_model_id(model_id, model_revision)
         result = []
