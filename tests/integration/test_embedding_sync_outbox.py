@@ -104,10 +104,15 @@ async def test_khoj_sync_outbox_never_leases_an_embedding_sync_requested_event(
     assert document_id not in {event.document_id for event in claimed}
 
 
-async def test_a_malformed_payload_is_failed_immediately_and_not_returned(
+async def test_a_malformed_payload_is_dead_lettered_and_never_claimed_again(
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],
 ) -> None:
+    """A missing ``document_id`` will never parse - it must be terminally
+    failed (attempts forced to max_attempts, delivered_at left NULL) rather
+    than rescheduled with backoff, or it would be re-leased and burn a claim
+    slot every backoff interval until its retry budget happened to run out
+    (F19)."""
     workspace_id, _ = seeded_identity
     bad_event_id = await _enqueue(app_session_factory, workspace_id, payload={"oops": "no id"})
 
@@ -118,14 +123,57 @@ async def test_a_malformed_payload_is_failed_immediately_and_not_returned(
     async with app_session_factory() as session:
         row = (
             await session.execute(
-                sa.select(outbox_events.c.last_error).where(outbox_events.c.id == bad_event_id)
+                sa.select(
+                    outbox_events.c.last_error,
+                    outbox_events.c.attempts,
+                    outbox_events.c.max_attempts,
+                    outbox_events.c.delivered_at,
+                ).where(outbox_events.c.id == bad_event_id)
             )
         ).one()
     assert row.last_error is not None
     assert "malformed_payload" in row.last_error
+    assert row.attempts == row.max_attempts, "must be terminal, not merely rescheduled"
+    assert row.delivered_at is None, "a dead-lettered event was not delivered"
+
+    second_claim = await outbox.claim(limit=50)
+    assert bad_event_id not in {event.event_id for event in second_claim}
 
 
-async def test_a_non_dict_payload_is_failed_immediately_and_not_returned(
+async def test_a_non_uuid_document_id_is_dead_lettered_and_never_claimed_again(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    workspace_id, _ = seeded_identity
+    bad_event_id = await _enqueue(
+        app_session_factory, workspace_id, payload={"document_id": "not-a-uuid"}
+    )
+
+    outbox = PostgresEmbeddingSyncOutbox(app_session_factory, lease_owner="test")
+    claimed = await outbox.claim(limit=50)
+
+    assert bad_event_id not in {event.event_id for event in claimed}
+    async with app_session_factory() as session:
+        row = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.last_error,
+                    outbox_events.c.attempts,
+                    outbox_events.c.max_attempts,
+                    outbox_events.c.delivered_at,
+                ).where(outbox_events.c.id == bad_event_id)
+            )
+        ).one()
+    assert row.last_error is not None
+    assert "malformed_payload" in row.last_error
+    assert row.attempts == row.max_attempts, "must be terminal, not merely rescheduled"
+    assert row.delivered_at is None, "a dead-lettered event was not delivered"
+
+    second_claim = await outbox.claim(limit=50)
+    assert bad_event_id not in {event.event_id for event in second_claim}
+
+
+async def test_a_non_dict_payload_is_dead_lettered_and_never_claimed_again(
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],
 ) -> None:
@@ -143,11 +191,21 @@ async def test_a_non_dict_payload_is_failed_immediately_and_not_returned(
     async with app_session_factory() as session:
         row = (
             await session.execute(
-                sa.select(outbox_events.c.last_error).where(outbox_events.c.id == bad_event_id)
+                sa.select(
+                    outbox_events.c.last_error,
+                    outbox_events.c.attempts,
+                    outbox_events.c.max_attempts,
+                    outbox_events.c.delivered_at,
+                ).where(outbox_events.c.id == bad_event_id)
             )
         ).one()
     assert row.last_error is not None
     assert "malformed_payload" in row.last_error
+    assert row.attempts == row.max_attempts, "must be terminal, not merely rescheduled"
+    assert row.delivered_at is None, "a dead-lettered event was not delivered"
+
+    second_claim = await outbox.claim(limit=50)
+    assert bad_event_id not in {event.event_id for event in second_claim}
 
 
 async def test_mark_delivered_then_claim_does_not_return_it_again(

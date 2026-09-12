@@ -381,6 +381,58 @@ async def test_stale_lease_mark_failed_does_not_clear_a_reclaimed_event(
     assert after.last_error is None, "A's stale error must not overwrite the row"
 
 
+async def test_stale_lease_mark_dead_lettered_does_not_clear_a_reclaimed_event(
+    app_session_factory: async_sessionmaker[AsyncSession],
+    seeded_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """A's stale mark_dead_lettered must not steal or clear B's lease (F19)."""
+    workspace_id, _ = seeded_identity
+    aggregate = f"agg-{uuid.uuid4()}"
+    event_id = await enqueue(app_session_factory, workspace_id, aggregate_id=aggregate)
+
+    worker_a = PostgresOutbox(
+        app_session_factory, lease_owner="worker-a", lease_duration=dt.timedelta(seconds=-1)
+    )
+    worker_b = PostgresOutbox(app_session_factory, lease_owner="worker-b")
+
+    await worker_a.claim(limit=50, event_types=("thought.captured",))
+    await worker_b.claim(limit=50, event_types=("thought.captured",))
+
+    async with app_session_factory() as session:
+        before = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.lease_owner,
+                    outbox_events.c.leased_until,
+                    outbox_events.c.attempts,
+                ).where(outbox_events.c.id == event_id)
+            )
+        ).one()
+
+    await worker_a.mark_dead_lettered(event_id, "stale-worker-error")
+
+    async with app_session_factory() as session:
+        after = (
+            await session.execute(
+                sa.select(
+                    outbox_events.c.lease_owner,
+                    outbox_events.c.leased_until,
+                    outbox_events.c.attempts,
+                    outbox_events.c.last_error,
+                ).where(outbox_events.c.id == event_id)
+            )
+        ).one()
+
+    assert after.lease_owner == before.lease_owner, (
+        "B's lease_owner must survive A's stale dead-letter"
+    )
+    assert after.leased_until == before.leased_until, (
+        "B's leased_until must survive A's stale dead-letter"
+    )
+    assert after.attempts == before.attempts, "A's stale dead-letter must not touch B's attempts"
+    assert after.last_error is None, "A's stale error must not overwrite the row"
+
+
 async def test_current_owner_mark_delivered_still_delivers(
     app_session_factory: async_sessionmaker[AsyncSession],
     seeded_identity: tuple[uuid.UUID, uuid.UUID],

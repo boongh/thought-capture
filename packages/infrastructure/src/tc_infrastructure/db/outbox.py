@@ -200,6 +200,52 @@ class PostgresOutbox:
             extra={"event_id": str(event_id), "attempts": attempts, "error_class": error[:80]},
         )
 
+    async def mark_dead_lettered(self, event_id: uuid.UUID, error: str) -> None:
+        """Terminally fail an event that will never parse or succeed.
+
+        Unlike ``mark_failed``, this does not reschedule: it forces
+        ``attempts`` to ``max_attempts`` so ``claim``'s ``attempts <
+        max_attempts`` predicate excludes the row forever, instead of
+        re-leasing a poison payload every backoff interval until its retry
+        budget happens to run out. ``delivered_at`` is deliberately left
+        NULL - setting it would assert the event was delivered, which is
+        false, and would hide the row from consumers (e.g.
+        ``has_dead_lettered_sync_events``) that need to see a terminal
+        failure to stop waiting on it.
+
+        Fenced identically to ``mark_failed``: without the lease check, a
+        stale worker could dead-letter an event a second worker has since
+        re-claimed and is actively processing.
+        """
+        async with self._session_factory() as session, session.begin():
+            fenced = await session.scalar(
+                sa.text("""
+                    UPDATE outbox_events
+                       SET attempts = max_attempts,
+                           leased_until = NULL,
+                           lease_owner = NULL,
+                           last_error = :error
+                     WHERE id = :id
+                       AND lease_owner = :owner AND leased_until > now()
+                 RETURNING id
+                """),
+                {
+                    "id": event_id,
+                    "error": error[:500],
+                    "owner": self._lease_token,
+                },
+            )
+        if fenced is None:
+            logger.warning(
+                "outbox.lease_lost",
+                extra={"event_id": str(event_id), "lease_owner": self._lease_token},
+            )
+            return
+        logger.warning(
+            "outbox.dead_lettered",
+            extra={"event_id": str(event_id), "error_class": error[:80]},
+        )
+
     async def settle_unclaimed(self, event_id: uuid.UUID) -> None:
         """Settle an event that was never leased through ``claim``.
 

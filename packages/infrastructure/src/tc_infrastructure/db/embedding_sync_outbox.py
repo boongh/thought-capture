@@ -38,9 +38,12 @@ class PostgresEmbeddingSyncOutbox:
                 )
             except (KeyError, ValueError, TypeError) as exc:
                 # A payload that will never parse must not be retried forever;
-                # fail it immediately rather than returning it to the caller.
-                await self._outbox.mark_failed(
-                    event.id, event.attempts, f"malformed_payload:{type(exc).__name__}"
+                # dead-letter it immediately rather than returning it to the
+                # caller. mark_failed would only reschedule it with backoff,
+                # re-leasing the same poison payload every interval until its
+                # retry budget happened to run out.
+                await self._outbox.mark_dead_lettered(
+                    event.id, f"malformed_payload:{type(exc).__name__}"
                 )
         return tuple(pending)
 
