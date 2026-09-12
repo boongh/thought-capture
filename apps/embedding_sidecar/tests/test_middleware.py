@@ -70,6 +70,41 @@ async def test_a_body_within_both_budgets_reaches_the_downstream_app() -> None:
     assert body == str(len(b"hello world")).encode()
 
 
+async def test_a_body_of_exactly_max_bytes_reaches_the_downstream_app() -> None:
+    """The boundary itself must be legal - a body exactly at `max_bytes`
+    is not "over the limit" and must not be rejected."""
+    send, sent = _capturing_send()
+    body = b"x" * 100
+    middleware = MaxBodySizeMiddleware(_echo_app, max_bytes=len(body), max_read_seconds=5.0)
+
+    await middleware(_http_scope(), _chunks(body), send)
+
+    assert _status_of(sent) == 200
+    echoed = next(m["body"] for m in sent if m["type"] == "http.response.body")
+    assert echoed == str(len(body)).encode()
+
+
+async def test_a_body_of_max_bytes_plus_one_is_rejected_without_reaching_the_app() -> None:
+    """The other side of the same boundary - one byte over must still be
+    rejected, exactly at the edge rather than only for bodies far larger."""
+    send, sent = _capturing_send()
+    app_was_called = False
+
+    async def app_that_must_not_run(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal app_was_called
+        app_was_called = True
+
+    max_bytes = 100
+    middleware = MaxBodySizeMiddleware(
+        app_that_must_not_run, max_bytes=max_bytes, max_read_seconds=5.0
+    )
+
+    await middleware(_http_scope(), _chunks(b"x" * (max_bytes + 1)), send)
+
+    assert _status_of(sent) == 413
+    assert not app_was_called
+
+
 async def test_a_body_over_the_byte_limit_is_rejected_without_reaching_the_app() -> None:
     send, sent = _capturing_send()
     app_was_called = False

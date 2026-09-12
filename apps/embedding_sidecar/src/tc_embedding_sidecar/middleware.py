@@ -2,7 +2,7 @@
 enforced before it is parsed.
 
 FastAPI/Pydantic buffer and fully parse the JSON body before any
-endpoint-level validation (`app.py`'s `max_batch_size`/`max_text_length`
+endpoint-level validation (`app.py`'s `max_batch_size`/`max_text_bytes`
 checks) ever runs - by the time those checks see the request, an
 oversized body has already been read into memory in full. A
 `Content-Length` header check alone is not enough either: a chunked-

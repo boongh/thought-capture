@@ -59,8 +59,8 @@ def test_defaults_are_valid() -> None:
         # was sized to protect, or wedges the service outright.
         ("MAX_BATCH_SIZE", "0"),
         ("MAX_BATCH_SIZE", "-1"),
-        ("MAX_TEXT_LENGTH", "0"),
-        ("MAX_TEXT_LENGTH", "-1"),
+        ("MAX_TEXT_BYTES", "0"),
+        ("MAX_TEXT_BYTES", "-1"),
         ("MAX_CONCURRENT_ENCODES", "0"),
         ("MAX_CONCURRENT_ENCODES", "-1"),
         ("MAX_QUEUED_ENCODES", "-1"),
@@ -72,6 +72,10 @@ def test_defaults_are_valid() -> None:
         ("LIMIT_CONCURRENCY", "-1"),
         ("H11_MAX_INCOMPLETE_EVENT_SIZE", "0"),
         ("H11_MAX_INCOMPLETE_EVENT_SIZE", "-1"),
+        # Positive but far too small to hold a request line and a Host header:
+        # h11 would abandon every connection mid-header.
+        ("H11_MAX_INCOMPLETE_EVENT_SIZE", "1"),
+        ("H11_MAX_INCOMPLETE_EVENT_SIZE", "512"),
         # A port outside the range the OS can actually bind.
         ("PORT", "0"),
         ("PORT", "65536"),
@@ -105,12 +109,17 @@ def test_zero_queued_encodes_is_accepted(monkeypatch: pytest.MonkeyPatch) -> Non
     assert Settings().max_queued_encodes == 0
 
 
-def test_limit_concurrency_below_admission_total_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("limit", ["9", "10", "11"])
+def test_limit_concurrency_below_admission_total_plus_overhead_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, limit: str
 ) -> None:
+    """Admission total is 10 here, so 10 and 11 are the interesting cases: at
+    10 uvicorn 503s the last queued request (its test is `>=`, and the current
+    connection is already counted), and at 11 the container healthcheck is the
+    connection turned away once the queue is full."""
     monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_CONCURRENT_ENCODES", "2")
     monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_QUEUED_ENCODES", "8")
-    monkeypatch.setenv(f"{REPO_ENV_PREFIX}LIMIT_CONCURRENCY", "9")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}LIMIT_CONCURRENCY", limit)
 
     with pytest.raises(ValidationError) as excinfo:
         Settings()
@@ -120,16 +129,103 @@ def test_limit_concurrency_below_admission_total_is_rejected(
     assert "TC_EMBEDDING_MAX_QUEUED_ENCODES" in message
 
 
-def test_limit_concurrency_equal_to_admission_total_is_accepted(
+def test_limit_concurrency_at_admission_total_plus_overhead_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The bound is "at least", not "strictly above" - an operator who sizes
-    uvicorn exactly to the admission total is correct, if tight."""
+    """The floor is exactly `total + 2`, not "comfortably more" - an operator
+    who sizes uvicorn to it is correct, if tight. Guards against the bound
+    drifting upward into an arbitrary number."""
     monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_CONCURRENT_ENCODES", "2")
     monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_QUEUED_ENCODES", "8")
-    monkeypatch.setenv(f"{REPO_ENV_PREFIX}LIMIT_CONCURRENCY", "10")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}LIMIT_CONCURRENCY", "12")
 
-    assert Settings().limit_concurrency == 10
+    assert Settings().limit_concurrency == 12
+
+
+def test_request_byte_cap_below_the_advertised_batch_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`TC_EMBEDDING_MAX_REQUEST_BYTES=1` used to start happily: `/health` is a
+    bodyless GET and still answered "ok", while every `/embed` 413'd - the same
+    green-health-check-over-a-dead-service shape as
+    `MAX_CONCURRENT_ENCODES=0`."""
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "1")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    assert "TC_EMBEDDING_MAX_REQUEST_BYTES" in str(excinfo.value)
+
+
+def test_raising_the_batch_limit_without_the_byte_cap_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cross-field case: neither field is individually out of range, but
+    together they advertise a batch the byte cap would reject."""
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "256")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    message = str(excinfo.value)
+    assert "TC_EMBEDDING_MAX_REQUEST_BYTES" in message
+    assert "TC_EMBEDDING_MAX_BATCH_SIZE" in message
+
+
+def test_byte_cap_exactly_at_the_worst_case_advertised_batch_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor is the *worst-case* JSON-serialized size, not the raw byte
+    total: `max_batch_size=2, max_text_bytes=1000` requires
+    `2*1000*6 + 2*3 + 12 = 12_018` bytes to admit a batch of two
+    all-control-character texts at exactly the advertised size - the true
+    minimum a maximally escaped, contract-legal request could serialize to.
+    An earlier version of this test pinned the bug this floor fixes: it
+    accepted `max_request_bytes=2000` for the same batch shape, which the
+    real middleware would 413 for any content that needs JSON escaping."""
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "2")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_TEXT_BYTES", "1000")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "12018")
+
+    assert Settings().max_request_bytes == 12018
+
+
+def test_byte_cap_one_below_the_worst_case_advertised_batch_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "2")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_TEXT_BYTES", "1000")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "12017")
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_default_byte_cap_admits_the_default_worst_case_batch() -> None:
+    """Pins the exact number, not just an inequality, so a future change to
+    either default that breaks the relationship fails loudly rather than
+    silently staying under a loose bound."""
+    settings = Settings()
+    worst_case_default_batch = (
+        settings.max_batch_size * settings.max_text_bytes * 6 + settings.max_batch_size * 3 + 12
+    )
+
+    assert worst_case_default_batch == 3_145_932
+    assert worst_case_default_batch <= settings.max_request_bytes
+
+
+def test_request_byte_cap_error_names_all_three_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "256")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    message = str(excinfo.value)
+    assert "TC_EMBEDDING_MAX_REQUEST_BYTES" in message
+    assert "TC_EMBEDDING_MAX_BATCH_SIZE" in message
+    assert "TC_EMBEDDING_MAX_TEXT_BYTES" in message
 
 
 def test_get_settings_propagates_the_validation_error(
@@ -150,10 +246,16 @@ def test_get_settings_propagates_the_validation_error(
 def test_invalid_env_exits_before_the_port_is_bound() -> None:
     """The whole point of the finding: the failure must be loud and *early*.
 
-    `main()` calls `get_settings()` before `uvicorn.run`, so a bad value must
-    exit non-zero without ever binding a socket - not raise later inside the
-    `factory=True` app factory, where uvicorn has already bound the port and
-    the container would briefly look alive.
+    What this pins is the observable property - `python -m tc_embedding_sidecar`
+    with an invalid value exits non-zero and never logs "Uvicorn running on",
+    so the container never reaches a listening state or a green healthcheck.
+
+    It deliberately does NOT claim to pin *where* the error is raised.
+    `__main__.main()` calls `get_settings()` before `uvicorn.run`, which is the
+    right placement, but an error raised inside the `factory=True` app factory
+    would also exit before a socket exists: uvicorn calls `config.load()` (and
+    therefore the factory) in `Server._serve` before `await self.startup(...)`
+    binds anything. An earlier version of this docstring claimed otherwise.
     """
     project_root = Path(__file__).resolve().parents[1]
     try:
@@ -188,5 +290,11 @@ def test_invalid_env_exits_before_the_port_is_bound() -> None:
 def _child_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(REPO_ENV_PREFIX)}
     env[f"{REPO_ENV_PREFIX}MAX_CONCURRENT_ENCODES"] = "0"
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    # Prepend rather than replace: clobbering an inherited PYTHONPATH would
+    # make the child's import environment differ from the developer's, and the
+    # resulting ImportError would surface as a confusing failure on the
+    # "names the field" assertion rather than at its real cause.
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    inherited = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src}{os.pathsep}{inherited}" if inherited else src
     return env
