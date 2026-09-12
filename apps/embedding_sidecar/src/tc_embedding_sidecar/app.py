@@ -162,14 +162,16 @@ def create_app(*, lifespan_handler: object | None = None) -> FastAPI:
                 ),
             )
         too_long = [
-            i for i, text in enumerate(request.texts) if len(text) > settings.max_text_length
+            i
+            for i, text in enumerate(request.texts)
+            if len(text.encode("utf-8")) > settings.max_text_bytes
         ]
         if too_long:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"texts at index {too_long} exceed the "
-                    f"{settings.max_text_length}-character limit per text"
+                    f"{settings.max_text_bytes}-byte (UTF-8) limit per text"
                 ),
             )
         try:

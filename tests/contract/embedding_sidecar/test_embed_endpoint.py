@@ -25,11 +25,29 @@ EXPECTED_DIMENSIONS = 384
 # Must match apps/embedding_sidecar/src/tc_embedding_sidecar/settings.py's
 # own defaults - duplicated here because the contract tests run in this
 # project's own Python 3.14 environment and cannot import the sidecar's
-# Python-3.12-only settings module directly.
+# Python-3.12-only settings module directly. A mismatch between these
+# constants and the real settings.py defaults is itself a silent-wrong-test
+# hazard: a test here could pass or fail for the wrong reason if the sidecar's
+# actual defaults ever drift without this file being updated to match. A
+# self-describing contract via `/health` (reporting the configured limits
+# back to callers) would close that gap; not fixed here (tracked as F20).
 MAX_BATCH_SIZE = 64
-MAX_TEXT_LENGTH = 50_000
+MAX_TEXT_BYTES = 8_192
 MAX_REQUEST_BYTES = 4_000_000
 LIMIT_CONCURRENCY = 32
+
+
+def _text_of_byte_length(byte_length: int, char: str = "x") -> str:
+    """Builds a string whose UTF-8 encoding is exactly `byte_length` bytes,
+    repeating `char` (which may be multibyte). `byte_length` must be evenly
+    divisible by `char`'s own encoded byte length."""
+    char_bytes = len(char.encode("utf-8"))
+    assert byte_length % char_bytes == 0, (
+        f"{byte_length} is not evenly divisible by {char!r}'s {char_bytes}-byte encoding"
+    )
+    text = char * (byte_length // char_bytes)
+    assert len(text.encode("utf-8")) == byte_length
+    return text
 
 
 async def test_health_reports_the_ready_model(sidecar: httpx.AsyncClient) -> None:
@@ -107,9 +125,47 @@ async def test_embed_rejects_a_batch_over_the_configured_limit(sidecar: httpx.As
 async def test_embed_rejects_a_text_over_the_configured_length_limit(
     sidecar: httpx.AsyncClient,
 ) -> None:
-    response = await sidecar.post("/embed", json={"texts": ["x" * (MAX_TEXT_LENGTH + 1)]})
+    over_limit_text = _text_of_byte_length(MAX_TEXT_BYTES + 1)
+
+    response = await sidecar.post("/embed", json={"texts": [over_limit_text]})
 
     assert response.status_code == 422
+
+
+async def test_embed_accepts_a_batch_at_exactly_the_configured_limits(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """A batch of exactly `MAX_BATCH_SIZE` texts, each exactly `MAX_TEXT_BYTES`
+    UTF-8 bytes, is the largest legal request - it must succeed, not be
+    wrongly rejected the way a byte-vs-character unit mismatch between the
+    per-text limit and the request-body byte cap previously could (a
+    max-size batch of single-byte ASCII text is legal, but the same batch
+    built from multibyte text encodes to more bytes for the same character
+    count, which the two checks must still agree is within budget)."""
+    max_size_text = _text_of_byte_length(MAX_TEXT_BYTES)
+
+    response = await sidecar.post("/embed", json={"texts": [max_size_text] * MAX_BATCH_SIZE})
+
+    assert response.status_code == 200
+    assert len(response.json()["vectors"]) == MAX_BATCH_SIZE
+
+
+async def test_embed_accepts_a_batch_at_exactly_the_configured_limits_with_multibyte_text(
+    sidecar: httpx.AsyncClient,
+) -> None:
+    """Same boundary as above, but built from a 2-byte UTF-8 character
+    ("é") rather than single-byte ASCII - the case this fix's floor
+    arithmetic (budgeting for worst-case JSON escaping) exists for, since a
+    naive character-count check would have let this through at half the
+    real byte size."""
+    max_size_multibyte_text = _text_of_byte_length(MAX_TEXT_BYTES, char="é")
+
+    response = await sidecar.post(
+        "/embed", json={"texts": [max_size_multibyte_text] * MAX_BATCH_SIZE}
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["vectors"]) == MAX_BATCH_SIZE
 
 
 async def test_embed_rejects_an_oversized_body_before_parsing_it(

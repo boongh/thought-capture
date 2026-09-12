@@ -18,6 +18,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # where each one comes from and how it was verified.
 _UVICORN_CONNECTION_SLOT_OVERHEAD = 2
 
+# A JSON string's worst-case expansion is 6 bytes out per 1 byte in, via a
+# control character escaping to `\u0000`. This is the real ceiling for the
+# first-party client, httpx 0.28.1's `_content.encode_json`, which uses
+# `ensure_ascii=False` with compact separators - so any content, including
+# an all-control-character string, expands by at most this factor.
+_JSON_WORST_CASE_BYTES_PER_TEXT_BYTE = 6  # control char -> "\u0000": 1 byte in, 6 out
+_JSON_ENVELOPE_FIXED_BYTES = 12  # len('{"texts":[]}')
+_JSON_PER_TEXT_OVERHEAD_BYTES = 3  # 2 quote bytes + 1 comma per text (safe over-estimate of 3n-1)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TC_EMBEDDING_")
@@ -50,10 +59,10 @@ class Settings(BaseSettings):
     # beyond the loopback-only Compose topology it currently has.
     max_batch_size: int = Field(default=64, ge=1)
     # gte-small's own max sequence length is 512 tokens; this is a generous
-    # character ceiling above that (the tokenizer truncates the rest) purely
+    # UTF-8 byte ceiling above that (the tokenizer truncates the rest) purely
     # to bound how much CPU a single request can force this process to spend
     # tokenizing before truncation ever kicks in.
-    max_text_length: int = Field(default=50_000, ge=1)
+    max_text_bytes: int = Field(default=8_192, ge=1)
     # SentenceTransformer.encode() is CPU-bound work handed to a worker
     # thread (model.py); running more than one at once does not increase
     # throughput on a CPU-bound task, only memory pressure and context-switch
@@ -63,19 +72,20 @@ class Settings(BaseSettings):
     # before a new one is rejected outright (429) instead of queuing
     # indefinitely. An unbounded queue behind the semaphore would let an
     # unlimited number of already-validated requests each hold up to
-    # `max_batch_size * max_text_length` of parsed payload in memory at
+    # `max_batch_size * max_text_bytes` of parsed payload in memory at
     # once - the semaphore only bounds *execution* concurrency, not
     # *admission*. Total admitted at once is
     # `max_concurrent_encodes + max_queued_encodes`.
     max_queued_encodes: int = Field(default=8, ge=0)
     # A hard ceiling on the raw request body, enforced by
     # `MaxBodySizeMiddleware` *before* FastAPI/Pydantic ever buffers or
-    # parses it into Python objects - `max_batch_size`/`max_text_length`
+    # parses it into Python objects - `max_batch_size`/`max_text_bytes`
     # alone only bound a body Pydantic has already fully parsed, which is
     # too late: a huge or chunked-transfer (no declared Content-Length)
     # request would already have forced the full parse first. Sized with
-    # headroom over `max_batch_size * max_text_length`'s raw character total
-    # (3.2 MB by default) for JSON structure/escaping overhead.
+    # headroom over `max_batch_size * max_text_bytes`'s worst-case JSON-
+    # escaped total (see `_request_byte_cap_admits_the_worst_case_advertised_batch`)
+    # so a batch at exactly the advertised limits is always admitted.
     max_request_bytes: int = Field(default=4_000_000, ge=1)
     # How long `MaxBodySizeMiddleware` will wait for a request body to
     # finish arriving before giving up (408). Without this, a client that
@@ -210,36 +220,54 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _request_byte_cap_admits_the_advertised_batch(self) -> Settings:
-        """The byte cap must not silently shrink the advertised batch limits.
+    def _request_byte_cap_admits_the_worst_case_advertised_batch(self) -> Settings:
+        """Every request within the advertised limits must fit the byte cap.
 
-        `MaxBodySizeMiddleware` enforces `max_request_bytes` before Pydantic
-        parses anything, so a cap below `max_batch_size * max_text_length` -
-        the raw character total of a request at exactly the advertised limits -
-        413s requests that `max_batch_size` and `max_text_length` both say are
-        acceptable. Those two then become partly dead configuration, by
-        exactly the argument `_limit_concurrency_covers_admission` makes about
-        the queue depth. The comparison is against the raw character total and
-        so ignores JSON structure/escaping overhead: this is the floor below
-        which the advertised limits are *definitely* unreachable, not a
-        promise that every request at the limit fits.
+        `MaxBodySizeMiddleware` enforces `max_request_bytes` against the
+        serialized JSON body's *bytes*, before Pydantic parses anything -
+        but `max_text_bytes` bounds each text's *UTF-8 byte length before
+        JSON-encoding*, and JSON string encoding can expand non-ASCII or
+        control-character content well beyond that. Comparing the two
+        directly (as an earlier version of this validator did) equates two
+        different units and wrongly accepts configurations - including this
+        module's own former defaults - where a maximum-sized, contract-legal
+        `/embed` batch still gets 413'd by the middleware for some content.
+
+        This validator instead computes the true worst case: every byte of
+        every text escapes to its longest possible JSON form, a 6-byte
+        `\\uXXXX` sequence (`_JSON_WORST_CASE_BYTES_PER_TEXT_BYTE`), plus the
+        per-text quote/comma overhead and the fixed `{"texts":[]}` envelope.
+        The guarantee this establishes: a request with `max_batch_size`
+        texts, each up to `max_text_bytes` UTF-8 bytes, is *always* admitted
+        by the byte-cap middleware, for ANY content - including text made
+        entirely of control characters, JSON's worst case for size
+        expansion.
 
         This also rules out the degenerate case the per-field `ge=1` bound
         alone allowed: `TC_EMBEDDING_MAX_REQUEST_BYTES=1` starts happily,
         answers `/health` with `status: ok` (a bodyless GET), and 413s every
         single `/embed`.
         """
-        required = self.max_batch_size * self.max_text_length
+        required = (
+            self.max_batch_size * self.max_text_bytes * _JSON_WORST_CASE_BYTES_PER_TEXT_BYTE
+            + self.max_batch_size * _JSON_PER_TEXT_OVERHEAD_BYTES
+            + _JSON_ENVELOPE_FIXED_BYTES
+        )
         if self.max_request_bytes < required:
             raise ValueError(
-                f"TC_EMBEDDING_MAX_REQUEST_BYTES={self.max_request_bytes} is below "
-                f"max_batch_size * max_text_length ({self.max_batch_size} * "
-                f"{self.max_text_length} = {required}), the raw character total of a "
-                "request at exactly the advertised limits. MaxBodySizeMiddleware would "
-                "413 requests those two settings say are acceptable, making them dead "
-                "configuration. Raise TC_EMBEDDING_MAX_REQUEST_BYTES to at least that "
-                "total (with headroom for JSON structure and escaping, as the default "
-                "has), or lower TC_EMBEDDING_MAX_BATCH_SIZE/TC_EMBEDDING_MAX_TEXT_LENGTH."
+                f"TC_EMBEDDING_MAX_REQUEST_BYTES={self.max_request_bytes} is below the "
+                "worst-case serialized size of a request at exactly the advertised "
+                f"limits: TC_EMBEDDING_MAX_BATCH_SIZE ({self.max_batch_size}) * "
+                f"TC_EMBEDDING_MAX_TEXT_BYTES ({self.max_text_bytes}) * "
+                f"{_JSON_WORST_CASE_BYTES_PER_TEXT_BYTE} (worst-case JSON "
+                "control-character escaping, one byte in becoming a 6-byte \\uXXXX "
+                f"escape out) + {self.max_batch_size} * "
+                f"{_JSON_PER_TEXT_OVERHEAD_BYTES} (per-text quote/comma overhead) + "
+                f"{_JSON_ENVELOPE_FIXED_BYTES} (fixed envelope) = {required}. "
+                "MaxBodySizeMiddleware would 413 requests those two settings say are "
+                "acceptable, making them dead configuration. Raise "
+                "TC_EMBEDDING_MAX_REQUEST_BYTES to at least that total, or lower "
+                "TC_EMBEDDING_MAX_BATCH_SIZE/TC_EMBEDDING_MAX_TEXT_BYTES."
             )
         return self
 

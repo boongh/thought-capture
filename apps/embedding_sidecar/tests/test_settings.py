@@ -59,8 +59,8 @@ def test_defaults_are_valid() -> None:
         # was sized to protect, or wedges the service outright.
         ("MAX_BATCH_SIZE", "0"),
         ("MAX_BATCH_SIZE", "-1"),
-        ("MAX_TEXT_LENGTH", "0"),
-        ("MAX_TEXT_LENGTH", "-1"),
+        ("MAX_TEXT_BYTES", "0"),
+        ("MAX_TEXT_BYTES", "-1"),
         ("MAX_CONCURRENT_ENCODES", "0"),
         ("MAX_CONCURRENT_ENCODES", "-1"),
         ("MAX_QUEUED_ENCODES", "-1"),
@@ -172,14 +172,60 @@ def test_raising_the_batch_limit_without_the_byte_cap_is_rejected(
     assert "TC_EMBEDDING_MAX_BATCH_SIZE" in message
 
 
-def test_byte_cap_exactly_at_the_advertised_batch_is_accepted(
+def test_byte_cap_exactly_at_the_worst_case_advertised_batch_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor is the *worst-case* JSON-serialized size, not the raw byte
+    total: `max_batch_size=2, max_text_bytes=1000` requires
+    `2*1000*6 + 2*3 + 12 = 12_018` bytes to admit a batch of two
+    all-control-character texts at exactly the advertised size - the true
+    minimum a maximally escaped, contract-legal request could serialize to.
+    An earlier version of this test pinned the bug this floor fixes: it
+    accepted `max_request_bytes=2000` for the same batch shape, which the
+    real middleware would 413 for any content that needs JSON escaping."""
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "2")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_TEXT_BYTES", "1000")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "12018")
+
+    assert Settings().max_request_bytes == 12018
+
+
+def test_byte_cap_one_below_the_worst_case_advertised_batch_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "2")
-    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_TEXT_LENGTH", "1000")
-    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "2000")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_TEXT_BYTES", "1000")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_REQUEST_BYTES", "12017")
 
-    assert Settings().max_request_bytes == 2000
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_default_byte_cap_admits_the_default_worst_case_batch() -> None:
+    """Pins the exact number, not just an inequality, so a future change to
+    either default that breaks the relationship fails loudly rather than
+    silently staying under a loose bound."""
+    settings = Settings()
+    worst_case_default_batch = (
+        settings.max_batch_size * settings.max_text_bytes * 6 + settings.max_batch_size * 3 + 12
+    )
+
+    assert worst_case_default_batch == 3_145_932
+    assert worst_case_default_batch <= settings.max_request_bytes
+
+
+def test_request_byte_cap_error_names_all_three_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MAX_BATCH_SIZE", "256")
+
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+
+    message = str(excinfo.value)
+    assert "TC_EMBEDDING_MAX_REQUEST_BYTES" in message
+    assert "TC_EMBEDDING_MAX_BATCH_SIZE" in message
+    assert "TC_EMBEDDING_MAX_TEXT_BYTES" in message
 
 
 def test_get_settings_propagates_the_validation_error(
