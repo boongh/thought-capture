@@ -98,6 +98,45 @@ async def _embed(
     )
 
 
+async def _advance_revision(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    body: str = "synthetic body, revision 2",
+) -> uuid.UUID:
+    """Commit a fresh revision for `document_id` and repoint
+    `documents.current_revision_id` at it - the same insert-then-update
+    sequence `organize_writer.py` uses when superseding a document, without
+    pulling in an `organize` fixture just for this."""
+    run_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    await session.execute(
+        sa.insert(runs).values(
+            id=run_id, workspace_id=workspace_id, kind="organize", status="succeeded"
+        )
+    )
+    await session.execute(
+        sa.insert(document_revisions).values(
+            id=revision_id,
+            document_id=document_id,
+            workspace_id=workspace_id,
+            run_id=run_id,
+            revision_number=2,
+            body_markdown=body,
+            body_sha256=hashlib.sha256(body.encode()).hexdigest(),
+            change_summary="synthetic supersession",
+            change_kind="organize",
+        )
+    )
+    await session.execute(
+        sa.update(documents)
+        .where(documents.c.id == document_id)
+        .values(current_revision_id=revision_id)
+    )
+    return revision_id
+
+
 async def _sync_events_for(session: AsyncSession, workspace_id: uuid.UUID) -> list[sa.Row]:
     return (
         await session.execute(
@@ -323,6 +362,61 @@ async def test_count_embedded_under_model_only_counts_current_workspace_and_mode
     embedded = await store.count_embedded_under_model(workspace_id, NEW_MODEL_ID)
 
     assert current == 2
+    assert embedded == 1
+
+
+async def test_count_embedded_under_model_excludes_a_superseded_revision(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """F18 (docs/plans/embedding-sync-review-round-5.md): a reembed sweep
+    enqueues revision r1, the worker embeds r1, then organize commits r2 for
+    the same document before the fresh sync event for r2 is delivered. The
+    document now has a `document_embeddings` row under the target model, but
+    it embeds a revision that is no longer current - `count_embedded_under_model`
+    must not count it, or `ReconcileReembedRuns` would mark the run
+    `succeeded` while the document's current revision has no embedding under
+    the new model at all."""
+    workspace_id, _ = fresh_identity
+    async with admin_session_factory() as session, session.begin():
+        document_id, revision_1 = await _document_with_revision(session, workspace_id)
+        await _embed(
+            session, document_id=document_id, revision_id=revision_1, model_id=NEW_MODEL_ID
+        )
+        await _advance_revision(session, document_id=document_id, workspace_id=workspace_id)
+
+    store = PostgresReembedRunStore(app_session_factory)
+    current = await store.count_current_documents(workspace_id)
+    embedded = await store.count_embedded_under_model(workspace_id, NEW_MODEL_ID)
+
+    assert current == 1
+    assert embedded == 0
+
+
+async def test_count_embedded_under_model_counts_an_embedding_at_the_current_revision(
+    admin_session_factory: async_sessionmaker[AsyncSession],
+    app_session_factory: async_sessionmaker[AsyncSession],
+    fresh_identity: tuple[uuid.UUID, uuid.UUID],
+) -> None:
+    """Mirror of the supersession case above: once the current revision
+    itself has been embedded under the target model, it must count - so the
+    fix cannot be satisfied by unconditionally returning 0."""
+    workspace_id, _ = fresh_identity
+    async with admin_session_factory() as session, session.begin():
+        document_id, _revision_1 = await _document_with_revision(session, workspace_id)
+        revision_2 = await _advance_revision(
+            session, document_id=document_id, workspace_id=workspace_id
+        )
+        await _embed(
+            session, document_id=document_id, revision_id=revision_2, model_id=NEW_MODEL_ID
+        )
+
+    store = PostgresReembedRunStore(app_session_factory)
+    current = await store.count_current_documents(workspace_id)
+    embedded = await store.count_embedded_under_model(workspace_id, NEW_MODEL_ID)
+
+    assert current == 1
     assert embedded == 1
 
 

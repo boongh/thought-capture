@@ -305,8 +305,11 @@ class ReembedRunStore(Protocol):
         self, workspace_id: uuid.UUID, embedding_model_id: str
     ) -> int:
         """How many of this workspace's ``document_embeddings`` rows already
-        carry ``embedding_model_id`` - joined through ``documents`` for
-        workspace scope, since ``document_embeddings`` has none of its own."""
+        carry ``embedding_model_id`` for the document's *current* revision -
+        joined through ``documents`` on both ``document_id`` and
+        ``current_revision_id`` for workspace scope and revision currency,
+        since ``document_embeddings`` has no ``workspace_id`` of its own. An
+        embedding of a since-superseded revision must not count."""
         ...
 
     async def has_dead_lettered_sync_events(

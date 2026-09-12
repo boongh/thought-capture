@@ -168,13 +168,21 @@ class PostgresReembedRunStore:
     ) -> int:
         # Workspace scope via the `documents` join - document_embeddings has
         # no workspace_id column of its own (ADR-0010 §3), mirroring
-        # PostgresEmbeddingWriter's model-uniformity precondition.
+        # PostgresEmbeddingWriter's model-uniformity precondition. The join
+        # also pins revision_id == documents.current_revision_id so a stale
+        # embedding of a superseded revision never counts as "done" (F18):
+        # otherwise a reembed run could report success while the document's
+        # *current* revision has no embedding under the new model at all.
         async with self._session_factory() as session:
             count = await session.scalar(
                 sa.select(sa.func.count(document_embeddings.c.document_id))
                 .select_from(
                     document_embeddings.join(
-                        documents, documents.c.id == document_embeddings.c.document_id
+                        documents,
+                        sa.and_(
+                            documents.c.id == document_embeddings.c.document_id,
+                            document_embeddings.c.revision_id == documents.c.current_revision_id,
+                        ),
                     )
                 )
                 .where(
