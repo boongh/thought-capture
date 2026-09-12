@@ -632,3 +632,65 @@ service, new flag) and can be reverted independently without touching the
 still-live Khoj path. After step 5's cutover, rollback means re-enabling
 the Khoj compose profile and flag — kept buildable, not deleted, until this
 ADR's "Full Khoj removal" verification gate above is met.
+
+## Addendum, 2026-09-11: replacing the pre-removal parity gate
+
+This Verification section's original text (above) gates full Khoj removal
+on "passes `docs/DESIGN.md` 15.2's golden-set recall/MRR thresholds at
+parity with or better than the Khoj-era baseline." **That gate is dropped
+and replaced**, per this repository's convention of recording a deviation
+beside the prior decision rather than rewriting it.
+
+**Why the original gate cannot be met.** There is no data to measure
+against: the local development database's contents were destroyed
+(`docs/incidents/0001-docker-compose-down-deleted-the-real-dev-stack.md`),
+so there is no corpus of organized documents for either channel to
+retrieve from. No Khoj-era baseline was ever captured either, so "parity
+with the baseline" would compare against a number that does not exist and
+cannot be reconstructed. Manufacturing one now — standing Khoj back up
+solely to generate a comparison number before deleting it — would be
+ceremony, not evidence: this ADR's own three motivations for retiring Khoj
+(§1: integration cost against an opaque system, an ungoverned second LLM
+credential, and the wrong shape of dependency for local embedding) are
+architectural, not "Khoj retrieves badly." Gating an architectural decision
+on a retrieval-quality comparison it was never motivated by does not serve
+the decision it is meant to protect.
+
+**What replaces it.** Khoj removal (Slice 5) is instead gated on the
+automated correctness bar this ADR's own Verification section already
+requires, confirmed with no comparison step:
+
+- The §2 exact-scan selective-filter recall test (`docs/plans/khoj-retirement-completion.md`
+  T3.4): a synthetic corpus, no real data needed, proving semantic search
+  returns every matching row within the requested limit under a
+  deliberately narrow filter.
+- The §9 run/journal state-machine tests and the §8 citation-validation
+  tests (T4.11).
+- The directly relevant items of `docs/DESIGN.md` Appendix A: the semantic
+  index contains current revisions only; Ask references resolve to current
+  documents and raw sources; hybrid search exposes channel scores and
+  degraded state.
+
+**The forward path for quality, once there is data.** Ask calls are
+journaled from Slice 4 onward (§9) — one `runs` row (`kind='ask'`) and one
+`llm_calls` row per call, carrying the prompt version, the full answer, the
+model served, and usage. Once real documents exist, a model or retrieval
+comparison can be run from that journal, against live traffic, without
+standing up either system for the purpose. That is a better comparison
+than the one being dropped here, and it is not blocked by removing Khoj.
+
+**What this addendum does not discharge.** `docs/DESIGN.md` 15.2's golden
+set remains an open Release 1 acceptance obligation in its own right
+(Appendix A, "Golden retrieval thresholds and organization evaluation gates
+pass") — independent of this cutover. This addendum decouples it from
+Slice 5; it does not cancel it. It is owed once there is a corpus to build
+it against.
+
+**Residual risk, accepted knowingly.** The replacement path drops Khoj's
+cross-encoder reranking and all document chunking (§1), and after removal
+there is no side-by-side window in which to measure either against Khoj.
+Both are accepted simplifications with their own stated re-evaluation
+triggers (§1, Consequences); the mitigations for the interim are the
+selective-filter recall test above, the embedding-truncation counter
+recorded alongside Slice 2 (`docs/plans/khoj-retirement-completion.md`
+Decision D), and the Ask journal described above.
