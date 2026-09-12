@@ -35,6 +35,104 @@ ENV_EXAMPLE = REPO_ROOT / "env.example"
 CHECK_SH = REPO_ROOT / "scripts" / "check.sh"
 CHECK_PS1 = REPO_ROOT / "scripts" / "check.ps1"
 CONTRACT_CONFTEST = REPO_ROOT / "tests" / "contract" / "embedding_sidecar" / "conftest.py"
+SIDECAR_DOCKERFILE = REPO_ROOT / "apps" / "embedding_sidecar" / "Dockerfile"
+SIDECAR_SETTINGS = (
+    REPO_ROOT / "apps" / "embedding_sidecar" / "src" / "tc_embedding_sidecar" / "settings.py"
+)
+
+# The two build-time model pins (review finding F16): a `.env` override alone
+# never reaches the sidecar's bake step, so Compose's build.args AND
+# environment blocks, the Dockerfile's ARG defaults, and settings.py's field
+# defaults must all agree - see the sidecar service's own anchor comment in
+# deploy/compose/docker-compose.yml for the full reasoning.
+MODEL_VARS = ("TC_EMBEDDING_MODEL_ID", "TC_EMBEDDING_MODEL_REVISION")
+
+
+def _embedding_sidecar_service() -> dict[str, Any]:
+    data = cast(dict[str, Any], yaml.safe_load(DOCKER_COMPOSE_YML.read_text(encoding="utf-8")))
+    return cast(dict[str, Any], data["services"]["embedding-sidecar"])
+
+
+def _compose_default(raw: str, var: str) -> str:
+    """Pull the `${VAR:-default}` fallback out of a raw Compose YAML string
+    value, without ever hard-coding the expected default in this test."""
+    match = re.search(r"\$\{" + re.escape(var) + r":-([^}]*)\}", raw)
+    assert match is not None, f"{var} is not written as ${{{var}:-default}} - got: {raw!r}"
+    return match.group(1)
+
+
+def _dockerfile_arg_default(var: str) -> str:
+    text = SIDECAR_DOCKERFILE.read_text(encoding="utf-8")
+    match = re.search(rf"^ARG {var}=(.+)$", text, re.MULTILINE)
+    assert match is not None, (
+        f"apps/embedding_sidecar/Dockerfile must declare `ARG {var}=<default>`"
+    )
+    return match.group(1).strip()
+
+
+def _settings_field_default(field: str) -> str:
+    text = SIDECAR_SETTINGS.read_text(encoding="utf-8")
+    match = re.search(rf'^\s*{field}: str = Field\(default="([^"]+)"', text, re.MULTILINE)
+    assert match is not None, f'settings.py must declare `{field}: str = Field(default="...")`'
+    return match.group(1)
+
+
+def test_embedding_sidecar_service_forwards_model_vars_at_runtime() -> None:
+    environment = _embedding_sidecar_service()["environment"]
+    for var in MODEL_VARS:
+        assert var in environment, (
+            f"deploy/compose/docker-compose.yml's `embedding-sidecar` service must "
+            f"forward {var} into the container's runtime environment - without this, "
+            f"an operator's .env override is silently ignored (review finding F16)"
+        )
+
+
+def test_embedding_sidecar_service_passes_model_vars_as_build_args() -> None:
+    build_args = _embedding_sidecar_service()["build"]["args"]
+    for var in MODEL_VARS:
+        assert var in build_args, (
+            f"deploy/compose/docker-compose.yml's `embedding-sidecar` service must pass "
+            f"{var} as a build.arg - without this, the model baked into the image at "
+            f"build time never reflects an operator's .env override, and forwarding it "
+            f"only at runtime (above) would name a model whose weights were never baked, "
+            f"crashing the container at start with HF_HUB_OFFLINE=1 set (review finding F16)"
+        )
+
+
+def test_model_var_defaults_agree_across_compose_dockerfile_and_settings() -> None:
+    service = _embedding_sidecar_service()
+    field_by_var = {
+        "TC_EMBEDDING_MODEL_ID": "model_id",
+        "TC_EMBEDDING_MODEL_REVISION": "model_revision",
+    }
+    for var, field in field_by_var.items():
+        compose_env_default = _compose_default(str(service["environment"][var]), var)
+        compose_build_arg_default = _compose_default(str(service["build"]["args"][var]), var)
+        dockerfile_default = _dockerfile_arg_default(var)
+        settings_default = _settings_field_default(field)
+
+        all_defaults = {
+            "compose environment": compose_env_default,
+            "compose build.args": compose_build_arg_default,
+            "Dockerfile ARG": dockerfile_default,
+            "settings.py field": settings_default,
+        }
+        distinct = set(all_defaults.values())
+        assert len(distinct) == 1, (
+            f"{var} defaults have drifted between build-time and run-time sources "
+            f"(review finding F16 exists specifically to prevent this): {all_defaults!r}"
+        )
+
+
+def test_env_example_documents_the_model_vars() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    for var in MODEL_VARS:
+        assert re.search(rf"^{var}=.+$", text, re.MULTILINE), (
+            f"env.example must document {var} alongside the other TC_EMBEDDING_* keys "
+            f"(review finding F16) - operators need a visible place to notice this "
+            f"variable exists and that it is a build-time pin"
+        )
+
 
 # Every TC_EMBEDDING_* setting apps/worker/src/tc_worker/__main__.py's
 # HttpEmbeddingClient/DeliverEmbeddingSync construction actually reads

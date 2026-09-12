@@ -259,9 +259,32 @@ services:
     build:
       context: ../../apps/embedding_sidecar
       dockerfile: Dockerfile
+      # The model is baked into the image at BUILD time (Dockerfile's own
+      # comment on this - review finding F16); Compose never injects an
+      # arbitrary `.env` key into a running container on its own (same fact
+      # F12 above hit for the worker service). Without `build.args` here, an
+      # operator's TC_EMBEDDING_MODEL_ID/TC_EMBEDDING_MODEL_REVISION override
+      # in `.env` would never reach the bake step, so the image would always
+      # bake the Dockerfile's own defaults regardless of `.env`. `build.args`
+      # alone is not enough either: the `environment` block below must carry
+      # the SAME two variables with the SAME defaults, so the running
+      # process's settings.py (which also reads them, at runtime) reports the
+      # model it actually has weights for - if the two blocks ever disagree,
+      # the container starts with HF_HUB_OFFLINE=1 naming a model whose
+      # weights were never baked, which is a startup crash, not a silent
+      # no-op. Changing the model therefore requires both an `.env` edit and
+      # `docker compose ... up -d --build embedding-sidecar` (docs/OPERATING.md).
+      args:
+        TC_EMBEDDING_MODEL_ID: ${TC_EMBEDDING_MODEL_ID:-thenlper/gte-small}
+        TC_EMBEDDING_MODEL_REVISION: ${TC_EMBEDDING_MODEL_REVISION:-17e1f347d17fe144873b1201da91788898c639cd}
     image: thought-capture-embedding-sidecar:local
     profiles: ["core"]
     restart: unless-stopped
+    environment:
+      # Must mirror `build.args` above exactly - see that comment for why
+      # both are required together.
+      TC_EMBEDDING_MODEL_ID: ${TC_EMBEDDING_MODEL_ID:-thenlper/gte-small}
+      TC_EMBEDDING_MODEL_REVISION: ${TC_EMBEDDING_MODEL_REVISION:-17e1f347d17fe144873b1201da91788898c639cd}
     healthcheck:
       test:
         ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health').status==200 else 1)\""]

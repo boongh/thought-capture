@@ -96,6 +96,23 @@ def test_invalid_value_is_rejected_naming_the_field(
     )
 
 
+def test_model_id_and_revision_env_overrides_take_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guards the `env_prefix` contract review finding F16's whole fix rests
+    on: deploy/compose/docker-compose.yml and the Dockerfile's bake step both
+    only work if `TC_EMBEDDING_MODEL_ID`/`TC_EMBEDDING_MODEL_REVISION` set in
+    the process environment actually reach these fields, rather than the
+    class silently keeping its built-in defaults."""
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MODEL_ID", "some-other/model")
+    monkeypatch.setenv(f"{REPO_ENV_PREFIX}MODEL_REVISION", "deadbeef")
+
+    settings = Settings()
+
+    assert settings.model_id == "some-other/model"
+    assert settings.model_revision == "deadbeef"
+
+
 def test_zero_queued_encodes_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     """0 is a meaningful setting here, not an invalid one: admit only what can
     run right now and 429 everything else. Guards against over-tightening this

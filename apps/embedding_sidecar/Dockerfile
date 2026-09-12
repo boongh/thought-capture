@@ -49,13 +49,32 @@ ENV PATH="/app/.venv/bin:$PATH"
 RUN mkdir -p "$HF_HOME" && chown -R tc:tc /app "$HF_HOME"
 USER tc
 
+# The model is a BUILD-time pin, not a runtime one (review finding F16):
+# `get_settings()` below is what actually bakes the weights, and it reads
+# these same two env vars via `env_prefix="TC_EMBEDDING_"`, so an operator
+# who only sets TC_EMBEDDING_MODEL_ID/TC_EMBEDDING_MODEL_REVISION in `.env`
+# and restarts the container changes nothing - the weights already baked in
+# below are still whatever these ARGs resolved to at `docker build` time.
+# Defaults here are IDENTICAL to settings.py's own field defaults so a plain
+# `docker compose build` (no override) bakes exactly what the process would
+# otherwise fall back to at runtime. Changing the model requires passing
+# --build-arg (deploy/compose/docker-compose.yml's `build.args`) and a
+# rebuild (`docker compose ... up -d --build embedding-sidecar`) - see
+# docs/OPERATING.md's model-change runbook.
+ARG TC_EMBEDDING_MODEL_ID=thenlper/gte-small
+ARG TC_EMBEDDING_MODEL_REVISION=17e1f347d17fe144873b1201da91788898c639cd
+ENV TC_EMBEDDING_MODEL_ID=${TC_EMBEDDING_MODEL_ID} \
+    TC_EMBEDDING_MODEL_REVISION=${TC_EMBEDDING_MODEL_REVISION}
+
 # Bakes the pinned model's weights into the image layer, so a container
 # restart never depends on network access to Hugging Face's hub at runtime
 # (docs/DESIGN.md 9's "local by default"; docs/adr/0010 §5's "no external
 # calls"). Uses the same settings module the app itself reads - including
 # `model_revision` (settings.py's own docstring has the full reasoning for
 # why the bare model id alone is not enough) - so the model id and pinned
-# revision can never drift between build time and run time.
+# revision can never drift between build time and run time, and the ARGs
+# above are the only place the pinned defaults are allowed to be typed a
+# second time (must stay identical to settings.py's field defaults).
 RUN python -c "from tc_embedding_sidecar.settings import get_settings; \
     from sentence_transformers import SentenceTransformer; \
     settings = get_settings(); \

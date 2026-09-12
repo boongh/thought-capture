@@ -231,8 +231,23 @@ eventually dead-lettering once they exhaust `outbox_events.max_attempts`
 silently degraded.
 
 **Cause:** the embedding sidecar's model or pinned revision changed
-(`TC_EMBEDDING_MODEL_ID` or `TC_EMBEDDING_MODEL_REVISION` in `.env`) without
-running a full re-embed of the workspace first. `document_embeddings` must
+(`TC_EMBEDDING_MODEL_ID` or `TC_EMBEDDING_MODEL_REVISION` in `.env`, followed
+by a rebuild of the sidecar image - see below) without running a full
+re-embed of the workspace first. These two variables are a **build-time**
+pin, not a runtime one (review finding F16): `apps/embedding_sidecar/Dockerfile`
+bakes the named model's weights into the image at `docker build` time and
+then disables Hugging Face hub access at runtime (`HF_HUB_OFFLINE=1`), so
+editing `.env` and only restarting the container changes nothing - the
+running process still serves whatever was baked in. Changing the model for
+real requires:
+
+```bash
+docker compose --env-file .env -f deploy/compose/docker-compose.yml \
+  --profile core up -d --build embedding-sidecar
+```
+
+before any of the recovery steps below, so the running sidecar actually
+reports the new `incoming_model_id` its weights match. `document_embeddings` must
 never hold vectors from two different models within one workspace
 (docs/DESIGN.md 8.5, 9.2); the write path now refuses every write that would
 violate that, rather than mixing models silently. This is a deliberate halt,
